@@ -1,0 +1,21 @@
+{  
+  "env" : {
+    "browser": true,
+    "es2020": true,
+    "node": true
+  },
+  "extends": [
+    "airbnb",
+    "airbnb-typescript"
+  ],
+  "parserOptions": {
+    "ecmaVersion": 11,
+    "sourceType": "module",
+    "project": "./tsconfig.json"
+  },
+  "rules": {
+    "no-console": 0,
+    "max-len": 0,
+    "object-curly-newline": 0
+  }
+}
