@@ -4,7 +4,7 @@ import {
 } from 'discord.js';
 import * as fs from 'fs/promises';
 
-import * as Commands from './Commands';
+import { commandMap } from './Commands';
 import { Command, Config, Server } from './Types';
 
 require('dotenv').config();
@@ -25,6 +25,7 @@ async function readConfig(): Promise<Config> {
   if (configBeingChanged) {
     return new Promise((resolve) => {
       setTimeout(async () => {
+        // eslint-disable-next-line no-plusplus
         resolve(await readConfig());
       }, 100);
     });
@@ -34,10 +35,11 @@ async function readConfig(): Promise<Config> {
 }
 
 async function startup() {
-  const commands = [
-    Commands.Help.data.toJSON(),
-    Commands.VoicePing.data.toJSON(),
-  ];
+  const commands: any[] = [];
+
+  commandMap.forEach((command) => {
+    commands.push(command.data.toJSON());
+  });
 
   await rest.put(Routes.applicationCommands(CLIENT_ID!), { body: commands });
 }
@@ -58,7 +60,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const { commandName } = interaction;
 
-  const command: Command = Commands.commandMap.get(commandName)!;
+  const command: Command = commandMap.get(commandName)!;
 
   if (!command) { return; }
 
@@ -82,7 +84,8 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
   if (oldState.channelId == null && server.voicePing.inputChannels.find((id) => id === newState.channelId)
     && newState.channel?.members.size === 1) {
-    const channel: TextChannel | undefined = client.channels.cache.get('920071596469788772') as TextChannel;
+    const index = server.voicePing.inputChannels.findIndex((id) => id === newState.channelId);
+    const channel: TextChannel | undefined = client.channels.cache.get(config.servers[index].voicePing.outputChannel) as TextChannel;
     const { voicePingMessage } = server.voicePing;
 
     if (channel) {
@@ -106,13 +109,6 @@ client.on('guildCreate', async (guild) => {
   const config = await readConfig();
 
   config.servers.push(server);
-  await changeConfig(config);
-});
-
-// Remove server from config when bot is removed from server
-client.on('guildDelete', async (guild) => {
-  const config = await readConfig();
-  config.servers = config.servers.filter((s) => s.id !== guild.id);
   await changeConfig(config);
 });
 

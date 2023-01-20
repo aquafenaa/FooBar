@@ -1,8 +1,11 @@
-/* eslint-disable no-param-reassign */
+/* eslint-disable consistent-return, no-param-reassign */
 import {
-  Channel, CommandInteraction, EmbedBuilder, SlashCommandBuilder,
+  Channel,
+  ChannelType,
+  ChatInputCommandInteraction,
+  CommandInteraction, EmbedBuilder, SlashCommandBuilder, TextChannel,
 } from 'discord.js';
-import { Command, Config } from './Types';
+import { Command, Config, Server } from './Types';
 
 const Help: Command = {
   data: new SlashCommandBuilder()
@@ -13,92 +16,121 @@ const Help: Command = {
   },
 };
 
+function buildVoicePingEmbed(server: Server) {
+  const { enabled, voicePingMessage, inputChannels, outputChannel } = server.voicePing;
+
+  return new EmbedBuilder()
+    .setTitle('Voice Ping Settings')
+    .setDescription('Voice ping settings for this server')
+    .addFields(
+      { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
+      { name: 'Message', value: voicePingMessage ?? 'No message set' },
+      { name: 'Listener Channels', value: inputChannels && inputChannels.length > 0 ? inputChannels?.map((id) => `<#${id}>`)?.join(', ') : 'No channels set' },
+      { name: 'Log Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
+    );
+}
+
 const VoicePing: Command = {
   data: new SlashCommandBuilder()
     .setName('voiceping')
     .setDescription('Sends a message when a user joins a voice channel')
-    .addBooleanOption((option) => option.setName('enable')
-      .setDescription('Enable or disable voice ping')
-      .setRequired(false))
-    .addStringOption((option) => option.setName('message')
-      .setDescription('Message to say. {user} mentions the user, and {channel} mentions the channel.')
-      .setRequired(false))
-    .addStringOption((option) => option.setName('inputs')
-      .setDescription('The channels to listen for voice activity. Please use channel IDs seperated by a space.')
-      .setRequired(false))
-    .addChannelOption((option) => option.setName('output')
-      .setDescription('The channel to send the message to')
-      .setRequired(false)),
-  async execute(interaction: CommandInteraction | any, config?: Config): Promise<void | Config> {
-    const enabledOption: boolean | undefined = interaction.options.getBoolean('enable') ?? undefined;
-    const messageOption: string | undefined = interaction.options.getString('message') ?? undefined;
-    const inputOptions: string[] | undefined = interaction.options.getString('inputs')?.split(' ') ?? undefined;
-    const outputOption: Channel | undefined = interaction.options.getChannel('output') ?? undefined;
+    .addSubcommand((subcommand) => subcommand.setName('test')
+      .setDescription('Test the voice ping message to the output channel'))
+    .addSubcommandGroup((group) => group.setName('settings')
+      .setDescription('View and edit the voice ping settings')
+      .addSubcommand((subcommand) => subcommand.setName('view')
+        .setDescription('View the current voice ping settings'))
+      .addSubcommand((subcommand) => subcommand.setName('edit')
+        .setDescription('Edit the current voice ping settings')
+        .addBooleanOption((option) => option.setName('enabled')
+          .setDescription('Enter "True" to enable, or "False" to disable.'))
+        .addStringOption((option) => option.setName('message')
+          .setDescription('Message to send when a user joins. {user} mentions the user, and {channel} mentions the channel.'))
+        .addStringOption((option) => option.setName('inputs')
+          .setDescription('The channels to listen for voice users joining. Enter channel IDs seperated by a space.'))
+        .addChannelOption((option) => option.setName('output')
+          .setDescription('Desired channel to output the message to')))),
 
-    if (enabledOption === undefined && messageOption === undefined && inputOptions === undefined && outputOption === undefined) {
-      const server = config?.servers.find((s) => s.id === interaction.guild?.id);
-      if (server === undefined) { console.error('Server is undefined'); return; }
-      const { enabled, voicePingMessage, inputChannels, outputChannel } = server.voicePing;
+  async execute(interaction: ChatInputCommandInteraction, config?: Config): Promise<void | Config> {
+    const server = config?.servers?.find((s) => s.id === interaction.guild?.id);
 
-      const embed = new EmbedBuilder()
-        .setTitle('Voice Ping Settings')
-        .addFields(
-          { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
-          { name: 'Message', value: voicePingMessage ?? 'No message set' },
-          { name: 'Listener Channels', value: inputChannels.map((id) => `<#${id}>`).join(', ') },
-          { name: 'Log Channel', value: `<#${outputChannel}>` },
-        );
+    if (config === undefined) { console.error('Config is undefined'); return; }
+    if (server === undefined) { console.error('Server is undefined'); return; }
 
-      await interaction.reply({ embeds: [embed] });
+    let { enabled, voicePingMessage, inputChannels, outputChannel } = server.voicePing;
+
+    let tempMessage = '';
+
+    if (interaction.options.getSubcommand() === 'test') {
+      if (outputChannel === undefined || outputChannel === '') {
+        tempMessage += 'No output channel set! Testing in this channel.\n';
+        outputChannel = interaction.channel?.id ?? '';
+      }
+      if (voicePingMessage?.includes('{channel}') && (inputChannels === undefined || inputChannels.length === 0)) {
+        tempMessage += 'No input channels set! Testing using a random voice channel.';
+        inputChannels = [interaction.guild?.channels.cache?.find((c: Channel) => c.type === ChannelType.GuildVoice)?.id ?? interaction.channel?.id ?? ''];
+      }
+
+      const channel: TextChannel = interaction.guild?.channels.cache.get(outputChannel) as TextChannel;
+
+      if (channel === undefined) {
+        await interaction.reply({ content: 'Invalid output channel!', ephemeral: true });
+
+        return;
+      }
+
+      if (tempMessage === '') {
+        tempMessage += 'Testing voice ping message!';
+      }
+
+      await interaction.reply({ content: tempMessage, ephemeral: true });
+
+      await channel.send(voicePingMessage?.replace('{user}', interaction.user.toString()).replace('{channel}', `<#${inputChannels[0]}>`));
+
       return;
     }
 
-    if (config === undefined) { console.error('Config is undefined'); return; }
-    const server = config.servers.find((s) => s.id === interaction.guild?.id);
-    if (server === undefined) { console.error('Server is undefined'); return; }
+    if (interaction.options.getSubcommandGroup() === 'settings') {
+      if (interaction.options.getSubcommand() === 'view') {
+        await interaction.reply({ embeds: [buildVoicePingEmbed(server)], ephemeral: true });
 
-    if (enabledOption !== undefined) {
-      server.voicePing.enabled = enabledOption;
+        return;
+      }
+
+      if (interaction.options.getSubcommand() === 'edit') {
+        const enable = interaction.options.getBoolean('enabled');
+        const message = interaction.options.getString('message');
+        const inputs = interaction.options.getString('inputs')?.split(' ');
+        const output = interaction.options.getChannel('output')?.id;
+
+        if (enable !== null) {
+          enabled = enable;
+        }
+        if (message !== null) {
+          voicePingMessage = message;
+        }
+        if (inputs !== undefined) {
+          inputChannels = inputs;
+        }
+        if (output !== undefined) {
+          outputChannel = output;
+        }
+
+        server.voicePing = {
+          enabled,
+          voicePingMessage,
+          inputChannels,
+          outputChannel,
+        };
+
+        await interaction.reply({ embeds: [buildVoicePingEmbed(server)], ephemeral: true });
+
+        const index = config.servers?.findIndex((s) => s.id === interaction.guild?.id);
+
+        config.servers[index] = server;
+        return config;
+      }
     }
-    if (messageOption !== undefined) {
-      server.voicePing.voicePingMessage = messageOption;
-    }
-    if (inputOptions !== undefined) {
-      server.voicePing.inputChannels = inputOptions;
-    }
-    if (outputOption !== undefined) {
-      server.voicePing.outputChannel = outputOption.id;
-    }
-
-    const { enabled, voicePingMessage, inputChannels, outputChannel } = server.voicePing;
-
-    const embed = new EmbedBuilder()
-      .setTitle('Voice Ping')
-      .setDescription('Voice ping has been updated!')
-      .addFields(
-        { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
-        { name: 'Message', value: voicePingMessage ?? 'No message set' },
-        { name: 'Listener Channels', value: inputChannels.map((id) => `<#${id}>`).join(', ') },
-        { name: 'Log Channel', value: `<#${outputChannel}>` },
-      );
-
-    await interaction.reply({ embeds: [embed] });
-
-    if (config === undefined) return;
-
-    // eslint-disable-next-line consistent-return
-    return config;
-  },
-};
-
-const ReactionRole: Command = {
-  data: new SlashCommandBuilder()
-    .setName('reactionrole')
-    .setDescription('Creates a reaction role message'),
-  async execute(interaction: CommandInteraction, config: Config): Promise<Config> {
-    await interaction.reply('Pong!');
-
-    return config;
   },
 };
 
@@ -106,4 +138,4 @@ const commandMap: Map<string, Command> = new Map();
 commandMap.set(Help.data.name, Help);
 commandMap.set(VoicePing.data.name, VoicePing);
 
-export { commandMap, Help, VoicePing, ReactionRole };
+export { commandMap, Help, VoicePing };
