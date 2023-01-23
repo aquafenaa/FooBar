@@ -11,7 +11,7 @@ import { Command, Config, Server } from './Types';
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const { TOKEN, CLIENT_ID } = process.env;
-const CONFIG_PATH = './config.json';
+const CONFIG_PATH = path.join(__dirname, '../config.json');
 const rest = new REST({ version: '10' }).setToken(TOKEN!);
 
 let configBeingChanged = false;
