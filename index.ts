@@ -3,11 +3,12 @@ import {
   REST, Events, Routes, Client, GatewayIntentBits, TextChannel,
 } from 'discord.js';
 import * as fs from 'fs/promises';
+import path from 'node:path';
 
 import { commandMap } from './Commands';
 import { Command, Config, Server } from './Types';
 
-require('dotenv').config();
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const { TOKEN, CLIENT_ID } = process.env;
 const CONFIG_PATH = './config.json';
