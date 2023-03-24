@@ -63,11 +63,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const command: Command = commandMap.get(commandName)!;
 
-  if (!command) { return; }
+  if (!command) { console.log(`No command found! Command Name: ${commandName}`); return; }
 
   try {
     const config = await readConfig();
     const tempConfig = await command.execute(interaction, config);
+
     if (tempConfig) {
       await changeConfig(tempConfig);
     }
