@@ -2,38 +2,16 @@
 import {
   REST, Events, Routes, Client, GatewayIntentBits, TextChannel,
 } from 'discord.js';
-import * as fs from 'fs/promises';
 import path from 'node:path';
 
-import { commandMap } from './Commands';
-import { Command, Config, Server } from './Types';
+import { commandMap, startPlayer } from './commands';
+import { Command, Server } from './types';
+import { readConfig, writeConfig } from './data';
 
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const { TOKEN, CLIENT_ID } = process.env;
-const CONFIG_PATH = path.join(__dirname, '../config.json');
 const rest = new REST({ version: '10' }).setToken(TOKEN!);
-
-let configBeingChanged = false;
-
-async function changeConfig(conf: Config) {
-  configBeingChanged = true;
-  await fs.writeFile(CONFIG_PATH, JSON.stringify(conf, null, 2));
-  configBeingChanged = false;
-}
-
-async function readConfig(): Promise<Config> {
-  if (configBeingChanged) {
-    return new Promise((resolve) => {
-      setTimeout(async () => {
-        // eslint-disable-next-line no-plusplus
-        resolve(await readConfig());
-      }, 100);
-    });
-  }
-
-  return JSON.parse(await fs.readFile(CONFIG_PATH, 'utf8'));
-}
 
 async function startup() {
   const commands: any[] = [];
@@ -50,10 +28,12 @@ const client = new Client({
     GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildVoiceStates,
   ],
 });
+
 client.login(TOKEN);
 
 client.on('ready', () => {
   console.log(`Client logged in as ${client.user?.tag}!`);
+  startPlayer(client);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -69,7 +49,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const config = await readConfig();
     const tempConfig = await command.execute(interaction, config);
     if (tempConfig) {
-      await changeConfig(tempConfig);
+      await writeConfig(tempConfig);
     }
   } catch (error) {
     console.error(error);
@@ -110,7 +90,7 @@ client.on('guildCreate', async (guild) => {
   const config = await readConfig();
 
   config.servers.push(server);
-  await changeConfig(config);
+  await writeConfig(config);
 });
 
 startup();
