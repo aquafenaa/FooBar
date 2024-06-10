@@ -17,7 +17,7 @@ function startPlayer(client: Client<boolean>) {
 
   player.extractors.register(SpotifyExtractor, {});
   player.extractors.register(SoundCloudExtractor, {});
-  player.extractors.register(YouTubeExtractor, {});
+  // player.extractors.register(YouTubeExtractor, {});
 
   player.events.on('playerStart', (queue, track) => {
     const requester = track.requestedBy!;
@@ -281,6 +281,10 @@ const Music: Command = {
 
       try {
         const { track } = await player.play(channel, query, {
+          ytdlOptions: {
+            quality: 'highestaudio',
+            highWaterMark: 1 << 25,
+          },
           requestedBy: interaction.user,
           nodeOptions: {
             metadata: interaction.channel,
