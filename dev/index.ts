@@ -4,11 +4,12 @@ import {
 } from 'discord.js';
 import path from 'node:path';
 
-import { commandMap, startPlayer } from './commands';
+import { commandMap } from './commands';
 import { Command, Server } from './types';
 import { readConfig, writeConfig } from './data';
 
-require('dotenv').config({ path: path.join(__dirname, '../.env') });
+// require('dotenv').config({ path: path.join(__dirname, '../.env') });
+require('dotenv').config({ path: path.join(__dirname, '../testing.env') });
 
 const { TOKEN, CLIENT_ID } = process.env;
 const rest = new REST({ version: '10' }).setToken(TOKEN!);
@@ -33,7 +34,6 @@ client.login(TOKEN);
 
 client.on('ready', () => {
   console.log(`Client logged in as ${client.user?.tag}!`);
-  startPlayer(client);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {

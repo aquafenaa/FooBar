@@ -1,6 +1,4 @@
-import { CommandInteraction, SlashCommandBuilder, Snowflake } from 'discord.js';
-
-type Location = 'YOUTUBE' | 'SPOTIFY' | 'SOUNDCLOUD';
+import { CommandInteraction, SlashCommandBuilder } from 'discord.js';
 
 interface VoicePing {
   enabled: boolean,
@@ -12,7 +10,6 @@ interface VoicePing {
 interface Server {
   id: string,
   voicePing: VoicePing,
-  musicChannel?: Snowflake;
 }
 
 interface ConfigData {
@@ -25,5 +22,5 @@ interface Command {
 }
 
 export {
-  Location, ConfigData, Server, VoicePing, Command,
+  ConfigData, Server, VoicePing, Command,
 };
