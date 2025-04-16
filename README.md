@@ -2,6 +2,6 @@
 ### A Discord Bot
 
 TODO: 
-- [ ] Add music-playing functionality
-- [ ] Add reaction role command
-- [ ] Add welcome & leaving messages
+- [x] Add heartboard functionality
+- [ ] Add hateboard functionality
+- [ ] Add date/time command that globalizes local times
