@@ -96,8 +96,7 @@ function clientEvents(client: Client) {
     }
   });
 
-  // when user adds a reaction
-  client.on('messageReactionAdd', async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+  const reactionFunction = async (reactionAdded: boolean, reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     const { message } = reaction;
 
     if (!message.guild) return;
@@ -114,15 +113,15 @@ function clientEvents(client: Client) {
 
     if (!enabled || !outputChannel || !outputChannel.isSendable() || !emojis.includes(reaction.emoji.toString())) return;
 
-    // Deny author
-    if (denyAuthor && user.id === message.author?.id && emojis.includes(reaction.emoji.toString())) {
-      // reaction.remove();
-      // return;
+    // remove author's reaction if the setting is turned on, and the emote's relevant
+    if (denyAuthor && reactionAdded && user.id === message.author?.id && emojis.includes(reaction.emoji.toString())) {
+      reaction.users.remove(user.id);
+      return;
     }
-    const messageReactions = message.reactions.cache.filter((r) => emojis.includes(r.emoji.toString())); // filter relevant emojis
 
     let total = 0;
     const reactedEmojis = [];
+    const messageReactions = message.reactions.cache.filter((r) => emojis.includes(r.emoji.toString())); // filter relevant emojis
 
     if (cumulative) { // whether we should tally all valid emojis
       messageReactions.forEach(({ emoji, count }) => {
@@ -140,26 +139,41 @@ function clientEvents(client: Client) {
       }
     }
 
-    if (total < thresholdNumber) return;
-
     const serverData = await getServerData(guildID) ?? await addData(guildID);
     const { heartBoardMessages } = serverData;
 
-    const messageTuple = heartBoardMessages.find((mTuple) => mTuple.messageID === message.id);
+    const messageTupleIndex = heartBoardMessages.findIndex((mTuple) => mTuple.messageID === message.id);
     const contentMessage = `${reactedEmojis.join('')} // **${total}**\n${message.url}`;
 
-    if (messageTuple) {
+    if (total < thresholdNumber && messageTupleIndex === -1) return;
+
+    if (messageTupleIndex !== -1) {
+      const messageTuple = heartBoardMessages[messageTupleIndex];
+
       const { embedMessageID } = messageTuple;
       const embedMessage = await outputChannel.messages.fetch(embedMessageID);
 
-      embedMessage.edit({ content: contentMessage, embeds: embedMessage.embeds });
+      if (!embedMessage) return;
+
+      if (total >= thresholdNumber) {
+        await embedMessage.edit({ content: contentMessage, embeds: embedMessage.embeds });
+        return;
+      }
+
+      // if removing the reaction has dipped below our threshold value, delete the message and tuple
+      await embedMessage.delete();
+      heartBoardMessages.splice(messageTupleIndex, 1);
+
+      serverData.heartBoardMessages = heartBoardMessages;
+      await editServerData(serverData);
+
       return;
     }
 
-    const guildUser = guild.members.cache.get(user.id);
+    const guildUser = await guild.members.fetch(message.author?.id ?? 'undefined');
     const embeds = [ // create embed
       (message.content ? new EmbedBuilder().setDescription(message.content) : new EmbedBuilder()) // set description to content if it exists
-        .setAuthor({ name: guildUser?.nickname ?? guildUser?.user.username ?? '', iconURL: guildUser?.displayAvatarURL() ?? user.defaultAvatarURL })
+        .setAuthor({ name: guildUser?.nickname ?? guildUser?.user.username ?? '', iconURL: guildUser?.displayAvatarURL() ?? '' })
         .setTimestamp(message.createdTimestamp),
     ];
 
@@ -181,7 +195,16 @@ function clientEvents(client: Client) {
     }); // add to data for future cache reference
 
     serverData.heartBoardMessages = heartBoardMessages; // not sure if necessary due to confusion abt JS references, but best to be cautious
-    editServerData(serverData);
+    await editServerData(serverData);
+  };
+
+  // when user adds a reaction
+  client.on('messageReactionAdd', async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+    await reactionFunction(true, reaction, user);
+  });
+
+  client.on('messageReactionRemove', async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+    await reactionFunction(false, reaction, user);
   });
 }
 
