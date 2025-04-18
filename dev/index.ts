@@ -6,8 +6,8 @@ import path from 'node:path';
 import { commandMap } from './commands';
 import clientEvents from './events';
 
-// require('dotenv').config({ path: path.join(__dirname, '../.env') }); // main config
-require('dotenv').config({ path: path.join(__dirname, '../testing.env') }); // testing config
+require('dotenv').config({ path: path.join(__dirname, '../.env') }); // main config
+// require('dotenv').config({ path: path.join(__dirname, '../testing.env') }); // testing config
 
 const { TOKEN, CLIENT_ID } = process.env;
 const rest = new REST({ version: '10' }).setToken(TOKEN!);
