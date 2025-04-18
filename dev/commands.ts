@@ -19,13 +19,14 @@ const Help: Command = {
 };
 
 function buildHeartBoardEmbed(heartBoard: HeartBoard) {
-  const { enabled, cumulative, thresholdNumber, emojis, outputChannel } = heartBoard;
+  const { enabled, cumulative, denyAuthor, thresholdNumber, emojis, outputChannel } = heartBoard;
 
   return new EmbedBuilder()
     .setTitle('Heart Board Settings')
     .addFields(
       { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
       { name: 'Cumulative Threshold', value: (cumulative ? 'Yes' : 'No') },
+      { name: 'Exclude Author\'s Reactions', value: `${denyAuthor ? 'Yes' : 'No'}` },
       { name: 'Threshold Value', value: `${thresholdNumber}` },
       { name: 'Emojis', value: `${emojis.join(', ')}` },
       { name: 'HeartBoard Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
