@@ -111,7 +111,13 @@ function clientEvents(client: Client) {
     const { enabled, cumulative, denyAuthor, emojis, thresholdNumber } = heartBoardConfig;
     const outputChannel = await guild.channels.fetch(heartBoardConfig.outputChannel);
 
-    if (!enabled || !outputChannel || !outputChannel.isSendable() || !emojis.includes(reaction.emoji.toString())) return;
+    const serverData = await getServerData(guildID) ?? await addData(guildID);
+    const { heartBoardMessages } = serverData;
+
+    // ignore this reaction if...
+    if (!enabled || !outputChannel || !outputChannel.isSendable() // ...the option is disabled or we can't send the message
+      || !emojis.includes(reaction.emoji.toString()) // ...the emoji isn't relevant to our search
+      || heartBoardMessages.find((mTuple) => message.id === mTuple.embedMessageID)) return; // ...the targeted message is a heartboard embed
 
     // remove author's reaction if the setting is turned on, and the emote's relevant
     if (denyAuthor && reactionAdded && user.id === message.author?.id && emojis.includes(reaction.emoji.toString())) {
@@ -138,9 +144,6 @@ function clientEvents(client: Client) {
         reactedEmojis.push(largestReaction.emoji.toString());
       }
     }
-
-    const serverData = await getServerData(guildID) ?? await addData(guildID);
-    const { heartBoardMessages } = serverData;
 
     const messageTupleIndex = heartBoardMessages.findIndex((mTuple) => mTuple.messageID === message.id);
     const contentMessage = `${reactedEmojis.join('')} // **${total}**\n${message.url}`;
