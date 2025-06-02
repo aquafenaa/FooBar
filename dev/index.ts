@@ -8,8 +8,7 @@ import { Ollama } from 'ollama';
 import { commandMap } from './commands';
 import clientEvents from './events';
 
-// require('dotenv').config({ path: path.join(__dirname, '../.env') }); // main config
-require('dotenv').config({ path: path.join(__dirname, '../testing.env') }); // testing config
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 const { TOKEN, CLIENT_ID } = process.env;
 const rest = new REST({ version: '10' }).setToken(TOKEN!);
