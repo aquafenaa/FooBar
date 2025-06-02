@@ -1,11 +1,14 @@
-import { Client, EmbedBuilder, Events, MessageReaction, PartialMessageReaction, PartialUser, TextChannel, User } from 'discord.js';
+import { Client, EmbedBuilder, Events, MessageReaction, PartialMessageReaction, PartialUser, Snowflake, TextChannel, User } from 'discord.js';
+import { Ollama } from 'ollama';
+
 import { addConfig, addData, editServerConfig, editServerData, getServerConfig, getServerData, readConfig, readData, repairServerConfig, repairServerData } from './data';
 import { commandMap } from './commands';
 import { Command } from './types';
 
-function clientEvents(client: Client) {
+function clientEvents(client: Client, grokClient: Ollama) {
   client.on('ready', async () => {
-    console.log(`Client logged in as ${client.user?.tag}!`);
+    console.log(`Client logged in as ${client.user?.tag}!, 
+      Current Models: ${(await grokClient.list()).models.map((m) => m.name.substring(0, m.name.indexOf(':'))).join(', ')}`);
 
     // verify all data and configs in case structures changed
     const data = await readData();
@@ -14,6 +17,7 @@ function clientEvents(client: Client) {
     data.servers.forEach((s) => repairServerData(s));
     config.servers.forEach((s) => repairServerConfig(s));
 
+    const invalidMessages: Snowflake[] = [];
     // load all heartboard messages to cache
     data.servers.forEach(async (server) => {
       const { id, heartBoardMessages } = server;
@@ -27,8 +31,14 @@ function clientEvents(client: Client) {
 
         if (!channel || !channel.isSendable()) return;
 
-        channel.messages.fetch(messageID ?? 'undefined'); // load message into cache
+        try {
+          channel.messages.fetch(messageID ?? 'undefined'); // load message into cache
+        } catch (error) {
+          invalidMessages.push(messageID);
+        }
       });
+
+      heartBoardMessages.filter((m) => invalidMessages.find((invalidMessageID) => m.messageID === invalidMessageID));
     });
   });
 
@@ -77,21 +87,27 @@ function clientEvents(client: Client) {
 
   // On user joining/leaving voice call
   client.on('voiceStateUpdate', async (oldState, newState) => {
-    const config = await readConfig();
-    const server = config?.servers?.find((s) => s.id === newState.guild?.id);
+    const guildID = newState.guild?.id;
 
-    if (!server || !server.voicePing.enabled) return;
+    if (!guildID) return; // we don't care if this isn't happening a server
+
+    const serverConfig = await getServerConfig(guildID);
+    const server = await client.guilds.fetch(guildID);
+
+    const { voicePing } = serverConfig!;
+
+    if (!server || !voicePing) return; // we don't care if we aren't able to make out a server, or if voice ping is disabled
 
     // checks if the user wasn't in a vc earlier, we're listening to the joined vc, and they're the first to join the channel
-    if (oldState.channelId == null && server.voicePing.inputChannels.find((id) => id === newState.channelId)
+    if (oldState.channelId == null && voicePing.inputChannels.find((id) => id === newState.channelId)
       && newState.channel?.members.size === 1) {
-      const index = server.voicePing.inputChannels.findIndex((id) => id === newState.channelId);
-      const channel: TextChannel | undefined = client.channels.cache.get(config.servers[index].voicePing.outputChannel) as TextChannel;
-      const { voicePingMessage } = server.voicePing;
+      const guild = await client.guilds.fetch(server.id);
+      const outputChannel: TextChannel | undefined = await guild.channels.fetch(voicePing.outputChannel) as TextChannel;
+      const { voicePingMessage } = voicePing;
 
       // send message to output channel
-      if (channel) {
-        channel.send(voicePingMessage.replace('{user}', `<@${newState.member?.user.id!}>`).replace('{channel}', `<#${newState.channelId!}>`));
+      if (outputChannel) {
+        outputChannel.send(voicePingMessage.replace('{user}', `<@${newState.member?.user.id!}>`).replace('{channel}', `<#${newState.channelId!}>`));
       }
     }
   });
