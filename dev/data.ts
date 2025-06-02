@@ -114,6 +114,7 @@ async function addConfig(guildID: string): Promise<ServerConfig> {
 
   const serverConfig: ServerConfig = {
     id: guildID,
+    aiEnabled: false,
     heartBoard: defaultHeartboardConfig,
     voicePing: defaultVoicepingConfig,
   };

@@ -1,5 +1,5 @@
 # FooBar
-This is the source code for a discord bot. It contains features that I think are useful, as well as features I find funny for my personal server
+This is the source code for a discord bot. It contains features that I think are useful, as well as features I find funny for my personal server. 
 If you would like to add this bot to your own server, feel free! If you encounter any issues or have suggestions, please create a report [here](https://github.com/aquafenaa/FooBar/issues)
 ----
 ### Features
@@ -25,11 +25,14 @@ If you would like to add this bot to your own server, feel free! If you encounte
 - [ ] Music Bot
   - Plays songs in vc when given a title
 
-- [ ] Date & Time
+- [ ] Date & Time Command
   - [ ] Choose local timezone. Whenever you mention a time in a message, it sends a localized response for everyone else. React with 🗑️ to delete the response
   - [ ] Localized command to get pregenerated localized time tags
   - [ ] Birthdate reminders
 ---
 #### **TODO**
-- [ ] Solidify config as its own command
+- [ ] Fix help command
+- [x] Solidify config as its own command
+- [ ] Test subcommand of config
 - [ ] Replied-to heartboard message added as preliminary embed
+- [ ] Command to reset config & data

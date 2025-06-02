@@ -85,6 +85,34 @@ function clientEvents(client: Client, grokClient: Ollama) {
     }
   });
 
+  client.on('messageCreate', async (message) => {
+    const { channel } = message;
+
+    if (!message.guildId || !message.mentions.has(client.user?.id ?? 'undefined') || !channel.isTextBased()) return;
+
+    // if the ai feature isn't enabled, or there isn't an available server config
+    if (!(await getServerConfig(message.guildId))?.aiEnabled) return;
+
+    const messages = Array.from(await channel.messages.fetch({ limit: 5, before: message.id }));
+    messages.push([message.id, message]);
+
+    const grokMessages = messages.map(([, m]) => ({
+      role: 'user',
+      content: `${m.author.displayName ?? m.author.globalName}: ${m.content ?? 'image'}`,
+    }));
+
+    channel.sendTyping();
+
+    grokClient.chat({
+      model: 'grok',
+      messages: [...grokMessages],
+    }).catch((e) => console.error(e)).then((response) => {
+      if (!response) return;
+
+      message.reply({ content: response.message.content ?? 'idk bro' });
+    });
+  });
+
   // On user joining/leaving voice call
   client.on('voiceStateUpdate', async (oldState, newState) => {
     const guildID = newState.guild?.id;
