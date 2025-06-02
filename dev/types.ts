@@ -1,4 +1,4 @@
-import { AutocompleteInteraction, CommandInteraction, SlashCommandBuilder, Snowflake } from 'discord.js';
+import { AutocompleteInteraction, CommandInteraction, EmbedBuilder, SlashCommandBuilder, Snowflake } from 'discord.js';
 
 interface HeartBoardMessage {
   channelID: Snowflake,
@@ -19,15 +19,16 @@ interface SaveData {
 /* Configs */
 interface ServerConfig {
   id: Snowflake,
-  heartBoard: HeartBoard,
-  voicePing: VoicePing,
+  aiEnabled: boolean,
+  heartBoard: HeartBoardConfig,
+  voicePing: VoicePingConfig,
 }
 
 interface ConfigData {
   servers: ServerConfig[];
 }
 
-interface HeartBoard {
+interface HeartBoardConfig {
   enabled: boolean,
   cumulative: boolean,
   denyAuthor: boolean,
@@ -36,7 +37,7 @@ interface HeartBoard {
   outputChannel: Snowflake;
 }
 
-interface VoicePing {
+interface VoicePingConfig {
   enabled: boolean,
   voicePingMessage: string,
   inputChannels: Snowflake[],
@@ -45,12 +46,18 @@ interface VoicePing {
 
 /* Command */
 interface Command {
-  data: SlashCommandBuilder | any;
-  execute(interaction: CommandInteraction, serverConfig: ServerConfig): Promise<ServerConfig | void>;
+  // usage: string,
+  data: SlashCommandBuilder | any,
+  execute(interaction: CommandInteraction, serverConfig: ServerConfig): Promise<ServerConfig | void>,
   autocomplete?(interaction: AutocompleteInteraction, serverConfig: ServerConfig): Promise<void>;
 }
+interface Feature {
+  name: string,
+  description: string,
+  embedBuilder(title: string, heartBoard: ServerConfig): EmbedBuilder
+}
 
-const defaultHeartboardConfig: HeartBoard = {
+const defaultHeartboardConfig: HeartBoardConfig = {
   enabled: false,
   cumulative: false,
   denyAuthor: false,
@@ -59,7 +66,7 @@ const defaultHeartboardConfig: HeartBoard = {
   outputChannel: '',
 };
 
-const defaultVoicepingConfig: VoicePing = {
+const defaultVoicepingConfig: VoicePingConfig = {
   enabled: false,
   voicePingMessage: 'Welcome to the voice channel, {user}',
   inputChannels: [],
@@ -67,6 +74,6 @@ const defaultVoicepingConfig: VoicePing = {
 };
 
 export {
-  ServerData, SaveData, HeartBoardMessage, ConfigData, ServerConfig, HeartBoard, VoicePing, Command,
+  ServerData, SaveData, HeartBoardMessage, ConfigData, ServerConfig, HeartBoardConfig, VoicePingConfig, Command, Feature,
   defaultHeartboardConfig, defaultVoicepingConfig,
 };

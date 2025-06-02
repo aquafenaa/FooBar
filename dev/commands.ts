@@ -1,12 +1,11 @@
 import {
-  Channel,
-  ChannelType,
   ChatInputCommandInteraction,
-  AutocompleteInteraction,
-  EmbedBuilder, MessageFlags, SlashCommandBuilder, TextChannel,
+  EmbedBuilder, MessageFlags, SlashCommandBuilder,
 } from 'discord.js';
-import { Command, HeartBoard, ServerConfig, VoicePing } from './types';
-import { editServerConfig } from './data';
+import { Command, Feature, ServerConfig } from './types';
+
+const commandMap: Map<string, Command> = new Map();
+const featureMap: Map<string, Feature> = new Map();
 
 const Help: Command = {
   data: new SlashCommandBuilder()
@@ -18,204 +17,200 @@ const Help: Command = {
   },
 };
 
-function buildHeartBoardEmbed(heartBoard: HeartBoard) {
-  const { enabled, cumulative, denyAuthor, thresholdNumber, emojis, outputChannel } = heartBoard;
+const HeartBoardFeature: Feature = {
+  name: 'heartboard',
+  description: 'Highlights beloved messages with a certain amount of reactions',
+  embedBuilder(title: string, serverConfig: ServerConfig) {
+    const { enabled, cumulative, denyAuthor, thresholdNumber, emojis, outputChannel } = serverConfig.heartBoard;
 
-  return new EmbedBuilder()
-    .setTitle('Heart Board Settings')
-    .addFields(
-      { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
-      { name: 'Cumulative Threshold', value: (cumulative ? 'Yes' : 'No') },
-      { name: 'Exclude Author\'s Reactions', value: `${denyAuthor ? 'Yes' : 'No'}` },
-      { name: 'Threshold Value', value: `${thresholdNumber}` },
-      { name: 'Emojis', value: `${emojis.join(', ')}` },
-      { name: 'HeartBoard Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
-    );
-}
-
-const HeartBoardCommand: Command = {
-  data: new SlashCommandBuilder()
-    .setName('heartboard')
-    .setDescription('Highlights beloved messages with a certain amount of reactions')
-    .addSubcommandGroup((configGroup) => configGroup.setName('config')
-      .setDescription('View and edit the heart board settings')
-      .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
-        .setDescription('View current heart board settings'))
-      .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
-        .setDescription('Edit the current heart board settings')
-        .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
-          .setDescription('Whether the heart board is current enabled'))
-        .addBooleanOption((cumulativeOption) => cumulativeOption.setName('cumulative')
-          .setDescription('Whether a single emoji must reach threshold (true), or total count of emojis reach threshold (false)'))
-        .addBooleanOption((banAuthorOption) => banAuthorOption.setName('deny-author')
-          .setDescription('Whether the author may react to their own message with a heartboard emoji'))
-        .addNumberOption((thresholdOption) => thresholdOption.setName('threshold')
-          .setDescription('Total number of reactions in order to trigger the message highlight'))
-        .addStringOption((emojisOption) => emojisOption.setName('emojis')
-          .setDescription('Emojis that trigger the bot. Separate with \',\'')
-          .setAutocomplete(true))
-        .addChannelOption((outputChannelOption) => outputChannelOption.setName('output-channel')
-          .setDescription('Channel to output highlighted messages to')))),
-  async execute(interaction: ChatInputCommandInteraction, serverConfig: ServerConfig): Promise<ServerConfig | void> {
-    const { enabled, cumulative, denyAuthor: banAuthor, thresholdNumber, emojis, outputChannel } = serverConfig.heartBoard;
-
-    if (interaction.options.getSubcommandGroup() === 'config') {
-      const subcommand = interaction.options.getSubcommand();
-
-      if (subcommand === 'edit') {
-        const newEnabled = interaction.options.getBoolean('enabled') ?? undefined;
-        const newCumulative = interaction.options.getBoolean('cumulative') ?? undefined;
-        const newBanAuthor = interaction.options.getBoolean('deny-author') ?? undefined;
-        const newThresholdNumber = interaction.options.getNumber('threshold');
-        const newEmojis = interaction.options.getString('emojis')?.trim()?.split(',');
-        const newOutputChannel = interaction.options.getChannel('output-channel');
-
-        // if none of the options were given
-        if (!(newEnabled === undefined || newCumulative === undefined || newBanAuthor === undefined
-            || newThresholdNumber || newEmojis || newOutputChannel)) {
-          interaction.reply({ content: 'Please give an option to change!', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        serverConfig.heartBoard = {
-          enabled: newEnabled ?? enabled,
-          cumulative: newCumulative ?? cumulative,
-          denyAuthor: newBanAuthor ?? banAuthor,
-          thresholdNumber: newThresholdNumber ?? thresholdNumber,
-          emojis: newEmojis ?? emojis,
-          outputChannel: newOutputChannel?.id ?? outputChannel,
-        };
-
-        editServerConfig(serverConfig);
-
-        interaction.reply({ content: 'Successfully edited HeartBoard settings', embeds: [buildHeartBoardEmbed(serverConfig.heartBoard)], flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (subcommand === 'view') {
-        interaction.reply({ embeds: [buildHeartBoardEmbed(serverConfig.heartBoard)], flags: MessageFlags.Ephemeral });
-      }
-    }
-  },
-  async autocomplete(interaction: AutocompleteInteraction, serverConfig: ServerConfig): Promise<void> {
-    const emojiString = serverConfig.heartBoard.emojis.join(',');
-    await interaction.respond([{ name: emojiString, value: emojiString }]);
+    return new EmbedBuilder()
+      .setTitle(title)
+      .addFields(
+        { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
+        { name: 'Cumulative Threshold', value: (cumulative ? 'Yes' : 'No') },
+        { name: 'Exclude Author\'s Reactions', value: `${denyAuthor ? 'Yes' : 'No'}` },
+        { name: 'Threshold Value', value: `${thresholdNumber}` },
+        { name: 'Emojis', value: `${emojis.join(', ')}` },
+        { name: 'HeartBoard Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
+      );
   },
 };
 
-function buildVoicePingEmbed(voicePing: VoicePing) {
-  const { enabled, voicePingMessage, inputChannels, outputChannel } = voicePing;
+const VoicePingFeature: Feature = {
+  name: 'voice-ping',
+  description: 'Sends a message when a user joins a voice channel',
+  embedBuilder(title: string, serverConfig: ServerConfig) {
+    const { enabled, voicePingMessage, inputChannels, outputChannel } = serverConfig.voicePing;
 
-  return new EmbedBuilder()
-    .setTitle('Voice Ping Settings')
-    .addFields(
-      { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
-      { name: 'Message', value: voicePingMessage ?? 'No message set' },
-      { name: 'Listener Channels', value: inputChannels && inputChannels.length > 0 ? inputChannels?.map((id) => `<#${id}>`)?.join(', ') : 'No channels set' },
-      { name: 'Log Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
-    );
-}
+    return new EmbedBuilder()
+      .setTitle(title)
+      .addFields(
+        { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
+        { name: 'Message', value: voicePingMessage ?? 'No message set' },
+        { name: 'Listener Channels', value: inputChannels && inputChannels.length > 0 ? inputChannels?.map((id) => `<#${id}>`)?.join(', ') : 'No channels set' },
+        { name: 'Log Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
+      );
+  },
+};
 
-const VoicePingCommand: Command = {
+const ConfigCommand: Command = {
   data: new SlashCommandBuilder()
-    .setName('voiceping')
-    .setDescription('Sends a message when a user joins a voice channel')
-    .addSubcommand((testSubcommand) => testSubcommand.setName('test')
-      .setDescription('Test the voice ping message to the output channel'))
-    .addSubcommandGroup((settingsGroup) => settingsGroup.setName('settings')
-      .setDescription('View and edit the voice ping settings')
-      .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
-        .setDescription('View the current voice ping settings'))
-      .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
-        .setDescription('Edit the current voice ping settings')
-        .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
-          .setDescription('Enter "True" to enable, or "False" to disable.'))
-        .addStringOption((messageOption) => messageOption.setName('message')
-          .setDescription('Message to send when a user joins. {user} mentions the user, and {channel} mentions the channel.'))
-        .addStringOption((inputChannelsOption) => inputChannelsOption.setName('inputs')
-          .setDescription('The channels to listen for voice users joining. Enter channel IDs seperated by a space.'))
-        .addChannelOption((outputChannelOption) => outputChannelOption.setName('output')
-          .setDescription('Desired channel to output the message to')))),
-
+    .setName('config')
+    .setDescription('Control server-wide settings of bot\'s features')
+    .addSubcommand(
+      (statusSubcommand) => statusSubcommand.setName('status')
+        .setDescription('Enable or disable a feature')
+        .addStringOption((statusFeatureName) => statusFeatureName.setName('feature-name')
+          .setDescription('Name of the feature you wish to view')
+          .setRequired(true)
+          .addChoices([
+            {
+              name: HeartBoardFeature.name,
+              value: HeartBoardFeature.name,
+            },
+            {
+              name: VoicePingFeature.name,
+              value: VoicePingFeature.name,
+            },
+          ]))
+        .addBooleanOption((statusEnabled) => statusEnabled.setName('enabled')
+          .setDescription('Whether the feature is enabled (true) or not (false)')
+          .setRequired(true)),
+    )
+    .addSubcommandGroup(
+      (editSubcommandGroup) => editSubcommandGroup.setName('edit')
+        .setDescription('Edit the current settings of a feature')
+        .addSubcommand(
+          (heartBoardEdit) => heartBoardEdit.setName(HeartBoardFeature.name)
+            .setDescription(HeartBoardFeature.description)
+            .addBooleanOption((heartBoardCumulative) => heartBoardCumulative.setName('cumulative')
+              .setDescription('Whether a single emoji must reach threshold (true), or total of all emojis reach threshold (false)')
+              .setRequired(false))
+            .addBooleanOption((heartBoardAuthor) => heartBoardAuthor.setName('deny-author')
+              .setDescription('Whether to remove relevant reactions from message author (true) or not (false)')
+              .setRequired(false))
+            .addIntegerOption((heartBoardThreshold) => heartBoardThreshold.setName('threshold')
+              .setDescription('Number of reactions to reach the heartboard')
+              .setRequired(false))
+            .addStringOption((heartBoardEmojis) => heartBoardEmojis.setName('emojis')
+              .setDescription('What emojis are tracked for the heartboard')
+              .setRequired(false))
+            .addChannelOption((heartBoardOutput) => heartBoardOutput.setName('output-channel')
+              .setDescription('Heartboard channel to send messages in')
+              .setRequired(false)),
+        ).addSubcommand(
+          (voicePingEdit) => voicePingEdit.setName(VoicePingFeature.name)
+            .setDescription(VoicePingFeature.description)
+            .addStringOption((voicePingMessage) => voicePingMessage.setName('message')
+              .setDescription('Message sent when a user joins a relevant channel')
+              .setRequired(false))
+            .addStringOption((voicePingInputs) => voicePingInputs.setName('input-channels')
+              .setDescription('Voice Channels to listen to. Enter a list of channel IDs separated by a space')
+              .setRequired(false))
+            .addChannelOption((voicePingOutput) => voicePingOutput.setName('output-channel')
+              .setDescription('Desired channel to send the message to')
+              .setRequired(false)),
+        ),
+    )
+    .addSubcommand((viewSubcommandGroup) => viewSubcommandGroup.setName('view')
+      .setDescription('View current config settings of a feature')
+      .addStringOption((viewFeatureName) => viewFeatureName.setName('feature-name')
+        .setDescription('Name of the feature you wish to view')
+        .setRequired(true)
+        .addChoices([
+          {
+            name: HeartBoardFeature.name,
+            value: HeartBoardFeature.name,
+          },
+          {
+            name: VoicePingFeature.name,
+            value: VoicePingFeature.name,
+          },
+        ]))),
   async execute(interaction: ChatInputCommandInteraction, serverConfig: ServerConfig): Promise<ServerConfig | void> {
     if (serverConfig === undefined) { console.error('Server is undefined'); return; }
 
-    let { enabled, voicePingMessage, inputChannels, outputChannel } = serverConfig.voicePing;
+    const subCommandGroup = interaction.options.getSubcommandGroup();
+    const subCommand = interaction.options.getSubcommand();
 
-    let tempMessage = '';
+    if (subCommand === 'status') {
+      const featureNameOption = interaction.options.getString('feature-name')!;
+      const enabledOption = interaction.options.getBoolean('enabled')!;
 
-    if (interaction.options.getSubcommand() === 'test') {
-      if (outputChannel === undefined || outputChannel === '') {
-        tempMessage += 'No output channel set! Testing in this channel.\n';
-        outputChannel = interaction.channel?.id ?? '';
-      }
-      if (voicePingMessage?.includes('{channel}') && (inputChannels === undefined || inputChannels.length === 0)) {
-        tempMessage += 'No input channels set! Testing using a random voice channel.';
-        inputChannels = [interaction.guild?.channels.cache?.find((c: Channel) => c.type === ChannelType.GuildVoice)?.id ?? interaction.channel?.id ?? ''];
-      }
+      if (featureNameOption === HeartBoardFeature.name) serverConfig.heartBoard.enabled = enabledOption;
+      if (featureNameOption === VoicePingFeature.name) serverConfig.voicePing.enabled = enabledOption;
 
-      const channel: TextChannel = interaction.guild?.channels.cache.get(outputChannel) as TextChannel;
+      interaction.reply({ embeds: [HeartBoardFeature.embedBuilder('New Heartboard Config', serverConfig)], flags: MessageFlags.Ephemeral });
+    } else if (subCommandGroup === 'edit') {
+      if (subCommand === HeartBoardFeature.name) {
+        const cumulativeOption = interaction.options.getBoolean('cumulative');
+        const denyAuthorOption = interaction.options.getBoolean('deny-author');
+        const thresholdOption = interaction.options.getInteger('threshold');
+        const emojisOption = interaction.options.getString('emojis')?.split(' '); // separate each emoji
+        const outputChannelOption = interaction.options.getChannel('output-channel');
 
-      if (channel === undefined) {
-        await interaction.reply({ content: 'Invalid output channel!', ephemeral: true });
-
-        return;
-      }
-
-      if (tempMessage === '') {
-        tempMessage += 'Testing voice ping message!';
-      }
-
-      await interaction.reply({ content: tempMessage, ephemeral: true });
-
-      await channel.send(voicePingMessage?.replace('{user}', interaction.user.toString()).replace('{channel}', `<#${inputChannels[0]}>`));
-
-      return;
-    }
-
-    if (interaction.options.getSubcommandGroup() === 'settings') {
-      if (interaction.options.getSubcommand() === 'view') {
-        await interaction.reply({ embeds: [buildVoicePingEmbed(serverConfig.voicePing)], ephemeral: true });
-
-        return;
-      }
-
-      if (interaction.options.getSubcommand() === 'edit') {
-        const enable = interaction.options.getBoolean('enabled');
-        const message = interaction.options.getString('message');
-        const inputs = interaction.options.getString('inputs')?.split(' ');
-        const output = interaction.options.getChannel('output')?.id;
-
-        if (enable !== null) {
-          enabled = enable;
-        }
-        if (message !== null) {
-          voicePingMessage = message;
-        }
-        if (inputs !== undefined) {
-          inputChannels = inputs;
-        }
-        if (output !== undefined) {
-          outputChannel = output;
+        // if we don't receive any arguments, tell them and return
+        if (cumulativeOption === null && denyAuthorOption === null && thresholdOption === null && emojisOption === null && outputChannelOption === null) {
+          interaction.reply({ content: 'please provide an argument to update!', flags: MessageFlags.Ephemeral });
+          return;
         }
 
-        serverConfig.voicePing = {
-          enabled,
-          voicePingMessage,
-          inputChannels,
-          outputChannel,
+        const oldHeartBoard = serverConfig.heartBoard;
+
+        // update the values if we received them, otherwise keep their old value
+        serverConfig.heartBoard = {
+          enabled: oldHeartBoard.enabled,
+          cumulative: cumulativeOption ?? oldHeartBoard.cumulative,
+          denyAuthor: denyAuthorOption ?? oldHeartBoard.denyAuthor,
+          thresholdNumber: thresholdOption ?? oldHeartBoard.thresholdNumber,
+          emojis: emojisOption ?? oldHeartBoard.emojis,
+          outputChannel: outputChannelOption?.id ?? oldHeartBoard.outputChannel,
         };
 
-        await interaction.reply({ embeds: [buildVoicePingEmbed(serverConfig.voicePing)], ephemeral: true });
+        interaction.reply({ embeds: [HeartBoardFeature.embedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
+      } else if (subCommand === VoicePingFeature.name) {
+        const messageOption = interaction.options.getString('message');
+        const inputChannelsOption = interaction.options.getString('input-channels')?.split(' '); // separate each channelID
+        const outputChannelOption = interaction.options.getChannel('output-channel');
 
-        return serverConfig;
+        // if we don't receive any arguments, tell them and return
+        if (messageOption === null && inputChannelsOption === null && outputChannelOption === null) {
+          interaction.reply({ content: 'please provide an argument to update!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        const oldVoicePingConfig = serverConfig.voicePing;
+
+        // update the values if we received them, otherwise keep their old value
+        serverConfig.voicePing = {
+          enabled: oldVoicePingConfig.enabled,
+          voicePingMessage: messageOption ?? oldVoicePingConfig.voicePingMessage,
+          inputChannels: inputChannelsOption ?? oldVoicePingConfig.inputChannels,
+          outputChannel: outputChannelOption?.id ?? oldVoicePingConfig.outputChannel,
+        };
+
+        interaction.reply({ embeds: [VoicePingFeature.embedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
       }
+    } else if (subCommand === 'view') {
+      const featureNameOption = interaction.options.getString('feature-name')!;
+      const feature = featureMap.get(featureNameOption)!;
+
+      await interaction.reply({
+        embeds: [feature.embedBuilder('Current Config', serverConfig)],
+        flags: MessageFlags.Ephemeral,
+      });
+
+      return; // we aren't changing config, so return early
     }
+
+    return serverConfig;
   },
 };
 
-const commandMap: Map<string, Command> = new Map();
 commandMap.set(Help.data.name, Help);
-commandMap.set(HeartBoardCommand.data.name, HeartBoardCommand);
-commandMap.set(VoicePingCommand.data.name, VoicePingCommand);
+commandMap.set(ConfigCommand.data.name, ConfigCommand);
 
-export { commandMap, Help, HeartBoardCommand, VoicePingCommand };
+featureMap.set(HeartBoardFeature.name, HeartBoardFeature);
+featureMap.set(VoicePingFeature.name, VoicePingFeature);
+
+export { commandMap, Help, ConfigCommand, HeartBoardFeature, VoicePingFeature };
