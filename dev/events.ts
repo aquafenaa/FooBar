@@ -115,7 +115,12 @@ function clientEvents(client: Client, grokClient: Ollama) {
       if (!response) return;
       clearInterval(typingExtension);
 
-      message.reply({ content: response.message.content ?? 'idk bro' });
+      const grokReply = response.message.content;
+      const eigenrobotIndex = grokReply.indexOf('eigenrobot:') + 1;
+
+      const formattedReply = eigenrobotIndex ? grokReply.substring(eigenrobotIndex - 1) : grokReply.replace('grok:', '');
+
+      message.reply({ content: formattedReply ?? 'idk bro' });
     });
   });
 
