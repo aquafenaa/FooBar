@@ -11,7 +11,7 @@ const Help: Command = {
   data: new SlashCommandBuilder()
     .setName('help')
     .setDescription('Displays all commands!')
-    .addStringOption((emoji) => emoji.setName('emoji').setDescription('ii')), // TODO: DELETE
+    .addStringOption((emoji) => emoji.setName('command-name').setDescription('Name of the command to use')), // TODO: DELETE
   async execute(interaction: ChatInputCommandInteraction): Promise<void> {
     await interaction.reply('Pong!');
   },
@@ -36,6 +36,20 @@ const HeartBoardFeature: Feature = {
   },
 };
 
+const AIFeature: Feature = {
+  name: 'ai-messages',
+  description: 'When pinged or replied to, the bot generates an LLM response',
+  embedBuilder(title: string, serverConfig: ServerConfig) {
+    const { aiEnabled } = serverConfig;
+
+    return new EmbedBuilder()
+      .setTitle(title)
+      .addFields(
+        { name: 'Enabled', value: (aiEnabled ? 'Yes' : 'No') },
+      );
+  },
+};
+
 const VoicePingFeature: Feature = {
   name: 'voice-ping',
   description: 'Sends a message when a user joins a voice channel',
@@ -53,6 +67,11 @@ const VoicePingFeature: Feature = {
   },
 };
 
+// set features before config so that we can generate feature name choices
+featureMap.set(HeartBoardFeature.name, HeartBoardFeature);
+featureMap.set(AIFeature.name, AIFeature);
+featureMap.set(VoicePingFeature.name, VoicePingFeature);
+
 const ConfigCommand: Command = {
   data: new SlashCommandBuilder()
     .setName('config')
@@ -63,16 +82,9 @@ const ConfigCommand: Command = {
         .addStringOption((statusFeatureName) => statusFeatureName.setName('feature-name')
           .setDescription('Name of the feature you wish to view')
           .setRequired(true)
-          .addChoices([
-            {
-              name: HeartBoardFeature.name,
-              value: HeartBoardFeature.name,
-            },
-            {
-              name: VoicePingFeature.name,
-              value: VoicePingFeature.name,
-            },
-          ]))
+          .addChoices(
+            Array.from(featureMap.values()).map((feature) => ({ name: feature.name, value: feature.name })),
+          ))
         .addBooleanOption((statusEnabled) => statusEnabled.setName('enabled')
           .setDescription('Whether the feature is enabled (true) or not (false)')
           .setRequired(true)),
@@ -117,16 +129,7 @@ const ConfigCommand: Command = {
       .addStringOption((viewFeatureName) => viewFeatureName.setName('feature-name')
         .setDescription('Name of the feature you wish to view')
         .setRequired(true)
-        .addChoices([
-          {
-            name: HeartBoardFeature.name,
-            value: HeartBoardFeature.name,
-          },
-          {
-            name: VoicePingFeature.name,
-            value: VoicePingFeature.name,
-          },
-        ]))),
+        .addChoices(Array.from(featureMap.values()).map((feature) => ({ name: feature.name, value: feature.name }))))),
   async execute(interaction: ChatInputCommandInteraction, serverConfig: ServerConfig): Promise<ServerConfig | void> {
     if (serverConfig === undefined) { console.error('Server is undefined'); return; }
 
@@ -134,13 +137,15 @@ const ConfigCommand: Command = {
     const subCommand = interaction.options.getSubcommand();
 
     if (subCommand === 'status') {
-      const featureNameOption = interaction.options.getString('feature-name')!;
       const enabledOption = interaction.options.getBoolean('enabled')!;
+      const featureNameOption = interaction.options.getString('feature-name')!;
+      const feature = featureMap.get(featureNameOption)!;
 
+      if (featureNameOption === AIFeature.name) serverConfig.aiEnabled = enabledOption;
       if (featureNameOption === HeartBoardFeature.name) serverConfig.heartBoard.enabled = enabledOption;
       if (featureNameOption === VoicePingFeature.name) serverConfig.voicePing.enabled = enabledOption;
 
-      interaction.reply({ embeds: [HeartBoardFeature.embedBuilder('New Heartboard Config', serverConfig)], flags: MessageFlags.Ephemeral });
+      interaction.reply({ embeds: [feature.embedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
     } else if (subCommandGroup === 'edit') {
       if (subCommand === HeartBoardFeature.name) {
         const cumulativeOption = interaction.options.getBoolean('cumulative');
@@ -209,8 +214,5 @@ const ConfigCommand: Command = {
 
 commandMap.set(Help.data.name, Help);
 commandMap.set(ConfigCommand.data.name, ConfigCommand);
-
-featureMap.set(HeartBoardFeature.name, HeartBoardFeature);
-featureMap.set(VoicePingFeature.name, VoicePingFeature);
 
 export { commandMap, Help, ConfigCommand, HeartBoardFeature, VoicePingFeature };

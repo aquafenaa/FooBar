@@ -93,23 +93,37 @@ function clientEvents(client: Client, grokClient: Ollama) {
     // if the ai feature isn't enabled, or there isn't an available server config
     if (!(await getServerConfig(message.guildId))?.aiEnabled) return;
 
-    const messages = Array.from(await channel.messages.fetch({ limit: 5, before: message.id }));
+    const messageReference = message.reference ? await message.fetchReference() : undefined;
+
+    console.log(message.reference, messageReference?.content);
+
+    const messages = Array.from(await channel.messages.fetch({ limit: 2, before: message.id })).filter((m) => m[1].id !== messageReference?.id);
+    if (messageReference) messages.push([messageReference.id, messageReference]);
+
     messages.push([message.id, message]);
 
-    const grokMessages = messages.map(([, m]) => ({
+    const grokMessages = messages.filter(([, m]) => m.content).map(([, m]) => ({
       role: 'user',
-      content: `${m.author.displayName ?? m.author.globalName}: ${m.content ?? 'image'}`,
+      content: `${m.author.displayName ?? m.author.globalName}: ${m.content ?? '<image>'}`,
     }));
 
-    channel.sendTyping();
+    console.log(`messages: ${grokMessages.map((m) => m.content).join(', ')}`);
+
+    message.channel.sendTyping();
+    const typingExtension = setInterval(async () => {
+      await message.channel.sendTyping();
+    }, 5000); // Send typing every 5 seconds
 
     grokClient.chat({
       model: 'grok',
       messages: [...grokMessages],
     }).catch((e) => console.error(e)).then((response) => {
       if (!response) return;
+      clearInterval(typingExtension);
 
-      message.reply({ content: response.message.content ?? 'idk bro' });
+      const formattedResponse = response.message.content.replace('foobar:', '').replace('foo:', '').replace('fooBar:', '');
+
+      message.reply({ content: formattedResponse ?? 'idk bro' });
     });
   });
 
