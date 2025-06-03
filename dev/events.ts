@@ -94,14 +94,11 @@ function clientEvents(client: Client, grokClient: Ollama) {
     // if the ai feature isn't enabled, or there isn't an available server config
     if (!(await getServerConfig(message.guildId))?.aiEnabled) return;
 
-    const messageReference = message.reference ? await message.fetchReference() : undefined;
+    const messages = message.reference ? [await message.fetchReference()] : [];
 
-    const messages = Array.from(await channel.messages.fetch({ limit: 1, before: message.id })).filter((m) => m[1].id !== messageReference?.id);
-    if (messageReference) messages.push([messageReference.id, messageReference]);
+    messages.push(message);
 
-    messages.push([message.id, message]);
-
-    const grokMessages = messages.filter(([, m]) => m.content).map(([, m]) => ({
+    const grokMessages = messages.filter((m) => m.content).map((m) => ({
       role: 'user',
       content: `${m.author.displayName ?? m.author.globalName}: ${m.content ?? '<image>'}`,
     }));
@@ -118,12 +115,7 @@ function clientEvents(client: Client, grokClient: Ollama) {
       if (!response) return;
       clearInterval(typingExtension);
 
-      const grokResponse = response.message.content;
-
-      const eigenRobotIndex = grokResponse.indexOf('eigenrobot:');
-      const formattedResponse = response.message.content.replace('foobar:', '').replace('foo:', '').replace('fooBar:', '').substring(eigenRobotIndex);
-
-      message.reply({ content: formattedResponse ?? 'idk bro' });
+      message.reply({ content: response.message.content ?? 'idk bro' });
     });
   });
 
