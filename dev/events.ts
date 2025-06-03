@@ -88,16 +88,15 @@ function clientEvents(client: Client, grokClient: Ollama) {
   client.on('messageCreate', async (message) => {
     const { channel } = message;
 
-    if (!message.guildId || !message.mentions.has(client.user?.id ?? 'undefined') || !channel.isTextBased()) return;
+    if ((!message.guildId || !channel.isTextBased())) return;
+    if (Math.random() < 0.999 && !message.mentions.has(client.user?.id ?? 'undefined')) return; // have a 1/1000 chance to respond if not pinged
 
     // if the ai feature isn't enabled, or there isn't an available server config
     if (!(await getServerConfig(message.guildId))?.aiEnabled) return;
 
     const messageReference = message.reference ? await message.fetchReference() : undefined;
 
-    console.log(message.reference, messageReference?.content);
-
-    const messages = Array.from(await channel.messages.fetch({ limit: 2, before: message.id })).filter((m) => m[1].id !== messageReference?.id);
+    const messages = Array.from(await channel.messages.fetch({ limit: 1, before: message.id })).filter((m) => m[1].id !== messageReference?.id);
     if (messageReference) messages.push([messageReference.id, messageReference]);
 
     messages.push([message.id, message]);
@@ -106,8 +105,6 @@ function clientEvents(client: Client, grokClient: Ollama) {
       role: 'user',
       content: `${m.author.displayName ?? m.author.globalName}: ${m.content ?? '<image>'}`,
     }));
-
-    console.log(`messages: ${grokMessages.map((m) => m.content).join(', ')}`);
 
     message.channel.sendTyping();
     const typingExtension = setInterval(async () => {
@@ -121,7 +118,10 @@ function clientEvents(client: Client, grokClient: Ollama) {
       if (!response) return;
       clearInterval(typingExtension);
 
-      const formattedResponse = response.message.content.replace('foobar:', '').replace('foo:', '').replace('fooBar:', '');
+      const grokResponse = response.message.content;
+
+      const eigenRobotIndex = grokResponse.indexOf('eigenrobot:');
+      const formattedResponse = response.message.content.replace('foobar:', '').replace('foo:', '').replace('fooBar:', '').substring(eigenRobotIndex);
 
       message.reply({ content: formattedResponse ?? 'idk bro' });
     });
