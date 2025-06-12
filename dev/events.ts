@@ -86,10 +86,10 @@ function clientEvents(client: Client, grokClient: OpenAI) {
   });
 
   client.on('messageCreate', async (message) => {
-    const { channel } = message;
+    const { channel, guildId } = message;
 
     // only works within my server, sorry! otherwise it's a waste of xAI tokens & money :/
-    if (!message.guildId || !channel.isTextBased() || channel.id !== '917588427959058462') return;
+    if (!message.guildId || !channel.isTextBased() || guildId !== '917588427959058462') return;
 
     const messageReference = message.reference ? await message.fetchReference() : undefined;
 
