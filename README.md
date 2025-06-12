@@ -5,6 +5,7 @@ If you would like to add this bot to your own server, feel free! If you encounte
 ### Features
 - [x] Voice Ping 
   - Sends a message in a given text channel if a user joins a specified voice channel
+  - [ ] Message / Role tied to each channel
 
 - [x] Heartboard
   - When a message receives enough reactions, it is captured as an embed and sent to a specified channel
@@ -15,8 +16,9 @@ If you would like to add this bot to your own server, feel free! If you encounte
 - [ ] Show ratings
   - Calculates average score of a show via user's reactions / interations
 
-- [ ] Grok AI?? <small>*disabled by default*</small>
+- [x] Grok AI?? <small>*highly experimental, recommended to keep disabled*</small>
   - Stupid LLM that responds when pinged or replied to
+  - [ ] Command to reset AI memory
 
 - [ ] Woke Meter
   - [ ] You can upvote or downvote a message there's the woker of the month
@@ -33,6 +35,7 @@ If you would like to add this bot to your own server, feel free! If you encounte
 #### **TODO**
 - [ ] Fix help command
 - [x] Solidify config as its own command
+- [ ] Permission-only access to admin commands
 - [ ] Test subcommand of config
 - [ ] Replied-to heartboard message added as preliminary embed
 - [ ] Command to reset config & data

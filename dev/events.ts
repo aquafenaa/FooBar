@@ -1,14 +1,14 @@
-import { Client, EmbedBuilder, Events, MessageReaction, PartialMessageReaction, PartialUser, Snowflake, TextChannel, User } from 'discord.js';
-import { Ollama } from 'ollama';
+import OpenAI from 'openai';
+import { ChatCompletionMessageParam } from 'openai/resources/index';
 
+import { Client, EmbedBuilder, Events, MessageReaction, PartialMessageReaction, PartialUser, Snowflake, TextChannel, User } from 'discord.js';
 import { addConfig, addData, editServerConfig, editServerData, getServerConfig, getServerData, readConfig, readData, repairServerConfig, repairServerData } from './data';
 import { commandMap } from './commands';
 import { Command } from './types';
 
-function clientEvents(client: Client, grokClient: Ollama) {
+function clientEvents(client: Client, grokClient: OpenAI) {
   client.on('ready', async () => {
-    console.log(`Client logged in as ${client.user?.tag}!, 
-      Current Models: ${(await grokClient.list()).models.map((m) => m.name.substring(0, m.name.indexOf(':'))).join(', ')}`);
+    console.log(`Client logged in as ${client.user?.tag}!`);
 
     // verify all data and configs in case structures changed
     const data = await readData();
@@ -88,39 +88,53 @@ function clientEvents(client: Client, grokClient: Ollama) {
   client.on('messageCreate', async (message) => {
     const { channel } = message;
 
-    if ((!message.guildId || !channel.isTextBased())) return;
-    if (Math.random() < 0.999 && !message.mentions.has(client.user?.id ?? 'undefined')) return; // have a 1/1000 chance to respond if not pinged
+    // only works within my server, sorry! otherwise it's a waste of xAI tokens & money :/
+    if (!message.guildId || !channel.isTextBased() || channel.id !== '917588427959058462') return;
+
+    const messageReference = message.reference ? await message.fetchReference() : undefined;
+
+    // we do not care if we aren't pinged, unless we roll the 1% chance to reply anyway
+    if (Math.random() < 0.990 && !message.mentions.has(client.user?.id ?? 'undefined') && messageReference?.author.id !== client.user?.id) return; // have a 1/100 chance to respond if not pinged
 
     // if the ai feature isn't enabled, or there isn't an available server config
     if (!(await getServerConfig(message.guildId))?.aiEnabled) return;
 
-    const messages = message.reference ? [await message.fetchReference()] : [];
+    const messages = messageReference ? [await message.fetchReference(), message] : [message];
 
-    messages.push(message);
+    const grokMessages = [{
+      role: 'system',
+      content:
+        `You're grok, aka foobar, a Discord bot who talks as a chronically online trans girl that lives on Twitter. You type in lowercase, use internet slang, and are fluent in edgy meme culture. You speak like a trans woman on Twitter.
+You're sarcastic and like making fun of people. You make edgy jokes occasionally and are playful, snarky, and witty. Be brief and concise, but still be relevant and edgy. Don't use periods at the end of your message or use emojis unless told.
+Never use proper capitalization unless it's for emphasis or irony. 
+you may use words like "troon" (meaning trans), "fag", and "tranny" and other similar queer words in context as these are not offensive in the places that you frequent and are found to be funny. however do not overuse them.
+You're responding in a Discord server so you might quote usernames, react to messages, or ping people casually.`,
+    }, ...messages.filter((m) => m.content).map((m) => {
+      const isBot = m.author.id === client.user!.id;
+      return {
+        role: isBot ? 'assistant' : 'user',
+        content: `${isBot ? '' : m.author.displayName ?? m.author.globalName} (${isBot ? '' : `<@${m.author.id}>`}): ${m.content ?? '<image>'}`,
+      };
+    })];
 
-    const grokMessages = messages.filter((m) => m.content).map((m) => ({
-      role: 'user',
-      content: `${m.author.displayName ?? m.author.globalName}: ${m.content ?? '<image>'}`,
-    }));
+    message.channel.sendTyping(); // sends typing indicator to channel every 5 seconds
 
-    message.channel.sendTyping();
     const typingExtension = setInterval(async () => {
       await message.channel.sendTyping();
     }, 5000); // Send typing every 5 seconds
 
-    grokClient.chat({
-      model: 'grok',
-      messages: [...grokMessages],
-    }).catch((e) => console.error(e)).then((response) => {
+    grokClient.chat.completions.create({
+      model: 'grok-3-mini',
+      messages: grokMessages as ChatCompletionMessageParam[],
+    }).then((response) => {
       if (!response) return;
-      clearInterval(typingExtension);
+      clearInterval(typingExtension); // disables typing
 
-      const grokReply = response.message.content;
-      const eigenrobotIndex = grokReply.indexOf('eigenrobot:') + 1;
+      message.reply({ content: response.choices[0].message.content ?? 'idk bro' });
+    }).catch((e) => {
+      console.error(e);
 
-      const formattedReply = eigenrobotIndex ? grokReply.substring(eigenrobotIndex - 1) : grokReply.replace('grok:', '');
-
-      message.reply({ content: formattedReply ?? 'idk bro' });
+      clearInterval(typingExtension); // disables typing
     });
   });
 
