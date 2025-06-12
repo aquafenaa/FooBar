@@ -3,15 +3,15 @@ import {
 } from 'discord.js';
 import path from 'node:path';
 
-import { Ollama } from 'ollama';
+import OpenAI from 'openai';
 
 import { commandMap } from './commands';
 import clientEvents from './events';
 
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
-const { TOKEN, CLIENT_ID } = process.env;
-const rest = new REST({ version: '10' }).setToken(TOKEN!);
+const { DISCORD_TOKEN, CLIENT_ID, GROK_KEY } = process.env;
+const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN!);
 
 async function startup() {
   const commands: any[] = [];
@@ -23,7 +23,10 @@ async function startup() {
   await rest.put(Routes.applicationCommands(CLIENT_ID!), { body: commands });
 }
 
-const grokClient = new Ollama({ host: 'http://127.0.0.1:11434' });
+const grokClient = new OpenAI({
+  apiKey: GROK_KEY,
+  baseURL: 'https://api.x.ai/v1',
+});
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent,
@@ -31,7 +34,7 @@ const client = new Client({
   ],
 });
 
-client.login(TOKEN);
+client.login(DISCORD_TOKEN);
 
 clientEvents(client, grokClient);
 startup();
