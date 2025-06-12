@@ -86,10 +86,13 @@ function clientEvents(client: Client, grokClient: OpenAI) {
   });
 
   client.on('messageCreate', async (message) => {
-    const { channel } = message;
+    const { author, channel, guildId } = message;
+
+    // the bot cannot respond to itself
+    if (author.id || author.id === client.user?.id || author) return;
 
     // only works within my server, sorry! otherwise it's a waste of xAI tokens & money :/
-    if (!message.guildId || !channel.isTextBased()) return;
+    if (!message.guildId || !channel.isTextBased() || guildId !== '917588427959058462') return;
 
     const messageReference = message.reference ? await message.fetchReference() : undefined;
 
