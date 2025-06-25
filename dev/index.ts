@@ -27,14 +27,14 @@ const grokClient = new OpenAI({
   apiKey: GROK_KEY,
   baseURL: 'https://api.x.ai/v1',
 });
-const client = new Client({
+const discordClient = new Client({
   intents: [
     GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessageReactions,
   ],
 });
 
-client.login(DISCORD_TOKEN);
+discordClient.login(DISCORD_TOKEN);
 
-clientEvents(client, grokClient);
+clientEvents(discordClient, grokClient);
 startup();

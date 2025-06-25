@@ -20,7 +20,7 @@ const Help: Command = {
 const HeartBoardFeature: Feature = {
   name: 'heartboard',
   description: 'Highlights beloved messages with a certain amount of reactions',
-  embedBuilder(title: string, serverConfig: ServerConfig) {
+  configEmbedBuilder(title: string, serverConfig: ServerConfig) {
     const { enabled, cumulative, denyAuthor, thresholdNumber, emojis, outputChannel } = serverConfig.heartBoard;
 
     return new EmbedBuilder()
@@ -39,7 +39,7 @@ const HeartBoardFeature: Feature = {
 const AIFeature: Feature = {
   name: 'ai-messages',
   description: 'When pinged or replied to, the bot generates an LLM response',
-  embedBuilder(title: string, serverConfig: ServerConfig) {
+  configEmbedBuilder(title: string, serverConfig: ServerConfig) {
     const { aiEnabled } = serverConfig;
 
     return new EmbedBuilder()
@@ -53,7 +53,7 @@ const AIFeature: Feature = {
 const VoicePingFeature: Feature = {
   name: 'voice-ping',
   description: 'Sends a message when a user joins a voice channel',
-  embedBuilder(title: string, serverConfig: ServerConfig) {
+  configEmbedBuilder(title: string, serverConfig: ServerConfig) {
     const { enabled, voicePingMessage, inputChannels, outputChannel } = serverConfig.voicePing;
 
     return new EmbedBuilder()
@@ -145,7 +145,7 @@ const ConfigCommand: Command = {
       if (featureNameOption === HeartBoardFeature.name) serverConfig.heartBoard.enabled = enabledOption;
       if (featureNameOption === VoicePingFeature.name) serverConfig.voicePing.enabled = enabledOption;
 
-      interaction.reply({ embeds: [feature.embedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
+      interaction.reply({ embeds: [feature.configEmbedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
     } else if (subCommandGroup === 'edit') {
       if (subCommand === HeartBoardFeature.name) {
         const cumulativeOption = interaction.options.getBoolean('cumulative');
@@ -172,7 +172,7 @@ const ConfigCommand: Command = {
           outputChannel: outputChannelOption?.id ?? oldHeartBoard.outputChannel,
         };
 
-        interaction.reply({ embeds: [HeartBoardFeature.embedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
+        interaction.reply({ embeds: [HeartBoardFeature.configEmbedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
       } else if (subCommand === VoicePingFeature.name) {
         const messageOption = interaction.options.getString('message');
         const inputChannelsOption = interaction.options.getString('input-channels')?.split(' '); // separate each channelID
@@ -194,14 +194,14 @@ const ConfigCommand: Command = {
           outputChannel: outputChannelOption?.id ?? oldVoicePingConfig.outputChannel,
         };
 
-        interaction.reply({ embeds: [VoicePingFeature.embedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
+        interaction.reply({ embeds: [VoicePingFeature.configEmbedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
       }
     } else if (subCommand === 'view') {
       const featureNameOption = interaction.options.getString('feature-name')!;
       const feature = featureMap.get(featureNameOption)!;
 
       await interaction.reply({
-        embeds: [feature.embedBuilder('Current Config', serverConfig)],
+        embeds: [feature.configEmbedBuilder('Current Config', serverConfig)],
         flags: MessageFlags.Ephemeral,
       });
 
