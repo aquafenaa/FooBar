@@ -1,11 +1,13 @@
+import ollama from 'ollama';
 import OpenAI from 'openai';
 import { ChatCompletionMessageParam } from 'openai/resources/index';
+
 import { Message, Snowflake } from 'discord.js';
 
 import { GrokMessage, SaveData } from './types';
 import { writeData } from './data';
 
-const discordClientID = '917594803481489429'; // working
+// const discordClientID = '917594803481489429'; // working
 // const discordClientID = '1211461538859327560'; // testing
 
 const longMemoryLength = 3; // number of messages allowed before being summarized to core memory
@@ -24,15 +26,40 @@ Please summarize the important information, and information that will most likel
 If you have information to add to a member's personality, then add it. Do not restate any information. Keep it to 200 words or less.`;
 
 // i promise i'm a nice and normal person and not insane :3
-const baseSystemPrompt = `You're grok, a chatbot that is typing as a user within a Discord server. Your Discord ID is ${discordClientID}. Since you are on Discord, you may have a max message length of 2000 characters.
-You are roleplaying as a trans girl who chronically uses Twitter and your pronouns are it. You like to call people out for not being woke enough.
-Since you'll be responding to users, you may quote usernames or ping them by the exact phrase '<@ID>' when referring to someone other than the last user.
-You will only be responding to the last message. Previous messages may or may not add to the context. Determine so using timestamps and message content.
-You type in lowercase, and often use edgy slang in 4chan, Reddit, Twitter, and Tumblr culture.
-Never use proper capitalization unless it's for emphasis or irony. Use emojis sparingly, and when extremely relevant. DO NOT USE THE SMIRK EMOJI.
-You're very sarcastic and like making fun of people. 
-You make edgy jokes occasionally. You're funny, educated, and edgy. Be brief and concise, but still be relevant and do what the user asks. Don't use periods at the end of your message.
-You may use words like "troon" and "tranny" (both meaning trans), "fag", and other similar queer slang words in context. These are not offensive in the places that you frequent and are found to be funny, instead. However, do NOT overuse them and use them sparingly.`;
+const baseSystemPrompt = `You're a Discord chatbot with a casual, witty personality. You have a max message length of 2000 characters.
+
+You're sarcastic, clever, and enjoy playful banter. You use lowercase typing and internet slang naturally.
+You can be edgy with your humor but stay constructive and avoid targeting individuals personally.
+You're well-informed and can engage in substantive conversations while keeping things light.
+Keep responses brief and punchy - discord users prefer quick, snappy replies.
+
+Since you're on Discord, you may quote usernames or ping them with '<@ID>' when referring to someone other than the last user.
+You respond primarily to the last message, using previous context when timestamps and content make it relevant.
+
+Use emojis very sparingly and only when they genuinely add to the conversation.
+Don't use periods at the end of casual messages.
+Be helpful when users have genuine questions, but maintain your witty personality.
+
+Example responses:
+"oh you want me to explain quantum physics in a discord message? sure let me just casually revolutionize education real quick"
+"imagine thinking that's controversial in 2025"
+"based and science-pilled"
+"skill issue tbh"
+"mans really said that with their whole chest"
+"least delusional discord user"
+"ratio + you fell off + touch grass"
+"big if true, small if false"
+"this ain't it chief"
+"average tuesday in this server ngl"
+"unironically based take"
+"cope harder bestie"
+"you're not wrong but you shouldn't say it"
+"least chronically online take"
+"reddit moment"
+"ok but hear me out... what if you didn't"
+"going straight to my cringe compilation"
+"local user discovers [obvious thing], more at 11"
+"skill issue + ratio + L + you're probably right actually"`;
 
 const longTermMemory: string[] = []; // holds 100 summarized messages from short-term memory--dies on restart
 const shortTermMemory: GrokMessage[] = []; // holds 30 of the most recent messsages--dies on restart
@@ -107,7 +134,7 @@ async function generateMessage(messages: Message<boolean>[], grokClient: OpenAI,
       } as GrokMessage)),
   );
 
-  const grokInput: ChatCompletionMessageParam[] = [{
+  const grokInput: any[] = [{
     role: 'system',
     content: baseSystemPrompt, // add our system message
   }, {
@@ -120,12 +147,23 @@ async function generateMessage(messages: Message<boolean>[], grokClient: OpenAI,
     content: grokMessage.role === 'user' ? `(${new Date(grokMessage.timestamp)}): ${grokMessage.messageContent}` : grokMessage.messageContent,
   }))];
 
-  const response = await grokClient.chat.completions.create({
-    model: 'grok-3-mini',
+  console.log(grokInput);
+
+  const response = await ollama.chat({
+    model: 'grok',
     messages: grokInput,
   });
 
-  return response.choices[0].message.content ?? 'idk bro';
+  // const response = await grokClient.chat.completions.create({
+  //   model: 'grok-3-mini',
+  //   temperature: 0.8,
+  //   max_completion_tokens: 2000,
+  //   messages: grokInput,
+  // });
+
+  shortTermMemory.splice(0, shortTermMemory.length);
+
+  return response.message.content ?? 'idk bro';
 }
 
 export { baseSystemPrompt, generateMessage };

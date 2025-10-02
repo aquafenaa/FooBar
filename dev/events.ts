@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { Client, EmbedBuilder, Events, Message, MessageReaction, PartialMessageReaction, PartialUser, Snowflake, TextChannel, User } from 'discord.js';
+import { Client, EmbedBuilder, Message, MessageReaction, PartialMessageReaction, PartialUser, Snowflake, TextChannel, User } from 'discord.js';
 
 import { Command } from './types';
 import { commandMap } from './commands';
@@ -50,7 +50,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
   });
 
   // On command
-  discordClient.on(Events.InteractionCreate, async (interaction) => {
+  discordClient.on('interactionCreate', async (interaction) => {
     if (!interaction.isCommand() && !interaction.isAutocomplete()) return;
 
     if (!interaction.guild) { return; }
@@ -100,7 +100,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
 
     // we do not care if...
     if ((
-      message.content.includes('@everyone') || message.content.includes('@here')
+      message.content.includes('@everyone') || message.content.includes('@here') // it was a mass ping
       || !message.mentions.has(discordClient.user?.id ?? 'undefined') // ... bot isn't mentioned...
       || message.author.id === discordClient.user?.id) // ...or the bot mentioned itself...
       && Math.random() < 0.990) return; // ...and we don't roll a 1% chance to respond anyway...
@@ -108,10 +108,12 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     // if the ai feature isn't enabled, or there isn't an available server config
     if (!(await getServerConfig(message.guildId))?.aiEnabled) return;
 
-    const messages: Message<boolean>[] = messageReference ? [await message.fetchReference(), message] : [message];
+    // TODO: replace with config variables
+    const previousMessages = Array.from((await channel.messages.fetch(({ limit: 5, cache: false, before: message.id }))).values());
+    const messages: Message<boolean>[] = previousMessages.reverse();
 
-    // TODO: replace these w config variables
-    messages.push(...((await channel.messages.fetch(({ limit: 5, cache: true }))).values()), ...messages); // fetches 5 previous messages and adds them to our array
+    if (messageReference) messages.push(messageReference); // if the user replied to a message, include it for context
+    messages.push(message);
 
     message.channel.sendTyping(); // starts typing indicator...
     const typingExtension = setInterval(() => {
@@ -123,7 +125,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     }, 20000); // cancel interval after 20 seconds, if it's still going
 
     // get response from grok, and reply
-    generateMessage(messages.reverse(), grokClient, await readData(), discordClient.user!.id).then((response) => {
+    generateMessage(messages, grokClient, await readData(), discordClient.user!.id).then((response) => {
       if (!response) return;
       clearInterval(typingExtension); // disables typing
 
