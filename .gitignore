@@ -5,6 +5,8 @@
 /src/
 
 dev.bat
+refresh.bat
+modelfile
 
 data.json
 config.json
