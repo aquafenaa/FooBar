@@ -114,7 +114,9 @@ async function addConfig(guildID: string): Promise<ServerConfig> {
 
   const serverConfig: ServerConfig = {
     id: guildID,
+
     aiEnabled: false,
+    serverResponses: [],
     heartBoard: defaultHeartboardConfig,
     voicePing: defaultVoicepingConfig,
   };
@@ -169,6 +171,12 @@ function repairServerData(serverData: any): ServerData {
 
 function repairServerConfig(serverConfig: any): ServerConfig {
   let changed = false;
+
+  if (!serverConfig.serverResponses) {
+    serverConfig.serverResponses = [];
+
+    changed = true;
+  }
 
   if (!serverConfig.heartBoard) {
     serverConfig.heartBoard = defaultHeartboardConfig;

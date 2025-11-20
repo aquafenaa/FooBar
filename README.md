@@ -15,6 +15,9 @@ If you would like to add this bot to your own server, feel free! If you encounte
 
 - [ ] Show ratings
   - Calculates average score of a show via user's reactions / interations
+- [ ] Position Tracker
+ - Command to keep track of position in shows
+ - Includes season, episode, and possible time
 
 - [x] Grok AI?? <small>*highly experimental, recommended to keep disabled*</small>
   - Stupid LLM that responds when pinged or replied to

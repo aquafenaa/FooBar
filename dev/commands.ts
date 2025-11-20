@@ -2,20 +2,10 @@ import {
   ChatInputCommandInteraction,
   EmbedBuilder, MessageFlags, SlashCommandBuilder,
 } from 'discord.js';
-import { Command, Feature, ServerConfig } from './types';
+import { Command, Feature, Response, ServerConfig } from './types';
 
 const commandMap: Map<string, Command> = new Map();
 const featureMap: Map<string, Feature> = new Map();
-
-const Help: Command = {
-  data: new SlashCommandBuilder()
-    .setName('help')
-    .setDescription('Displays all commands!')
-    .addStringOption((emoji) => emoji.setName('command-name').setDescription('Name of the command to use')), // TODO: DELETE
-  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
-    await interaction.reply('Pong!');
-  },
-};
 
 const HeartBoardFeature: Feature = {
   name: 'heartboard',
@@ -71,6 +61,16 @@ const VoicePingFeature: Feature = {
 featureMap.set(HeartBoardFeature.name, HeartBoardFeature);
 featureMap.set(AIFeature.name, AIFeature);
 featureMap.set(VoicePingFeature.name, VoicePingFeature);
+
+const Help: Command = {
+  data: new SlashCommandBuilder()
+    .setName('help')
+    .setDescription('Displays all commands!')
+    .addStringOption((emoji) => emoji.setName('command-name').setDescription('Name of the command to use')), // TODO: DELETE
+  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
+    await interaction.reply('Pong!');
+  },
+};
 
 const ConfigCommand: Command = {
   data: new SlashCommandBuilder()
@@ -212,7 +212,171 @@ const ConfigCommand: Command = {
   },
 };
 
+function responseEmbedBuilder(response: Response): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle(`${response.name} response`)
+    .addFields([
+      { name: 'Enabled', value: response.enabled ? 'Yes' : 'No' },
+      { name: 'Activation Regex', value: response.activationRegex },
+      { name: 'Capture Regex', value: response.captureRegex ?? 'None' },
+      { name: 'Output Template', value: response.outputTemplateString }
+    ]);
+}
+
+const ResponseCommand: Command = {
+  data: new SlashCommandBuilder()
+    .setName('response').setDescription('A response is an automated, generated response, upon a specific phrase.')
+    .addSubcommand((createResponseSubcommand) => createResponseSubcommand.setName('create')
+      .setDescription('Creates an automated, generated response, when a specific phrase is sent')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the automated response')
+        .setRequired(true))
+      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .setDescription('Whether the response starts enabled or not.')
+        .setRequired(true))
+      .addStringOption((activationRegexOption) => activationRegexOption.setName('activation-regex')
+        .setDescription('Regex that activates the formatted response, when detected')
+        .setRequired(true))
+      .addStringOption((captureRegexOption) => captureRegexOption.setName('capture-regex')
+        .setDescription('Regex for capturing and grouping terms within the original text')
+        .setRequired(true))
+      .addStringOption((outputTemplateOption) => outputTemplateOption.setName('output-template')
+        .setDescription('String for formatted output. Use {1}, {2}..., to use captured groups')
+        .setRequired(true)))
+    .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
+      .setDescription('Edit pre-existing responses')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the response to edit')
+        .setRequired(true))
+      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .setDescription('Whether the response is enabled or not'))
+      .addStringOption((activationRegexOption) => activationRegexOption.setName('activation-regex')
+        .setDescription('Regex that triggers the response'))
+      .addStringOption((captureRegexOption) => captureRegexOption.setName('capture-regex')
+        .setDescription('Regex for capturing and grouping terms within the original text.'))
+      .addStringOption((outputTemplateOption) => outputTemplateOption.setName('output-template')
+        .setDescription('String for formatted output. Use {1}, {2}..., to use captured groups')))
+    .addSubcommand((removeSubcommand) => removeSubcommand.setName('remove')
+      .setDescription('Remove a response')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the response to remove')
+        .setRequired(true)))
+    .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
+      .setDescription('View current settings for a given response')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the response to view'))),
+  async execute(interaction: ChatInputCommandInteraction, serverConfig: ServerConfig): Promise<ServerConfig | void> {
+    if (serverConfig === undefined) { console.error('Server is undefined'); return; }
+
+    const subCommandGroup = interaction.options.getSubcommandGroup();
+    const subCommand = interaction.options.getSubcommand();
+
+    if (subCommand === 'create') {
+      const nameOption = interaction.options.getString('name')!;
+      const enabledOption = interaction.options.getBoolean('enabled')! ?? false;
+      const activationRegex = interaction.options.getString('activation-regex')!;
+      const captureRegex = interaction.options.getString('capture-regex')!;
+      const outputTemplate = interaction.options.getString('output-template')!;
+
+      if (serverConfig.serverResponses.findIndex((r) => r.name === nameOption) !== -1) {
+        interaction.reply({ content: 'There is already a response with this name. Choose another and try again', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const newResponse: Response = {
+        name: nameOption,
+        enabled: enabledOption,
+        activationRegex,
+        captureRegex,
+        outputTemplateString: outputTemplate,
+      };
+
+      serverConfig.serverResponses.push(newResponse);
+
+      interaction.reply({ content: 'Successfully created response', embeds: [responseEmbedBuilder(newResponse)], flags: MessageFlags.Ephemeral });
+
+      return serverConfig;
+    }
+
+    if (subCommand === 'edit') {
+      const nameOption = interaction.options.getString('name')!;
+      const enabledOption = interaction.options.getBoolean('enabled');
+      const activationRegex = interaction.options.getString('activation-regex');
+      const captureRegex = interaction.options.getString('capture-regex');
+      const outputTemplate = interaction.options.getString('output-template');
+
+      // if user hasn't specified any attributes
+      if (enabledOption === null && !activationRegex && !captureRegex && !outputTemplate) {
+        interaction.reply({ content: 'You must select at least one attribute to edit!', flags: MessageFlags.Ephemeral });
+
+        return;
+      }
+
+      const referencedResponseIndex = serverConfig.serverResponses.findIndex((r) => r.name === nameOption);
+      if (referencedResponseIndex === -1) {
+        interaction.reply({ content: 'No server responses with that name were found. Ensure you spelled it correctly!', flags: MessageFlags.Ephemeral });
+
+        return;
+      }
+
+      const referencedResponse = serverConfig.serverResponses[referencedResponseIndex];
+
+      if (enabledOption !== null) {
+        referencedResponse.enabled = enabledOption;
+      }
+
+      referencedResponse.activationRegex = activationRegex ?? referencedResponse.activationRegex;
+      referencedResponse.captureRegex = captureRegex ?? referencedResponse.captureRegex;
+      referencedResponse.outputTemplateString = outputTemplate ?? referencedResponse.outputTemplateString;
+
+      serverConfig.serverResponses[referencedResponseIndex] = referencedResponse;
+
+      interaction.reply({ content: 'Successfully edited response!', flags: MessageFlags.Ephemeral });
+
+      return serverConfig;
+    }
+
+    if (subCommand === 'view') {
+      const nameOption = interaction.options.getString('name')!;
+
+      const referencedResponse = serverConfig.serverResponses.find((r) => r.name === nameOption);
+      if (!referencedResponse) { // none specified, so we'll view all
+        const embeds = serverConfig.serverResponses.map((response) => responseEmbedBuilder(response));
+
+        if (embeds.length === 0) {
+          interaction.reply({ content: 'There are zero responses', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        interaction.reply(({ embeds, flags: MessageFlags.Ephemeral }));
+        return;
+      }
+
+      interaction.reply(({ embeds: [responseEmbedBuilder(referencedResponse)], flags: MessageFlags.Ephemeral }));
+      return;
+    }
+
+    if (subCommand === 'remove') {
+      const nameOption = interaction.options.getString('name')!;
+
+      const referencedResponseIndex = serverConfig.serverResponses.findIndex((r) => r.name === nameOption);
+
+      if (referencedResponseIndex === -1) {
+        interaction.reply({ content: 'No server responses with that name were found. Ensure you spelled it correctly!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      serverConfig.serverResponses.splice(referencedResponseIndex, 1);
+
+      interaction.reply({ content: 'Successfully removed response', flags: MessageFlags.Ephemeral });
+
+      return serverConfig;
+    }
+  },
+};
+
 commandMap.set(Help.data.name, Help);
 commandMap.set(ConfigCommand.data.name, ConfigCommand);
+commandMap.set(ResponseCommand.data.name, ResponseCommand);
 
 export { commandMap, Help, ConfigCommand, HeartBoardFeature, VoicePingFeature };
