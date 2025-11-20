@@ -219,7 +219,7 @@ function responseEmbedBuilder(response: Response): EmbedBuilder {
       { name: 'Enabled', value: response.enabled ? 'Yes' : 'No' },
       { name: 'Activation Regex', value: response.activationRegex },
       { name: 'Capture Regex', value: response.captureRegex ?? 'None' },
-      { name: 'Output Template', value: response.outputTemplateString }
+      { name: 'Output Template', value: response.outputTemplateString },
     ]);
 }
 
@@ -268,7 +268,6 @@ const ResponseCommand: Command = {
   async execute(interaction: ChatInputCommandInteraction, serverConfig: ServerConfig): Promise<ServerConfig | void> {
     if (serverConfig === undefined) { console.error('Server is undefined'); return; }
 
-    const subCommandGroup = interaction.options.getSubcommandGroup();
     const subCommand = interaction.options.getSubcommand();
 
     if (subCommand === 'create') {

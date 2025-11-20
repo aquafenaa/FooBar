@@ -5,8 +5,8 @@ import { Message, Snowflake } from 'discord.js';
 import { GrokMessage, SaveData } from './types';
 import { writeData } from './data';
 
-// const discordClientID = '917594803481489429'; // working
-const discordClientID = '1211461538859327560'; // testing
+const discordClientID = '917594803481489429'; // working
+// const discordClientID = '1211461538859327560'; // testing
 
 const longMemoryLength = 7; // number of messages allowed before being summarized to core memory
 const shortMemoryLength = 20; // number of messages allowed in short-term memory
