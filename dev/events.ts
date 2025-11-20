@@ -33,13 +33,15 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
         if (!channel || !channel.isSendable()) return;
 
         try {
-          channel.messages.fetch(messageID ?? 'undefined'); // load message into cache
+          await channel.messages.fetch(messageID ?? 'undefined'); // load message into cache
         } catch (error) {
           invalidMessages.push(messageID);
         }
       });
+      const filteredMessages = heartBoardMessages.filter((m) => !invalidMessages.find((invalidMessageID) => m.messageID === invalidMessageID));
 
-      heartBoardMessages.filter((m) => invalidMessages.find((invalidMessageID) => m.messageID === invalidMessageID));
+      server.heartBoardMessages = filteredMessages;
+      editServerData(server);
     });
   });
 
@@ -86,53 +88,91 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     }
   });
 
+  const allowedServers = ['917588427959058462', '1064698336185172010'];
+
   // grok functionality, when message was sent
   discordClient.on('messageCreate', async (message) => {
     const { author, channel, guildId } = message;
+
+    // if we can't send messages, we don't care about the message
+    if (!message.guildId || !channel.isTextBased()) return;
+
+    const messageContent = message.content;
+    const serverConfig = await getServerConfig(message.guildId);
+
+    if (!serverConfig) return;
+
+    serverConfig.serverResponses.forEach((response) => {
+      // continue to next if response isn't enabled, or activation phrase isn't found
+      if (!response.enabled || !messageContent.match(response.activationRegex)) return;
+
+      const groups = messageContent.match(response.captureRegex!);
+
+      if (!groups) return; // return undefined, if no groups were found
+
+      // parse groups, and replace them with respective group number
+      if (!response.outputTemplateString) { console.log(response); return; }
+      const responseStr = response.outputTemplateString.replace(/\{(\d+)\}/g, (_, index) => { // thank u claude. this is actually a cute little implementation
+        const i = parseInt(index, 10);
+        return groups[i] ?? '';
+      });
+
+      message.reply({ content: responseStr });
+    });
+
+    // cancel if the message starts with "-ai"
+    if (messageContent.substring(0, 3) === '-ai') return;
 
     // the bot cannot respond to itself
     if (!author.id || author.id === discordClient.user?.id) return;
 
     // only works within my server, sorry! otherwise it's a waste of xAI tokens & money :/
-    if (!message.guildId || !channel.isTextBased() || (guildId !== '917588427959058462' && guildId !== '1064698336185172010')) return;
-
-    const messageReference = message.reference ? await message.fetchReference() : undefined;
+    if (!allowedServers.find((id) => guildId === id)) return;
 
     // we do not care if...
     if ((
-      message.content.includes('@everyone') || message.content.includes('@here')
+      message.content.includes('@everyone') || message.content.includes('@here') // ...it's a mass ping...
       || !message.mentions.has(discordClient.user?.id ?? 'undefined') // ... bot isn't mentioned...
-      || message.author.id === discordClient.user?.id) // ...or the bot mentioned itself...
-      && Math.random() < 0.990) return; // ...and we don't roll a 1% chance to respond anyway...
+      || message.author.id === discordClient.user?.id)) return; // ...or the bot mentioned itself...
+    // && Math.random() < 1 / 4096) return; // ...and we don't roll a 1% chance to respond anyway... <-- big bug, will fix.
 
     // if the ai feature isn't enabled, or there isn't an available server config
     if (!(await getServerConfig(message.guildId))?.aiEnabled) return;
 
-    const messages: Message<boolean>[] = messageReference ? [await message.fetchReference(), message] : [message];
+    let userContent = message.content; // remove '-ai' marker from beginning of text
+    const messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
+    const context: Message<boolean>[] | undefined = Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: message.id }))).values()); // fetch 5 most recent messages as context
 
-    // TODO: replace these w config variables
-    messages.push(...((await channel.messages.fetch(({ limit: 5, cache: true }))).values()), ...messages); // fetches 5 previous messages and adds them to our array
+    // if a user is responding to a message, we add it to our message
+    if (messageReference && messageReference.content.length > 0) {
+      userContent = `Responding to: "${messageReference.content}"\nResponse: "${userContent}"`;
+    }
 
     message.channel.sendTyping(); // starts typing indicator...
     const typingExtension = setInterval(() => {
       message.channel.sendTyping();
-    }, 5000); // ... and refreshes it every 5 seconds until cancelled
+    }, 5000); // ... and refreshes it every 5 seconds, until cancelled
 
     setTimeout(() => {
       clearInterval(typingExtension);
-    }, 20000); // cancel interval after 20 seconds, if it's still going
+    }, 20000); // cancel interval after 20 seconds, if it's still somehow going
 
     // get response from grok, and reply
-    generateMessage(messages.reverse(), grokClient, await readData(), discordClient.user!.id).then((response) => {
-      if (!response) return;
+    const grokReply = await generateMessage(message, userContent, context ?? [], grokClient, await readData(), discordClient.user!.id, typingExtension);
+    try {
+      if (!grokReply) return;
       clearInterval(typingExtension); // disables typing
 
-      message.reply({ content: response });
-    }).catch((e) => {
+      if (grokReply.length < 2000) {
+        await message.reply(grokReply);
+      } else {
+        await message.reply(grokReply.substring(0, 2000));
+      }
+    } catch (error) {
       clearInterval(typingExtension); // disables typing
 
-      console.error(e);
-    });
+      console.error(error);
+    }
   });
 
   // On user joining/leaving voice call
@@ -162,6 +202,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     }
   });
 
+  // Heartboard reaction function
   const reactionFunction = async (reactionAdded: boolean, reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     const { message } = reaction;
 

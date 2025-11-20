@@ -5,7 +5,9 @@ import { AutocompleteInteraction, CommandInteraction, EmbedBuilder, SlashCommand
 */
 interface ServerConfig {
   id: Snowflake,
+
   aiEnabled: boolean,
+  serverResponses: Response[],
   heartBoard: HeartBoardConfig,
   voicePing: VoicePingConfig,
 }
@@ -35,18 +37,19 @@ interface VoicePingConfig {
 }
 
 /*
- * Data--more volatile and less important than direct configs. stored in ./data/data.json
+ * Data--more volatile and less important than direct configs. stored in ./data/data.json (stupid name, ik)
 */
 interface SaveData {
   servers: ServerData[],
+
   grokCoreMemory: string;
 }
 interface ServerData {
   id: Snowflake, // server ID
-  heartBoardMessages: HeartBoardMessage[]; // channelID, messageID -> embedMessageID
+  heartBoardMessages: HeartBoardMessage[];
 }
 
-/*
+/**
  * A command is added automatically as a SlashCommand that a Discord user may call
  * i.e. Help or Config
  *
@@ -61,7 +64,19 @@ interface Command {
   autocomplete?(interaction: AutocompleteInteraction, serverConfig: ServerConfig): Promise<void>;
 }
 
-/*
+/**
+ * A response is an automatic response from the bot
+ *
+*/
+interface Response {
+  enabled: boolean,
+  name: string,
+  activationRegex: string,
+  captureRegex: string | undefined, // capturing regex for the response to use
+  outputTemplateString: string,
+}
+
+/**
  * A feature is a behaviour by the bot that isn't directly influenced by commands
  * i.e. VoicePing or HeartBoard messages
  *
@@ -73,11 +88,11 @@ interface Command {
 interface Feature {
   name: string,
   description: string,
-  configEmbedBuilder(embedTitle: string, serverConfig: ServerConfig): EmbedBuilder
+  configEmbedBuilder(embedTitle: string, serverConfig: ServerConfig): EmbedBuilder,
 }
 
 /*
- * Grok (an LLM built into the Discord bot) types. Used largely in grok.ts
+ * Grok (an LLM built into the Discord bot) types. Mostly implemented in grok.ts
 */
 interface GrokMessage {
   role: 'system' | 'user' | 'assistant',
@@ -96,7 +111,7 @@ const defaultHeartboardConfig: HeartBoardConfig = {
   cumulative: false,
   denyAuthor: false,
   thresholdNumber: 3,
-  emojis: ['❤️'],
+  emojis: ['❤️'], // all UTF emojis MUST be in their UTF form, instead of discord's :heart: format ("❤️", not ":heart:")
   outputChannel: '',
 };
 const defaultVoicepingConfig: VoicePingConfig = {
@@ -107,8 +122,9 @@ const defaultVoicepingConfig: VoicePingConfig = {
 };
 
 export {
-  ConfigData, SaveData, ServerData, ServerConfig, Command, Feature, // Savedata, Commands, and Features
-  GrokMessage, // AI-related types
+  ConfigData, SaveData, ServerData, ServerConfig, // Save data
+  Command, Response, Feature, // Savedata, Commands, and Features
+  GrokMessage, // AI-related types (🤮)
   HeartBoardMessage, HeartBoardConfig, VoicePingConfig, // Feature config types
   defaultHeartboardConfig, defaultVoicepingConfig, // Defaults
 };
