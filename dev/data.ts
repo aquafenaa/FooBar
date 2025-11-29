@@ -162,42 +162,33 @@ async function editServerConfig(serverConfig: ServerConfig) {
 
 // REPAIRS AN INCOMPLETE SERVER DATA WITH DEFAULT DATA
 function repairServerData(serverData: any): ServerData {
-  let changed = false;
+  if (!serverData.id) return serverData;
 
-  if (serverData.id && !serverData.heartBoardMessages) {
-    serverData.heartBoardMessages = [];
+  const fixedData: ServerData = {
+    id: serverData.id,
 
-    changed = true;
-  }
+    heartBoardMessages: serverData.heartboardMessage ?? [],
+    chatbotCoreMemory: serverData.chatbotCoreMemory ?? '',
+    chatbotLongtermMemory: serverData.chatbotLongtermMemory ?? [],
+    chatbotShortTermMessages: serverData.chatbotShortTermMessages ?? [],
+  };
 
-  if (changed) editServerData(serverData); // update if changed
-
-  return serverData;
+  editServerData(fixedData); // update if changed
+  return fixedData;
 }
 
 function repairServerConfig(serverConfig: any): ServerConfig {
-  let changed = false;
+  const fixedConfig: ServerConfig = {
+    id: serverConfig.id,
 
-  if (!serverConfig.serverResponses) {
-    serverConfig.serverResponses = [];
+    aiEnabled: serverConfig.aiEnabled ?? false,
+    serverResponses: serverConfig.serverResponses ?? [],
+    heartBoard: serverConfig.heartBoard ?? defaultHeartboardConfig,
+    voicePing: serverConfig.voicePing ?? defaultVoicepingConfig,
+  };
 
-    changed = true;
-  }
-
-  if (!serverConfig.heartBoard) {
-    serverConfig.heartBoard = defaultHeartboardConfig;
-
-    changed = true;
-  }
-  if (!serverConfig.voicePing) {
-    serverConfig.voicePing = defaultVoicepingConfig;
-
-    changed = true;
-  }
-
-  if (changed) editServerConfig(serverConfig); // update if changed
-
-  return serverConfig;
+  editServerConfig(fixedConfig); // update if changed
+  return fixedConfig;
 }
 
 export {
