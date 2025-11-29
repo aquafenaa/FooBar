@@ -8,7 +8,7 @@ import { generateMessage } from './chatbot';
 import { addConfig, addData, editServerConfig, editServerData, getServerConfig, getServerData, readConfig, readData, repairServerConfig, repairServerData } from './data';
 
 function clientEvents(discordClient: Client, grokClient: OpenAI) {
-  discordClient.on('ready', async () => {
+  discordClient.on('clientReady', async () => {
     console.log(`Client logged in as ${discordClient.user?.tag}!`);
 
     // verify all data and configs in case structures changed
