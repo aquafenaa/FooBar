@@ -75,19 +75,6 @@ async function readConfig(): Promise<ConfigData> {
   return JSON.parse(await readFile(configPath, 'utf-8'));
 }
 
-// GETS DATA GIVEN A GUILD ID
-async function getServerData(guildID: Snowflake): Promise<ServerData | undefined> {
-  const data = await readData();
-
-  return data.servers.find((s) => s.id === guildID);
-}
-
-async function getServerConfig(guildID: Snowflake): Promise<ServerConfig | undefined> {
-  const config = await readConfig();
-
-  return config.servers.find((server) => server.id === guildID);
-}
-
 // ADDS A NEW SERVER IF GUILD ID DOESN'T EXIST
 async function addData(guildID: string): Promise<ServerData> {
   const data = await readData();
@@ -98,6 +85,10 @@ async function addData(guildID: string): Promise<ServerData> {
   const serverData: ServerData = {
     id: guildID,
     heartBoardMessages: [],
+
+    chatbotCoreMemory: '',
+    chatbotLongtermMemory: [],
+    chatbotShortTermMessages: [],
   };
 
   data.servers.push(serverData);
@@ -125,6 +116,21 @@ async function addConfig(guildID: string): Promise<ServerConfig> {
   writeConfig(config);
 
   return serverConfig;
+}
+
+// GETS DATA GIVEN A GUILD ID
+async function getServerData(guildID: Snowflake): Promise<ServerData | undefined> {
+  const data = await readData();
+
+  const serverData = data.servers.find((s) => s.id === guildID);
+
+  return serverData ?? await addData(guildID);
+}
+
+async function getServerConfig(guildID: Snowflake): Promise<ServerConfig | undefined> {
+  const config = await readConfig();
+
+  return config.servers.find((server) => server.id === guildID);
 }
 
 // EDITS AN EXISTING SERVER IF IT EXISTS, OR CREATES ONE
