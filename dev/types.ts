@@ -1,7 +1,10 @@
 import { AutocompleteInteraction, CommandInteraction, EmbedBuilder, SlashCommandBuilder, Snowflake } from 'discord.js';
 
-/*
- * Configs--permanent data for various commands and features. stored in ./data/config.json
+// Configs--permanent data for various commands and features. stored in ./data/config.json
+
+/**
+ * Holds configuration data for a discordJS Guild
+ *
 */
 interface ServerConfig {
   id: Snowflake,
@@ -9,17 +12,12 @@ interface ServerConfig {
   aiEnabled: boolean,
   serverResponses: Response[],
   heartBoard: HeartBoardConfig,
-  voicePing: VoicePingConfig,
+  voicePing: VoicePingConfig;
 }
 interface ConfigData {
   servers: ServerConfig[];
 }
 
-interface HeartBoardMessage {
-  channelID: Snowflake,
-  messageID: Snowflake,
-  embedMessageID: Snowflake;
-}
 interface HeartBoardConfig {
   enabled: boolean,
   cumulative: boolean,
@@ -27,6 +25,11 @@ interface HeartBoardConfig {
   thresholdNumber: number,
   emojis: Snowflake[],
   outputChannel: Snowflake;
+}
+interface HeartBoardMessage {
+  channelID: Snowflake,
+  messageID: Snowflake,
+  embedMessageID: Snowflake;
 }
 
 interface VoicePingConfig {
@@ -36,17 +39,19 @@ interface VoicePingConfig {
   outputChannel: Snowflake;
 }
 
-/*
+/**
  * Data--more volatile and less important than direct configs. stored in ./data/data.json (stupid name, ik)
 */
 interface SaveData {
   servers: ServerData[],
-
-  grokCoreMemory: string;
 }
 interface ServerData {
   id: Snowflake, // server ID
-  heartBoardMessages: HeartBoardMessage[];
+  heartBoardMessages: HeartBoardMessage[],
+
+  chatbotShortTermMessages: ChatbotMessage[],
+  chatbotLongtermMemory: string[],
+  chatbotCoreMemory: string;
 }
 
 /**
@@ -73,7 +78,7 @@ interface Response {
   name: string,
   activationRegex: string,
   captureRegex: string | undefined, // capturing regex for the response to use
-  outputTemplateString: string,
+  outputTemplateString: string;
 }
 
 /**
@@ -88,19 +93,19 @@ interface Response {
 interface Feature {
   name: string,
   description: string,
-  configEmbedBuilder(embedTitle: string, serverConfig: ServerConfig): EmbedBuilder,
+  configEmbedBuilder(embedTitle: string, serverConfig: ServerConfig): EmbedBuilder;
 }
 
 /*
  * Grok (an LLM built into the Discord bot) types. Mostly implemented in grok.ts
 */
-interface GrokMessage {
-  role: 'system' | 'user' | 'assistant',
+interface ChatbotMessage {
+  role: 'system' | 'user' | 'assistant', // role, as defined by OpenAI API
   author: string, // author of message's display name
   authorID: Snowflake, // ID of the author
-  timestamp: number,
-  messageID: Snowflake; // saved for later in case of future reference ability
-  messageContent: string,
+  timestamp: number, // time the message was originally sent
+  messageID: Snowflake, // saved for later in case of future reference ability
+  messageContent: string;
 }
 
 /*
@@ -124,7 +129,7 @@ const defaultVoicepingConfig: VoicePingConfig = {
 export {
   ConfigData, SaveData, ServerData, ServerConfig, // Save data
   Command, Response, Feature, // Savedata, Commands, and Features
-  GrokMessage, // AI-related types (🤮)
+  ChatbotMessage, // AI-related types (🤮)
   HeartBoardMessage, HeartBoardConfig, VoicePingConfig, // Feature config types
   defaultHeartboardConfig, defaultVoicepingConfig, // Defaults
 };

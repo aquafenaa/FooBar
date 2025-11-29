@@ -3,7 +3,7 @@ import { Client, EmbedBuilder, Events, Message, MessageReaction, PartialMessageR
 
 import { Command } from './types';
 import { commandMap } from './commands';
-import { generateMessage } from './grok';
+import { generateMessage } from './chatbot';
 
 import { addConfig, addData, editServerConfig, editServerData, getServerConfig, getServerData, readConfig, readData, repairServerConfig, repairServerData } from './data';
 
@@ -88,17 +88,17 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     }
   });
 
-  const allowedServers = ['917588427959058462', '1064698336185172010'];
+  const allowedServers = ['917588427959058462', '1064698336185172010', '708642778300547142', '1148069131711680633'];
 
   // grok functionality, when message was sent
   discordClient.on('messageCreate', async (message) => {
     const { author, channel, guildId } = message;
 
     // if we can't send messages, we don't care about the message
-    if (!message.guildId || !channel.isTextBased()) return;
+    if (!guildId || !channel.isTextBased()) return;
 
     const messageContent = message.content;
-    const serverConfig = await getServerConfig(message.guildId);
+    const serverConfig = await getServerConfig(guildId);
 
     if (!serverConfig) return;
 
@@ -126,7 +126,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     // the bot cannot respond to itself
     if (!author.id || author.id === discordClient.user?.id) return;
 
-    // only works within my server, sorry! otherwise it's a waste of xAI tokens & money :/
+    // only works within my servers, sorry! otherwise it's a waste of xAI tokens & money :/
     if (!allowedServers.find((id) => guildId === id)) return;
 
     // we do not care if...
@@ -137,7 +137,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     // && Math.random() < 1 / 4096) return; // ...and we don't roll a 1% chance to respond anyway... <-- big bug, will fix.
 
     // if the ai feature isn't enabled, or there isn't an available server config
-    if (!(await getServerConfig(message.guildId))?.aiEnabled) return;
+    if (!(await getServerConfig(guildId))?.aiEnabled) return;
 
     let userContent = message.content; // remove '-ai' marker from beginning of text
     const messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
@@ -158,7 +158,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     }, 20000); // cancel interval after 20 seconds, if it's still somehow going
 
     // get response from grok, and reply
-    const grokReply = await generateMessage(message, userContent, context ?? [], grokClient, await readData(), discordClient.user!.id, typingExtension);
+    const grokReply = await generateMessage(message, userContent, context ?? [], grokClient, (await getServerData(guildId))!, discordClient.user!.id, typingExtension);
     try {
       if (!grokReply) return;
       clearInterval(typingExtension); // disables typing
