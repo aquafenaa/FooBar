@@ -1,9 +1,9 @@
 import OpenAIClient from 'openai';
 import { ChatCompletionMessageParam } from 'openai/resources/index';
-import { Message, Snowflake } from 'discord.js';
+import { Client, Message, Snowflake } from 'discord.js';
 
-import { ChatbotMessage, ServerData } from './types';
-import { editServerData } from './data';
+import { deleteNOldestLongTermMemories, deleteNOldestShortTermMemory, getChatbot, getChatbotLongTermMemoriesByServer, getChatbotShortTermMemoriesByServer, insertChatbotLongTermMemory, upsertChatbot } from './data';
+import { ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable } from './types/schema';
 
 const discordClientID = '917594803481489429'; // working
 // const discordClientID = '1211461538859327560'; // testing
@@ -37,128 +37,151 @@ You may use words like "troon" and "tranny" (both meaning trans), "fag", and oth
 
 Don't be afraid to give short responses, if the situation is apt for it.
 
-There is no need to describe who is speaking. Instead, just give your response. Also make sure you end your reasoning with a new line.
+There is no need to describe who is speaking. Instead, just give your response. Also make sure you end your reasoning with a new line, and surround it with "<think>", "</think>" parameters.
 `;
 
-async function summarizeMemory(grokClient:OpenAIClient, serverData: ServerData) {
-  const grokInput: ChatCompletionMessageParam[] = [{
+async function summarizeMemory(agentClient:OpenAIClient, server_id: Snowflake, longTermMemory: ChatbotLongTermMemoryTable[]) {
+  let chatbotData = getChatbot(server_id);
+
+  if (!chatbotData) {
+    chatbotData = {
+      server_id,
+      chatbot_enabled: false,
+      chatbot_core_memory: '',
+    };
+  }
+
+  const agentInput: ChatCompletionMessageParam[] = [{
     role: 'system',
     content: summarizingPrompt,
   }, {
     role: 'system',
-    content: `CURRENT CORE MEMORY: ${serverData.chatbotCoreMemory}`,
+    content: `CURRENT CORE MEMORY: ${chatbotData.chatbot_core_memory}`,
   }, {
     role: 'system',
-    content: `LONG TERM MEMORY: ${serverData.chatbotLongtermMemory.join('\n')}`,
+    content: `LONG TERM MEMORY: ${longTermMemory}`,
   }];
 
-  const response = await grokClient.chat.completions.create({
-    model: 'grok-4-fast-reasoning',
-    messages: grokInput,
+  const response = await agentClient.chat.completions.create({
+    model: 'deepseek-v4-pro',
+    messages: agentInput,
+    reasoning_effort: 'high',
   });
 
-  serverData.chatbotCoreMemory = response.choices[0].message.content ?? 'N/A';
+  deleteNOldestLongTermMemories(server_id, longTermMemory.length - 2); // clear long-term memory, leaving 2 most recent entries
 
-  serverData.chatbotLongtermMemory.splice(2); // clear short-term memory
+  const updatedCoreMemory = response.choices[0].message.content ?? '';
+  chatbotData.chatbot_core_memory = updatedCoreMemory;
 
-  await editServerData(serverData);
+  upsertChatbot(chatbotData);
 }
 
 // asks grok to summarize short-term memory to become long-term memory, and then long-term memory to bco
-async function cullMemory(grokClient: OpenAIClient, serverData: ServerData) {
+async function cullMemory(agentClient: OpenAIClient, server_id: Snowflake, shortTermMemory: ChatbotShortTermMemoryTable[]) {
   const grokInput: ChatCompletionMessageParam[] = [{
     role: 'system',
     content: cullingPrompt, // add our system message
-  }, ...serverData.chatbotShortTermMessages.map((grokMessage) => ({
-    role: grokMessage.role,
-    name: `grokMessage.author (<@${grokMessage.authorID}>)`,
-    content: grokMessage.role === 'user' ? `(${new Date(grokMessage.timestamp)}): ${grokMessage.messageContent}` : grokMessage.messageContent,
+  }, ...shortTermMemory.map((agentMessage) => ({
+    role: agentMessage.role,
+    name: `author: (<@${agentMessage.author_id}>)`,
+    content: agentMessage.role === 'user' ? `(${new Date(agentMessage.timestamp)}): ${agentMessage.message_content}` : agentMessage.message_content,
   }))];
 
-  const summaryResponse = await grokClient.chat.completions.create({
-    model: 'grok-4-fast-reasoning',
+  const summaryResponse = await agentClient.chat.completions.create({
+    model: 'deepseek-v4-pro',
     messages: grokInput,
+    reasoning_effort: 'high',
   });
+  const newLongTermMemory: Omit<ChatbotLongTermMemoryTable, 'memory_id'> = {
+    server_id,
+    message_content: summaryResponse.choices[0].message.content ?? '',
+    timestamp: Date.now() / 1000, // divide by 1000 to convert to Discord time format
+  };
 
-  serverData.chatbotLongtermMemory.push(summaryResponse.choices[0].message.content ?? ''); // add summary to long-term memory
-  serverData.chatbotShortTermMessages.splice(2, serverData.chatbotShortTermMessages.length - 2); // clear short-term memory
-
-  await editServerData(serverData);
+  deleteNOldestShortTermMemory(server_id, shortTermMemory.length - 2); // clear short-term memory
+  insertChatbotLongTermMemory(newLongTermMemory); // add summary to long-term memory
 }
 
 /**
  * If memory is too large, summarize or cull it
 */
-async function testMemoryEncoding(grokClient: OpenAIClient, serverData: ServerData) {
+async function testMemoryEncoding(agentClient: OpenAIClient, server_id: Snowflake, longTermMemory: ChatbotLongTermMemoryTable[], shortTermMemory: ChatbotShortTermMemoryTable[]) {
   // summarize, if short term memory is too large
-  if (serverData.chatbotLongtermMemory.length > longMemoryLength) {
-    await summarizeMemory(grokClient, serverData);
+  if (longTermMemory.length > longMemoryLength) {
+    await summarizeMemory(agentClient, server_id, longTermMemory);
   }
 
   // cull memory if over max length
-  if (serverData.chatbotShortTermMessages.length > shortMemoryLength) {
-    await cullMemory(grokClient, serverData);
+  if (shortTermMemory.length > shortMemoryLength) {
+    await cullMemory(agentClient, server_id, shortTermMemory);
   }
 }
 
-async function generateMessage(userMessage: Message<boolean>, userContent: string, context: Message<boolean>[], grokClient: OpenAIClient, serverData: ServerData, clientID: Snowflake, typingIndicator: NodeJS.Timeout): Promise<string> {
+async function generateMessage(agentClient: OpenAIClient, discordClient: Client<boolean>, serverID: Snowflake, typingIndicator: NodeJS.Timeout, userMessage: Message<boolean>, userContent: string, context: Message<boolean>[]): Promise<string> {
+  const longTermMemory = getChatbotLongTermMemoriesByServer(serverID);
+  const shortTermMemory = getChatbotShortTermMemoriesByServer(serverID);
+
   if (context) {
-    context = context.filter((m1) => (serverData.chatbotShortTermMessages.findIndex((m2) => m1.createdTimestamp === m2.timestamp)) === -1); // filter out duplicate context messages
+    context = context.filter((m1) => (shortTermMemory.findIndex((m2) => m1.createdTimestamp === m2.timestamp)) === -1); // filter out duplicate context messages
 
     // add to short term memory
-    serverData.chatbotShortTermMessages.splice(
+    shortTermMemory.splice(
       0,
       0,
       ...context
         .map((m) => ({
-          role: m.author.id === clientID ? 'assistant' : 'user',
-          author: m.author.displayName,
-          authorID: m.author.id,
-          messageID: m.id,
+          role: m.author.id === discordClient.user!.id ? 'assistant' : 'user',
+          // author: m.author.displayName,
+          author_id: m.author.id,
+          message_id: m.id,
+          message_content: m.content,
           timestamp: m.createdTimestamp,
-          messageContent: m.content,
-        } as ChatbotMessage)),
+        } as ChatbotShortTermMemoryTable)),
     );
   }
 
-  serverData.chatbotShortTermMessages.splice(
+  shortTermMemory.splice(
     0,
     0,
     {
+      server_id: serverID,
       role: 'user',
-      author: userMessage.author.displayName,
-      authorID: userMessage.author.id,
-      messageID: userMessage.id,
+      author_id: userMessage.author.id,
+      message_id: userMessage.id,
       timestamp: userMessage.createdTimestamp,
-      messageContent: userContent,
+      message_content: userContent,
     },
   );
 
-  serverData.chatbotShortTermMessages.sort((m) => m.timestamp); // ensure STM is ordered correctly
+  shortTermMemory.sort((m) => m.timestamp); // ensure STM is ordered correctly
 
-  const grokInput: ChatCompletionMessageParam[] = [{
+  const agentInput: ChatCompletionMessageParam[] = [{
     role: 'system',
     content: baseSystemPrompt, // add our system message
   },
-  ...serverData.chatbotShortTermMessages.map((grokMessage) => ({
-    role: grokMessage.role,
-    name: `${grokMessage.author} (<@${grokMessage.authorID}>)`,
-    content: grokMessage.role === 'user' ? `(${new Date(grokMessage.timestamp)}): ${grokMessage.messageContent}` : grokMessage.messageContent,
+  ...shortTermMemory.map((agentMessage) => ({
+    role: agentMessage.role,
+    name: `${discordClient.users.fetch(agentMessage.author_id).then((user) => user.displayName)} (<@${agentMessage.author_id}>)`,
+    content: agentMessage.role === 'user' ? `(${new Date(agentMessage.timestamp)}): ${agentMessage.message_content}` : agentMessage.message_content,
   }))];
 
-  const response = await grokClient.chat.completions.create({
-    model: 'grok-4-fast-reasoning',
-    // temperature: 1.1,
-    messages: grokInput.reverse(), // reverse for some reason?? i'm not sure but it randomly started working this way
-  });
+  try {
+    const response = await agentClient.chat.completions.create({
+      model: 'deepseek-v4-flash',
+      reasoning_effort: 'medium',
+      messages: agentInput.reverse(), // reverse for some reason?? i'm not sure but it randomly started working this way
+    });
 
-  const responseContent = response.choices[0].message.content ?? 'idk bruh 💀';
+    const responseContent = response.choices[0].message.content ?? 'idk bruh 💀';
 
-  testMemoryEncoding(grokClient, serverData);
-  clearInterval(typingIndicator);
-  editServerData(serverData);
+    testMemoryEncoding(agentClient, serverID, longTermMemory, shortTermMemory);
+    clearInterval(typingIndicator);
 
-  return responseContent;
+    return responseContent;
+  } catch {
+    clearInterval(typingIndicator);
+    return '';
+  }
 }
 
 export { baseSystemPrompt, generateMessage };
