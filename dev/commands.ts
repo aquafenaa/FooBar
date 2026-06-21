@@ -1,78 +1,526 @@
 import {
   ChatInputCommandInteraction,
+  Snowflake, AutocompleteInteraction,
   EmbedBuilder, MessageFlags, SlashCommandBuilder,
+  ChannelType,
 } from 'discord.js';
-import { Command, Feature, Response, ServerConfig } from './types';
+import { Command, ConfigCommand, Feature } from './types/bot';
+import { deleteAllHeartBoardEmojis, deleteHeartBoard, getChatbot, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getVoicePing, getVoicePingsByServer, insertHeartBoard, insertHeartBoardEmoji, insertVoicePing, insertVoicePingInput, updateHeartBoard, updateVoicePing } from './data';
+import { HeartBoardTable, VoicePingTable } from './types/schema';
 
 const commandMap: Map<string, Command> = new Map();
 const featureMap: Map<string, Feature> = new Map();
 
-const HeartBoardFeature: Feature = {
-  name: 'heartboard',
-  description: 'Highlights beloved messages with a certain amount of reactions',
-  configEmbedBuilder(title: string, serverConfig: ServerConfig) {
-    const { enabled, cumulative, denyAuthor, thresholdNumber, emojis, outputChannel } = serverConfig.heartBoard;
-
-    return new EmbedBuilder()
-      .setTitle(title)
-      .addFields(
-        { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
-        { name: 'Cumulative Threshold', value: (cumulative ? 'Yes' : 'No') },
-        { name: 'Exclude Author\'s Reactions', value: `${denyAuthor ? 'Yes' : 'No'}` },
-        { name: 'Threshold Value', value: `${thresholdNumber}` },
-        { name: 'Emojis', value: `${emojis.join(', ')}` },
-        { name: 'HeartBoard Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
-      );
-  },
-};
-
 const AIFeature: Feature = {
   name: 'ai-messages',
   description: 'When pinged or replied to, the bot generates an LLM response',
-  configEmbedBuilder(title: string, serverConfig: ServerConfig) {
-    const { aiEnabled } = serverConfig;
+  configEmbedBuilder(title: string, serverID: Snowflake) {
+    const chatbot = getChatbot(serverID);
 
     return new EmbedBuilder()
       .setTitle(title)
       .addFields(
-        { name: 'Enabled', value: (aiEnabled ? 'Yes' : 'No') },
+        { name: 'Enabled', value: (chatbot?.chatbot_enabled ? 'Yes' : 'No') },
       );
   },
 };
 
-const VoicePingFeature: Feature = {
-  name: 'voice-ping',
-  description: 'Sends a message when a user joins a voice channel',
-  configEmbedBuilder(title: string, serverConfig: ServerConfig) {
-    const { enabled, voicePingMessage, inputChannels, outputChannel } = serverConfig.voicePing;
+// const VoicePingFeature: Feature = {
+//   name: 'voice-ping',
+//   description: 'Sends a message when a user joins a voice channel',
+//   configEmbedBuilder(title: string, serverID: Snowflake) {
+//     const voicePing = getVoicePing(serverID);
+//     const { enabled, voicePingMessage, inputChannels, outputChannel } = serverConfig.voicePing;
 
-    return new EmbedBuilder()
-      .setTitle(title)
-      .addFields(
-        { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
-        { name: 'Message', value: voicePingMessage ?? 'No message set' },
-        { name: 'Listener Channels', value: inputChannels && inputChannels.length > 0 ? inputChannels?.map((id) => `<#${id}>`)?.join(', ') : 'No channels set' },
-        { name: 'Log Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
-      );
-  },
-};
+//     return new EmbedBuilder()
+//       .setTitle(title)
+//       .addFields(
+//         { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
+//         { name: 'Message', value: voicePingMessage ?? 'No message set' },
+//         { name: 'Listener Channels', value: inputChannels && inputChannels.length > 0 ? inputChannels?.map((id) => `<#${id}>`)?.join(', ') : 'No channels set' },
+//         { name: 'Log Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
+//       );
+//   },
+// };
 
 // set features before config so that we can generate feature name choices
-featureMap.set(HeartBoardFeature.name, HeartBoardFeature);
+// featureMap.set(HeartBoardFeature.name, HeartBoardFeature);
+// featureMap.set(VoicePingFeature.name, VoicePingFeature);
 featureMap.set(AIFeature.name, AIFeature);
-featureMap.set(VoicePingFeature.name, VoicePingFeature);
 
-const Help: Command = {
+const HeartboardCommand: ConfigCommand = {
   data: new SlashCommandBuilder()
-    .setName('help')
-    .setDescription('Displays all commands!')
-    .addStringOption((emoji) => emoji.setName('command-name').setDescription('Name of the command to use')), // TODO: DELETE
-  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
-    await interaction.reply('Pong!');
+    .setName('heartboard')
+    .setDescription('A board that keeps track of all messages above a threshold of reactions')
+    .addSubcommand((listSubcommand) => listSubcommand.setName('list')
+      .setDescription('Lists existing boards in the server'))
+    .addSubcommand((statusSubcommand) => statusSubcommand.setName('status')
+      .setDescription('Enable or disable')
+      .addStringOption((heartboardNameOption) => heartboardNameOption.setName('name')
+        .setDescription('Name of the board you wish to enable/disable')
+        .setAutocomplete(true)
+        .setRequired(true))
+      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .setDescription('Whether to enable or disable the option. True = Enable')
+        .setRequired(true)))
+    .addSubcommand((createSubcommand) => createSubcommand.setName('create')
+      .setDescription('Create a new Heartboard')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name for the new board')
+        .setRequired(true))
+      .addStringOption((emojisOption) => emojisOption.setName('emojis')
+        .setDescription('List of emojis the board should listen for. Separate each using commas')
+        .setRequired(true))
+      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .setDescription('Whether the board should be enabled or not')
+        .setRequired(true))
+      .addBooleanOption((denyAuthorOption) => denyAuthorOption.setName('deny-author')
+        .setDescription('Whether to stop the author of the message from adding a board reaction')
+        .setRequired(true))
+      .addIntegerOption((thresholdOption) => thresholdOption.setName('threshold')
+        .setDescription('What threshold should of reactions should trigger the board')
+        .setMinValue(1)
+        .setRequired(true))
+      .addChannelOption((outputChannelOption) => outputChannelOption.setName('output-channel')
+        .setDescription('The channel to send the message is highlighted in')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.PublicThread)
+        .setRequired(true)))
+    .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
+      .setDescription('Edit the settings of an existing board')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('The name of the board to edit')
+        .setAutocomplete(true)
+        .setRequired(true))
+      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .setDescription('Whether the board is enabled or not (True = enabled)'))
+      .addStringOption((emojisOption) => emojisOption.setName('emojis')
+        .setDescription('List of emojis the board should listen for. Separate each using commas'))
+      .addBooleanOption((denyAuthorOption) => denyAuthorOption.setName('deny-author')
+        .setDescription('Whether to stop the author of the message from adding a board reaction'))
+      .addIntegerOption((thresholdOption) => thresholdOption.setName('threshold')
+        .setDescription('What threshold should of reactions should trigger the board')
+        .setMinValue(1))
+      .addChannelOption((outputChannelOption) => outputChannelOption.setName('output-channel')
+        .setDescription('The channel to send the message is highlighted in')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.PublicThread)))
+    .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete')
+      .setDescription('Delete a heartboard')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the heartboard to delete')
+        .setAutocomplete(true)
+        .setRequired(true)))
+    .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
+      .setDescription('View the current settings of a heartboard')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name for the heartboard settings to view')
+        .setAutocomplete(true)
+        .setRequired(true))),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake) {
+    const subCommand = interaction.options.getSubcommand();
+
+    if (subCommand === 'list') {
+      const heartBoards = getHeartBoardsByServer(serverID);
+      if (!heartBoards) {
+        interaction.reply({ content: 'There are currently no heartboards on this server.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const heartboardFields = heartBoards.map((heartboard) => ({
+        name: `${heartboard.board_name} (${heartboard.enabled ? '✔' : '✘'})`,
+        value: getHeartBoardEmojis(serverID, heartboard.board_name).join(', '),
+      }));
+      const embed = new EmbedBuilder().setTitle('Heartboards').addFields(...heartboardFields);
+
+      interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subCommand === 'status') {
+      const nameOption = interaction.options.getString('name')!;
+      const enabledOption = interaction.options.getBoolean('enabled')!;
+
+      try {
+        const heartBoard = getHeartBoard(serverID, nameOption);
+
+        if (!heartBoard) {
+          interaction.reply({ content: 'There is no heartboard with that name', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        heartBoard.enabled = enabledOption;
+        updateHeartBoard(heartBoard);
+
+        interaction.reply({ content: 'Successfully updated heartboard', flags: MessageFlags.Ephemeral });
+        return;
+      } catch (exception) {
+        interaction.reply({ content: 'There was an error updating the board. Please try again later.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subCommand === 'create') {
+      const nameOption = interaction.options.getString('name')!;
+      const emojisOption = interaction.options.getString('emojis')!.replace(/\s+/g, '').split(',');
+      const enabledOption = interaction.options.getBoolean('enabled')!;
+      const denyAuthorOption = interaction.options.getBoolean('deny-author')!;
+      const thresholdOption = interaction.options.getInteger('threshold')!;
+      const outputChannelOption = interaction.options.getChannel('output-channel')!;
+
+      const outputChannel = await interaction.guild!.channels.fetch(outputChannelOption.id);
+      if (!outputChannel || !outputChannel.isSendable()) {
+        interaction.reply({ content: 'Please ensure that the output channel exists and that the bot can send messages to it!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const heartboard: HeartBoardTable = {
+        server_id: serverID,
+        board_name: nameOption,
+        enabled: enabledOption,
+        deny_author: denyAuthorOption,
+        threshold: thresholdOption,
+        output_channel: outputChannel.id,
+      };
+
+      try {
+        insertHeartBoard(heartboard);
+        emojisOption.forEach((emoji) => {
+          insertHeartBoardEmoji({
+            server_id: serverID,
+            board_name: heartboard.board_name,
+            emoji: emoji.toString(),
+          });
+        });
+
+        interaction.reply({ content: 'Successfully create heartboard!', flags: MessageFlags.Ephemeral });
+        return;
+      } catch (exception) {
+        interaction.reply({ content: 'There was an error creating the board. Please try again later!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subCommand === 'edit') {
+      const nameOption = interaction.options.getString('name')!;
+      const emojisOption = interaction.options.getString('emojis')?.replace(/\s+/g, '').split(',');
+      const enabledOption = interaction.options.getBoolean('enabled');
+      const denyAuthorOption = interaction.options.getBoolean('deny-author');
+      const thresholdOption = interaction.options.getInteger('threshold');
+      const outputChannelOption = interaction.options.getChannel('output-channel');
+
+      if (!emojisOption && !enabledOption && denyAuthorOption === null && thresholdOption === null && outputChannelOption === null) {
+        interaction.reply({ content: 'You must edit at least a single parameter!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const heartBoard = getHeartBoard(serverID, nameOption);
+      if (!heartBoard) {
+        interaction.reply({ content: 'There is no heartboard with this name.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (emojisOption) {
+        deleteAllHeartBoardEmojis(serverID, heartBoard.board_name);
+        emojisOption.forEach((emoji) => {
+          insertHeartBoardEmoji({
+            server_id: serverID,
+            board_name: heartBoard.board_name,
+            emoji: emoji.toString(),
+          });
+        });
+      }
+      if (outputChannelOption) {
+        const outputChannel = await interaction.guild!.channels.fetch(outputChannelOption.id ?? 'unknown');
+        if (!outputChannel || !outputChannel.isSendable()) {
+          interaction.reply({ content: 'Please ensure that the output channel exists and that the bot can send messages to it!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        heartBoard.output_channel = outputChannel.id;
+      }
+
+      if (enabledOption !== null) {
+        heartBoard.enabled = enabledOption;
+      }
+      if (denyAuthorOption !== null) {
+        heartBoard.deny_author = denyAuthorOption;
+      }
+      if (thresholdOption !== null) {
+        heartBoard.threshold = thresholdOption;
+      }
+
+      try {
+        updateHeartBoard(heartBoard);
+        interaction.reply({ content: 'Successfully updated heartboard!', flags: MessageFlags.Ephemeral });
+        return;
+      } catch (exception) {
+        interaction.reply({ content: 'There was an error when editing the heartboard. Please try again later. ', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subCommand === 'delete') {
+      const nameOption = interaction.options.getString('name')!;
+      const heartBoard = getHeartBoard(serverID, nameOption);
+
+      if (!heartBoard) {
+        interaction.reply({ content: 'There is no heatboard with this name.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      try {
+        deleteHeartBoard(serverID, heartBoard.board_name);
+        interaction.reply({ content: 'Successfully deleted heartboard.', flags: MessageFlags.Ephemeral });
+        return;
+      } catch (exception) {
+        interaction.reply({ content: 'There was error deleting the heartboard. Please try again later.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subCommand === 'view') {
+      const nameOption = interaction.options.getString('name')!;
+
+      const heartBoard = getHeartBoard(serverID, nameOption);
+      if (!heartBoard) {
+        interaction.reply({ content: 'There is no heartboard with this name.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const embed = HeartboardCommand.configEmbedBuilder(serverID, heartBoard);
+      interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    }
+  },
+  configEmbedBuilder(serverID: Snowflake, heartBoard: HeartBoardTable): EmbedBuilder {
+    const heartboardEmojis = getHeartBoardEmojis(serverID, heartBoard.board_name).map((emoji) => emoji.emoji).join(', ');
+
+    return new EmbedBuilder().setTitle(`${heartBoard.board_name}`)
+      .addFields([
+        { name: 'Status', value: heartBoard.enabled ? 'Enabled' : 'Disabled' },
+        { name: 'Emojis', value: heartboardEmojis },
+        { name: 'Deny Author', value: heartBoard.deny_author ? 'True' : 'False' },
+        { name: 'Threshold', value: `${heartBoard.threshold}` },
+      ]);
+  },
+  async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
+    const focusedValue = interaction.options.getFocused();
+
+    const heartBoards = getHeartBoardsByServer(serverID);
+    const choices = heartBoards.map((heartBoard) => heartBoard.board_name);
+
+    const filtered = choices.filter((choice) => choice.startsWith(focusedValue));
+    interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
   },
 };
 
-const ConfigCommand: Command = {
+const VoicePingCommand: ConfigCommand = {
+  data: new SlashCommandBuilder().setName('voiceping')
+    .setDescription('Pings users when someone joins a specified voice channel')
+    .addSubcommand((listSubcommand) => listSubcommand.setName('list')
+      .setDescription('List all existing voice pings'))
+    .addSubcommand((statusSubcommand) => statusSubcommand.setName('status')
+      .setDescription('Enable or disable a given voice ping')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the voice ping you wish to enable / disable')
+        .setAutocomplete(true)
+        .setRequired(true))
+      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .setDescription('Whether to enable or disable the voice ping. True = Enable')
+        .setRequired(true)))
+    .addSubcommand((createSubcommand) => createSubcommand.setName('create')
+      .setDescription('Create a new voice ping')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the new voice ping')
+        .setRequired(true))
+      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .setDescription('Whether the VoicePing should be enabled or disabled. True = Enable')
+        .setRequired(true))
+      .addStringOption((messageOption) => messageOption.setName('message-template')
+        .setDescription('Message used when pinged. Use \'{user}\' for user, \'{channel}\' for channel')
+        .setRequired(true))
+      .addStringOption((inputChannelOption) => inputChannelOption.setName('input-channels')
+        .setDescription('Voice channels to listen to. Give channel ID\'s, separated with \',\'')
+        .setRequired(true))
+      .addChannelOption((outputChannelOption) => outputChannelOption.setName('output-channel')
+        .setDescription('Channel the ping message should be sent in.')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.PublicThread)
+        .setRequired(true)))
+    .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
+      .setDescription('Edit an existing VoicePing')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the existing VoicePing')
+        .setAutocomplete(true)
+        .setRequired(true))
+      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .setDescription('Whether the VoicePing should be enabled or disabled. True = Enable'))
+      .addStringOption((messageTemplateOption) => messageTemplateOption.setName('message-template')
+        .setDescription('Message used when pinged. Use \'{user}\' for user, \'{channel}\' for channel'))
+      .addChannelOption((outputChannelOption) => outputChannelOption.setName('output-channel')
+        .setDescription('Channel the ping message should be sent in.')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.PublicThread))
+      .addStringOption((inputChannelOption) => inputChannelOption.setName('input-channels')
+        .setDescription('Voice channels to listen to. Give channel ID\'s, separated with \',\'')))
+    .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete')
+      .setDescription('Delete an existing VoicePing')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the existing VoicePing')
+        .setAutocomplete(true)
+        .setRequired(true)))
+    .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
+      .setDescription('View the settings of an existing VoicePing')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the existing VoicePing you wish to view')
+        .setAutocomplete(true)
+        .setRequired(true))),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake) {
+    const subCommand = interaction.options.getSubcommand();
+
+    if (subCommand === 'list') {
+      const voicePings = getVoicePingsByServer(serverID);
+      if (!voicePings) {
+        interaction.reply({ content: 'There are currently no VoicePings on this server.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const voicepingFields = voicePings.map((voicePing) => ({
+        name: `${voicePing.voiceping_name} (${voicePing.enabled ? '✔' : '✘'})`,
+        value: `<#${voicePing.output_channel}>`,
+      }));
+      const embed = new EmbedBuilder().setTitle('VoicePings').addFields(...voicepingFields);
+
+      interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subCommand === 'status') {
+      const nameOption = interaction.options.getString('name')!;
+      const enabledOption = interaction.options.getBoolean('enabled')!;
+
+      try {
+        const voicePing = getVoicePing(serverID, nameOption);
+
+        if (!voicePing) {
+          interaction.reply({ content: 'There is no VoicePings with that name', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        voicePing.enabled = enabledOption;
+        updateVoicePing(voicePing);
+
+        interaction.reply({ content: 'Successfully updated VoicePing', flags: MessageFlags.Ephemeral });
+        return;
+      } catch (exception) {
+        interaction.reply({ content: 'There was an error updating the VoicePing. Please try again later.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subCommand === 'create') {
+      const nameOption = interaction.options.getString('name')!;
+      const enabledOption = interaction.options.getBoolean('enabled')!;
+      const messageTemplateOption = interaction.options.getString('message-template')!;
+      const inputChannelsOption = interaction.options.getString('input-channels')!.replace(/\s+/g, '').split(',');
+      const outputChannelOption = interaction.options.getChannel('output-channel')!;
+
+      const outputChannel = await interaction.guild!.channels.fetch(outputChannelOption.id);
+      if (!outputChannel || !outputChannel.isSendable()) {
+        interaction.reply({ content: 'Please ensure that the output channel exists and that the bot can send messages to it!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const inputChannels = (await Promise.all(inputChannelsOption.map((channelID) => interaction.guild!.channels.fetch(channelID))))
+        .filter((channelID) => channelID !== null);
+
+      const voicePing: VoicePingTable = {
+        server_id: serverID,
+        voiceping_name: nameOption,
+        enabled: enabledOption,
+        message_template: messageTemplateOption,
+        output_channel: outputChannel.id,
+      };
+
+      try {
+        insertVoicePing(voicePing);
+        inputChannels.forEach((channel) => {
+          insertVoicePingInput({
+            server_id: serverID,
+            voiceping_name: voicePing.voiceping_name,
+            channel_id: channel.id,
+          });
+        });
+
+        interaction.reply({ content: 'Successfully created VoicePing!', flags: MessageFlags.Ephemeral });
+        return;
+      } catch (exception) {
+        interaction.reply({ content: 'There was an error creating the ping. Please try again later!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subCommand === 'edit') {
+      const gg = interaction.options.getString('name')!;
+      const dd = interaction.options.getString('emojis')?.replace(/\s+/g, '').split(',');
+      const aa = interaction.options.getBoolean('enabled');
+      const cc = interaction.options.getBoolean('deny-author');
+      const ff = interaction.options.getInteger('threshold');
+      const ee = interaction.options.getChannel('output-channel');
+
+      if (!emojisOption && !enabledOption && denyAuthorOption === null && thresholdOption === null && outputChannelOption === null) {
+        interaction.reply({ content: 'You must edit at least a single parameter!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const heartBoard = getHeartBoard(serverID, nameOption);
+      if (!heartBoard) {
+        interaction.reply({ content: 'There is no heartboard with this name.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (emojisOption) {
+        deleteAllHeartBoardEmojis(serverID, heartBoard.board_name);
+        emojisOption.forEach((emoji) => {
+          insertHeartBoardEmoji({
+            server_id: serverID,
+            board_name: heartBoard.board_name,
+            emoji: emoji.toString(),
+          });
+        });
+      }
+      if (outputChannelOption) {
+        const outputChannel = await interaction.guild!.channels.fetch(outputChannelOption.id ?? 'unknown');
+        if (!outputChannel || !outputChannel.isSendable()) {
+          interaction.reply({ content: 'Please ensure that the output channel exists and that the bot can send messages to it!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        heartBoard.output_channel = outputChannel.id;
+      }
+
+      if (enabledOption !== null) {
+        heartBoard.enabled = enabledOption;
+      }
+      if (denyAuthorOption !== null) {
+        heartBoard.deny_author = denyAuthorOption;
+      }
+      if (thresholdOption !== null) {
+        heartBoard.threshold = thresholdOption;
+      }
+
+      try {
+        updateHeartBoard(heartBoard);
+        interaction.reply({ content: 'Successfully updated heartboard!', flags: MessageFlags.Ephemeral });
+        return;
+      } catch (exception) {
+        interaction.reply({ content: 'There was an error when editing the heartboard. Please try again later. ', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+  },
+  configEmbedBuilder(serverID: Snowflake, voicePing: VoicePingTable) {
+    return new EmbedBuilder();
+  },
+  async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
+    const focusedValue = interaction.options.getFocused();
+
+    const voicePings = getVoicePingsByServer(serverID);
+    const choices = voicePings.map((voicePing) => voicePing.voiceping_name);
+
+    const filtered = choices.filter((choice) => choice.startsWith(focusedValue));
+    interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
+  },
+};
+
+const SettingsCommand: Command = {
   data: new SlashCommandBuilder()
     .setName('config')
     .setDescription('Control server-wide settings of bot\'s features')
@@ -212,7 +660,7 @@ const ConfigCommand: Command = {
   },
 };
 
-function responseEmbedBuilder(response: Response): EmbedBuilder {
+function responseEmbedBuilder(response: AutomaticResponse): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle(`${response.name} response`)
     .addFields([
@@ -282,7 +730,7 @@ const ResponseCommand: Command = {
         return;
       }
 
-      const newResponse: Response = {
+      const newResponse: AutomaticResponse = {
         name: nameOption,
         enabled: enabledOption,
         activationRegex,
@@ -374,8 +822,9 @@ const ResponseCommand: Command = {
   },
 };
 
-commandMap.set(Help.data.name, Help);
-commandMap.set(ConfigCommand.data.name, ConfigCommand);
+commandMap.set(HeartboardCommand.data.name, HeartboardCommand);
+commandMap.set(VoicePingCommand.data.name, VoicePingCommand);
+commandMap.set(SettingsCommand.data.name, SettingsCommand);
 commandMap.set(ResponseCommand.data.name, ResponseCommand);
 
-export { commandMap, Help, ConfigCommand, HeartBoardFeature, VoicePingFeature };
+export { commandMap, SettingsCommand, ResponseCommand, HeartboardCommand, VoicePingCommand };
