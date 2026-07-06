@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS Server(
 );
 
 CREATE TABLE IF NOT EXISTS Chatbot(
-  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
+  server_id VARCHAR(20) PRIMARY KEY REFERENCES Server(server_id) ON DELETE CASCADE,
 
   chatbot_enabled BOOLEAN,
   chatbot_core_memory TEXT
@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS VoicePing(
 );
 CREATE TABLE IF NOT EXISTS VoicePingInput(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
-  channel_id VARCHAR(20) NOT NULL REFERENCES Channel(channel_id) ON DELETE CASCADE,
+  channel_id VARCHAR(20) NOT NULL,
   voiceping_name TEXT NOT NULL,
 
   PRIMARY KEY (server_id, voiceping_name, channel_id),
@@ -86,8 +86,8 @@ CREATE TABLE IF NOT EXISTS ChatbotLongTermMemory(
   memory_id INTEGER NOT NULL,
   message_content VARCHAR(2000),
 
-  PRIMARY KEY (server_id, memory_id),
-  timestamp INTEGER
+  timestamp INTEGER,
+  PRIMARY KEY (server_id, memory_id)
 );
 CREATE TABLE IF NOT EXISTS ChatbotShortTermMemory(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,

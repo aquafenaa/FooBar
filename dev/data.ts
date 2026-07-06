@@ -4,15 +4,17 @@ import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 
 import { AutomaticResponseTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, ServerTable, VoicePingInputTable, VoicePingTable } from './types/schema';
+import { ConfigData, ServerConfig, ServerData } from './types/bot';
 
 const schemaPath = path.join(__dirname, '../data/seed/schema.sql');
 const schema = readFileSync(schemaPath, 'utf-8');
 
-// const dataPath = path.join(__dirname, '../data/data.json');
-// const configPath = path.join(__dirname, '../data/config.json');
+const dataPath = path.join(__dirname, '../data/data.json');
+const configPath = path.join(__dirname, '../data/config.json');
 
-const db = new Database('cok.db');
-db.pragma('journal_mode = WAL');
+const dbPath = path.join(__dirname, '../data/foobar.db');
+const db = new Database(dbPath);
+// db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
 db.exec(schema);
@@ -55,7 +57,7 @@ function upsertChatbot(chatbot: ChatbotTable): void {
     ON CONFLICT(server_id) DO UPDATE SET
       chatbot_enabled = excluded.chatbot_enabled,
       chatbot_core_memory = excluded.chatbot_core_memory
-  `).run(chatbot.server_id, chatbot.chatbot_enabled, chatbot.chatbot_core_memory);
+  `).run(chatbot.server_id, chatbot.chatbot_enabled ? 1 : 0, chatbot.chatbot_core_memory);
 }
 
 // ==================== Channel ====================
@@ -152,12 +154,12 @@ function getHeartBoardsByEmoji(server_id: Snowflake, emoji: string): HeartBoardT
 }
 function insertHeartBoard(board: HeartBoardTable): void {
   db.prepare('INSERT INTO HeartBoard (server_id, board_name, enabled, deny_author, threshold, output_channel) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(board.server_id, board.board_name, board.enabled, board.deny_author, board.threshold, board.output_channel);
+    .run(board.server_id, board.board_name, board.enabled ? 1 : 0, board.deny_author ? 1 : 0, board.threshold, board.output_channel);
 }
 function updateHeartBoard(board: HeartBoardTable): void {
   db.prepare(`UPDATE HeartBoard SET enabled = ?, deny_author = ?, threshold = ?, output_channel = ?
     WHERE server_id = ? AND board_name = ?`)
-    .run(board.enabled, board.deny_author, board.threshold, board.output_channel, board.server_id, board.board_name);
+    .run(board.enabled ? 1 : 0, board.deny_author ? 1 : 0, board.threshold, board.output_channel, board.server_id, board.board_name);
 }
 function deleteHeartBoard(server_id: Snowflake, board_name: string): void {
   // NOTE: Cascades to HeartBoardEmoji and HeartBoardMessage
@@ -221,7 +223,7 @@ function getVoicePingsByServer(server_id: Snowflake): VoicePingTable[] {
 }
 function insertVoicePing(ping: VoicePingTable): void {
   db.prepare('INSERT INTO VoicePing (server_id, voiceping_name, enabled, message_template, output_channel) VALUES (?, ?, ?, ?, ?)')
-    .run(ping.server_id, ping.voiceping_name, ping.enabled, ping.message_template, ping.output_channel);
+    .run(ping.server_id, ping.voiceping_name, ping.enabled ? 1 : 0, ping.message_template, ping.output_channel);
 }
 function updateVoicePing(ping: VoicePingTable): void {
   db.prepare('UPDATE VoicePing SET message_template = ?, output_channel = ? WHERE server_id = ? AND voiceping_name = ?')
@@ -241,6 +243,10 @@ function insertVoicePingInput(input: VoicePingInputTable): void {
   db.prepare('INSERT OR IGNORE INTO VoicePingInput (server_id, voiceping_name, channel_id) VALUES (?, ?, ?)')
     .run(input.server_id, input.voiceping_name, input.channel_id);
 }
+function deleteAllVoicePingInputs(server_id: Snowflake, voiceping_name: string): void {
+  db.prepare('DELETE FROM VoicePingInput WHERE server_id = ? AND voiceping_name = ?')
+    .run(server_id, voiceping_name);
+}
 function deleteVoicePingInput(server_id: Snowflake, voiceping_name: string, channel_id: Snowflake): void {
   db.prepare('DELETE FROM VoicePingInput WHERE server_id = ? AND voiceping_name = ? AND channel_id = ?')
     .run(server_id, voiceping_name, channel_id);
@@ -257,11 +263,11 @@ function getAutomaticResponsesByServer(server_id: Snowflake): AutomaticResponseT
 }
 function insertAutomaticResponse(response: AutomaticResponseTable): void {
   db.prepare('INSERT OR IGNORE INTO AutomaticResponse (server_id, name, enabled, ctivation_regex, capture_regex, output_template) VALUES (?, ?, ?, ?, ?)')
-    .run(response.server_id, response.name, response.enabled, response.activation_regex, response.capture_regex, response.output_template);
+    .run(response.server_id, response.name, response.enabled ? 1 : 0, response.activation_regex, response.capture_regex, response.output_template);
 }
 function updateAutomaticResponse(response: AutomaticResponseTable): void {
   db.prepare('UPDATE AutomaticResponse SET enabled = ?, activation_regex = ?, capture_regex = ?, output_template = ? WHERE server_id = ? AND name = ?')
-    .run(response.enabled, response.activation_regex, response.capture_regex, response.output_template, response.server_id, response.name);
+    .run(response.enabled ? 1 : 0, response.activation_regex, response.capture_regex, response.output_template, response.server_id, response.name);
 }
 function deleteAutomaticResponse(server_id: Snowflake, name: string): void {
   db.prepare('DELETE FROM AutomaticResponse WHERE server_id = ? AND name = ?').run(server_id, name);
@@ -271,7 +277,74 @@ const syncServer = db.transaction((server_id: Snowflake) => {
   insertServer(server_id);
   upsertChatbot({ server_id, chatbot_enabled: false, chatbot_core_memory: '' });
 
-  // const currentVersion = (db.pragma('user_version', { simple: true }) as number);
+  const currentVersion = (db.pragma('user_version', { simple: true }) as number);
+  if (!currentVersion || currentVersion < 0) {
+    const configData: ConfigData = JSON.parse(readFileSync(configPath, { encoding: 'utf-8' }));
+    const data: ServerData[] = JSON.parse(readFileSync(dataPath, { encoding: 'utf-8' })).servers;
+
+    const serverConfig: ServerConfig = configData.servers.filter((cd) => cd.id === server_id)[0];
+    const serverData: ServerData = data.filter((d) => d.id === server_id)[0];
+
+    if (!serverConfig || !serverData) return;
+
+    serverConfig.serverResponses.forEach((response) => {
+      const existingServerResponse = getAutomaticResponse(server_id, response.name);
+      if (existingServerResponse) return;
+
+      insertAutomaticResponse({
+        server_id,
+        name: response.name,
+        enabled: response.enabled,
+        activation_regex: response.activationRegex,
+        capture_regex: response.captureRegex ?? '*',
+        output_template: response.outputTemplateString,
+      });
+    });
+
+    const existingDefaultHeartboard = getHeartBoard(server_id, 'legacy-heartboard');
+    if (!existingDefaultHeartboard) {
+      const board = serverConfig.heartBoard;
+
+      insertHeartBoard({
+        server_id,
+        board_name: 'legacy-heartboard',
+        enabled: board.enabled,
+        deny_author: board.denyAuthor,
+        threshold: board.thresholdNumber,
+        output_channel: board.outputChannel,
+      });
+
+      serverData.heartBoardMessages.forEach((hbm) => insertHeartBoardMessage({
+        server_id,
+        board_name: 'legacy-heartboard',
+        channel_id: hbm.channelID,
+        embed_id: hbm.embedMessageID,
+        message_id: hbm.messageID,
+        total_emojis: -1,
+      }));
+    }
+
+    const existingDefaultVoiceping = getVoicePing(server_id, 'legacy-voiceping');
+    if (!existingDefaultVoiceping) {
+      const ping = serverConfig.voicePing;
+
+      insertVoicePing({
+        server_id,
+        voiceping_name: 'legacy-voiceping',
+        enabled: ping.enabled,
+        message_template: ping.voicePingMessage,
+        output_channel: ping.outputChannel,
+      });
+
+      ping.inputChannels.forEach((inputChannel) => insertVoicePingInput({
+        server_id,
+        voiceping_name: 'legacy-voiceping',
+        channel_id: inputChannel,
+      }));
+    }
+
+    // chatbot's data can be deleted. it's not as important as other data
+  }
   // if (currentVersion < 1) {
   // }
 });
@@ -287,7 +360,7 @@ export {
   getHeartBoardEmojis, insertHeartBoardEmoji, deleteHeartBoardEmoji, deleteAllHeartBoardEmojis,
   getHeartBoardMessage, getHeartBoardMessagesByServer, getEmbedMessagesByBoard, insertHeartBoardMessage, updateHeartBoardMessage, deleteHeartBoardMessage, isEmbedMessage,
   getVoicePing, getVoicePingsByServer, insertVoicePing, updateVoicePing, deleteVoicePing,
-  getVoicePingInputs, insertVoicePingInput, deleteVoicePingInput,
+  getVoicePingInputs, insertVoicePingInput, deleteAllVoicePingInputs, deleteVoicePingInput,
   getChatbotLongTermMemory, getChatbotLongTermMemoriesByServer, insertChatbotLongTermMemory, deleteChatbotLongTermMemory, deleteNOldestLongTermMemories,
   getChatbotShortTermMemoriesByServer, insertChatbotShortTermMemory, deleteChatbotShortTermMemory, clearChatbotShortTermMemory, deleteNOldestShortTermMemory,
   getAutomaticResponse, getAutomaticResponsesByServer, insertAutomaticResponse, updateAutomaticResponse, deleteAutomaticResponse,

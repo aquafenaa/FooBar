@@ -5,8 +5,8 @@ import {
   ChannelType,
 } from 'discord.js';
 import { Command, ConfigCommand, Feature } from './types/bot';
-import { deleteAllHeartBoardEmojis, deleteHeartBoard, getChatbot, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getVoicePing, getVoicePingsByServer, insertHeartBoard, insertHeartBoardEmoji, insertVoicePing, insertVoicePingInput, updateHeartBoard, updateVoicePing } from './data';
-import { HeartBoardTable, VoicePingTable } from './types/schema';
+import { deleteAllHeartBoardEmojis, deleteAllVoicePingInputs, deleteAutomaticResponse, deleteHeartBoard, deleteVoicePing, getAutomaticResponse, getAutomaticResponsesByServer, getChatbot, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getVoicePing, getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertHeartBoard, insertHeartBoardEmoji, insertVoicePing, insertVoicePingInput, updateAutomaticResponse, updateHeartBoard, updateVoicePing, upsertChatbot } from './data';
+import { AutomaticResponseTable, HeartBoardTable, VoicePingTable } from './types/schema';
 
 const commandMap: Map<string, Command> = new Map();
 const featureMap: Map<string, Feature> = new Map();
@@ -33,7 +33,7 @@ const AIFeature: Feature = {
 //     const { enabled, voicePingMessage, inputChannels, outputChannel } = serverConfig.voicePing;
 
 //     return new EmbedBuilder()
-//       .setTitle(title)
+//       .setTitle(titx le)
 //       .addFields(
 //         { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
 //         { name: 'Message', value: voicePingMessage ?? 'No message set' },
@@ -204,7 +204,7 @@ const HeartboardCommand: ConfigCommand = {
       const thresholdOption = interaction.options.getInteger('threshold');
       const outputChannelOption = interaction.options.getChannel('output-channel');
 
-      if (!emojisOption && !enabledOption && denyAuthorOption === null && thresholdOption === null && outputChannelOption === null) {
+      if (enabledOption === null && denyAuthorOption === null && !emojisOption && !thresholdOption && !outputChannelOption) {
         interaction.reply({ content: 'You must edit at least a single parameter!', flags: MessageFlags.Ephemeral });
         return;
       }
@@ -448,31 +448,34 @@ const VoicePingCommand: ConfigCommand = {
       }
     }
     if (subCommand === 'edit') {
-      const gg = interaction.options.getString('name')!;
-      const dd = interaction.options.getString('emojis')?.replace(/\s+/g, '').split(',');
-      const aa = interaction.options.getBoolean('enabled');
-      const cc = interaction.options.getBoolean('deny-author');
-      const ff = interaction.options.getInteger('threshold');
-      const ee = interaction.options.getChannel('output-channel');
+      const nameOption = interaction.options.getString('name')!;
+      const enabledOption = interaction.options.getBoolean('enabled');
+      const messageTemplateOption = interaction.options.getString('message-template');
+      const inputChannelStringsOption = interaction.options.getString('input-channels')?.replace(/\s+/g, '')?.split(',');
+      const outputChannelOption = interaction.options.getChannel('output-channel');
 
-      if (!emojisOption && !enabledOption && denyAuthorOption === null && thresholdOption === null && outputChannelOption === null) {
+      if (enabledOption === null && !messageTemplateOption && !outputChannelOption && !inputChannelStringsOption) {
         interaction.reply({ content: 'You must edit at least a single parameter!', flags: MessageFlags.Ephemeral });
         return;
       }
 
-      const heartBoard = getHeartBoard(serverID, nameOption);
-      if (!heartBoard) {
-        interaction.reply({ content: 'There is no heartboard with this name.', flags: MessageFlags.Ephemeral });
+      const voicePing = getVoicePing(serverID, nameOption);
+      if (!voicePing) {
+        interaction.reply({ content: 'There is no voiceping with this name.', flags: MessageFlags.Ephemeral });
         return;
       }
 
-      if (emojisOption) {
-        deleteAllHeartBoardEmojis(serverID, heartBoard.board_name);
-        emojisOption.forEach((emoji) => {
-          insertHeartBoardEmoji({
+      if (inputChannelStringsOption) {
+        // only implement valid channels
+        const inputChannels = (await Promise.all(inputChannelStringsOption.map((channelString) => interaction.guild!.channels.fetch(channelString))))
+          .filter((channel) => channel !== null);
+
+        deleteAllVoicePingInputs(serverID, voicePing.voiceping_name);
+        inputChannels.forEach((inputChannel) => {
+          insertVoicePingInput({
             server_id: serverID,
-            board_name: heartBoard.board_name,
-            emoji: emoji.toString(),
+            voiceping_name: voicePing.voiceping_name,
+            channel_id: inputChannel.id,
           });
         });
       }
@@ -483,31 +486,66 @@ const VoicePingCommand: ConfigCommand = {
           return;
         }
 
-        heartBoard.output_channel = outputChannel.id;
+        voicePing.output_channel = outputChannel.id;
       }
 
       if (enabledOption !== null) {
-        heartBoard.enabled = enabledOption;
+        voicePing.enabled = enabledOption;
       }
-      if (denyAuthorOption !== null) {
-        heartBoard.deny_author = denyAuthorOption;
-      }
-      if (thresholdOption !== null) {
-        heartBoard.threshold = thresholdOption;
+      if (messageTemplateOption) {
+        voicePing.message_template = messageTemplateOption;
       }
 
       try {
-        updateHeartBoard(heartBoard);
-        interaction.reply({ content: 'Successfully updated heartboard!', flags: MessageFlags.Ephemeral });
+        updateVoicePing(voicePing);
+        interaction.reply({ content: 'Successfully updated voiceping!', flags: MessageFlags.Ephemeral });
         return;
       } catch (exception) {
-        interaction.reply({ content: 'There was an error when editing the heartboard. Please try again later. ', flags: MessageFlags.Ephemeral });
+        interaction.reply({ content: 'There was an error when editing the voiceping. Please try again later. ', flags: MessageFlags.Ephemeral });
         return;
       }
     }
+    if (subCommand === 'delete') {
+      const nameOption = interaction.options.getString('name')!;
+
+      const voicePing = getVoicePing(serverID, nameOption);
+      if (!voicePing) {
+        interaction.reply({ content: 'There is no VoicePing with this name! Ensure it\'s spelled correctly.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      try {
+        deleteVoicePing(serverID, nameOption);
+        interaction.reply({ content: 'Successfully deleted VoicePing', flags: MessageFlags.Ephemeral });
+        return;
+      } catch {
+        interaction.reply({ content: 'There was an issue when deleting the VoicePing. Please try again later.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subCommand === 'view') {
+      const nameOption = interaction.options.getString('name')!;
+
+      const voicePing = getVoicePing(serverID, nameOption);
+      if (!voicePing) {
+        interaction.reply({ content: 'There is no VoicePing with this name! Ensure it\'s spelled correctly.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const configEmbed = VoicePingCommand.configEmbedBuilder(serverID, voicePing);
+      interaction.reply({ embeds: [configEmbed] });
+    }
   },
   configEmbedBuilder(serverID: Snowflake, voicePing: VoicePingTable) {
-    return new EmbedBuilder();
+    const voicePingInputChannels = getVoicePingInputs(serverID, voicePing.voiceping_name).map((channel) => `<#${channel.channel_id}>`).join(', ');
+
+    return new EmbedBuilder().setTitle(`${voicePing.voiceping_name}`)
+      .addFields([
+        { name: 'Status', value: voicePing.enabled ? 'Enabled' : 'Disabled' },
+        { name: 'Input Channels', value: voicePingInputChannels },
+        { name: 'Message Template', value: voicePing.message_template },
+        { name: 'Output Channel', value: `${voicePing.output_channel !== '' ? `<#${voicePing.output_channel}>` : ''}` },
+      ]);
   },
   async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
     const focusedValue = interaction.options.getFocused();
@@ -520,160 +558,20 @@ const VoicePingCommand: ConfigCommand = {
   },
 };
 
-const SettingsCommand: Command = {
-  data: new SlashCommandBuilder()
-    .setName('config')
-    .setDescription('Control server-wide settings of bot\'s features')
-    .addSubcommand(
-      (statusSubcommand) => statusSubcommand.setName('status')
-        .setDescription('Enable or disable a feature')
-        .addStringOption((statusFeatureName) => statusFeatureName.setName('feature-name')
-          .setDescription('Name of the feature you wish to view')
-          .setRequired(true)
-          .addChoices(
-            Array.from(featureMap.values()).map((feature) => ({ name: feature.name, value: feature.name })),
-          ))
-        .addBooleanOption((statusEnabled) => statusEnabled.setName('enabled')
-          .setDescription('Whether the feature is enabled (true) or not (false)')
-          .setRequired(true)),
-    )
-    .addSubcommandGroup(
-      (editSubcommandGroup) => editSubcommandGroup.setName('edit')
-        .setDescription('Edit the current settings of a feature')
-        .addSubcommand(
-          (heartBoardEdit) => heartBoardEdit.setName(HeartBoardFeature.name)
-            .setDescription(HeartBoardFeature.description)
-            .addBooleanOption((heartBoardCumulative) => heartBoardCumulative.setName('cumulative')
-              .setDescription('Whether a single emoji must reach threshold (true), or total of all emojis reach threshold (false)')
-              .setRequired(false))
-            .addBooleanOption((heartBoardAuthor) => heartBoardAuthor.setName('deny-author')
-              .setDescription('Whether to remove relevant reactions from message author (true) or not (false)')
-              .setRequired(false))
-            .addIntegerOption((heartBoardThreshold) => heartBoardThreshold.setName('threshold')
-              .setDescription('Number of reactions to reach the heartboard')
-              .setRequired(false))
-            .addStringOption((heartBoardEmojis) => heartBoardEmojis.setName('emojis')
-              .setDescription('What emojis are tracked for the heartboard')
-              .setRequired(false))
-            .addChannelOption((heartBoardOutput) => heartBoardOutput.setName('output-channel')
-              .setDescription('Heartboard channel to send messages in')
-              .setRequired(false)),
-        ).addSubcommand(
-          (voicePingEdit) => voicePingEdit.setName(VoicePingFeature.name)
-            .setDescription(VoicePingFeature.description)
-            .addStringOption((voicePingMessage) => voicePingMessage.setName('message')
-              .setDescription('Message sent when a user joins a relevant channel')
-              .setRequired(false))
-            .addStringOption((voicePingInputs) => voicePingInputs.setName('input-channels')
-              .setDescription('Voice Channels to listen to. Enter a list of channel IDs separated by a space')
-              .setRequired(false))
-            .addChannelOption((voicePingOutput) => voicePingOutput.setName('output-channel')
-              .setDescription('Desired channel to send the message to')
-              .setRequired(false)),
-        ),
-    )
-    .addSubcommand((viewSubcommandGroup) => viewSubcommandGroup.setName('view')
-      .setDescription('View current config settings of a feature')
-      .addStringOption((viewFeatureName) => viewFeatureName.setName('feature-name')
-        .setDescription('Name of the feature you wish to view')
-        .setRequired(true)
-        .addChoices(Array.from(featureMap.values()).map((feature) => ({ name: feature.name, value: feature.name }))))),
-  async execute(interaction: ChatInputCommandInteraction, serverConfig: ServerConfig): Promise<ServerConfig | void> {
-    if (serverConfig === undefined) { console.error('Server is undefined'); return; }
-
-    const subCommandGroup = interaction.options.getSubcommandGroup();
-    const subCommand = interaction.options.getSubcommand();
-
-    if (subCommand === 'status') {
-      const enabledOption = interaction.options.getBoolean('enabled')!;
-      const featureNameOption = interaction.options.getString('feature-name')!;
-      const feature = featureMap.get(featureNameOption)!;
-
-      if (featureNameOption === AIFeature.name) serverConfig.aiEnabled = enabledOption;
-      if (featureNameOption === HeartBoardFeature.name) serverConfig.heartBoard.enabled = enabledOption;
-      if (featureNameOption === VoicePingFeature.name) serverConfig.voicePing.enabled = enabledOption;
-
-      interaction.reply({ embeds: [feature.configEmbedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
-    } else if (subCommandGroup === 'edit') {
-      if (subCommand === HeartBoardFeature.name) {
-        const cumulativeOption = interaction.options.getBoolean('cumulative');
-        const denyAuthorOption = interaction.options.getBoolean('deny-author');
-        const thresholdOption = interaction.options.getInteger('threshold');
-        const emojisOption = interaction.options.getString('emojis')?.split(' '); // separate each emoji
-        const outputChannelOption = interaction.options.getChannel('output-channel');
-
-        // if we don't receive any arguments, tell them and return
-        if (cumulativeOption === null && denyAuthorOption === null && thresholdOption === null && emojisOption === null && outputChannelOption === null) {
-          interaction.reply({ content: 'please provide an argument to update!', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        const oldHeartBoard = serverConfig.heartBoard;
-
-        // update the values if we received them, otherwise keep their old value
-        serverConfig.heartBoard = {
-          enabled: oldHeartBoard.enabled,
-          cumulative: cumulativeOption ?? oldHeartBoard.cumulative,
-          denyAuthor: denyAuthorOption ?? oldHeartBoard.denyAuthor,
-          thresholdNumber: thresholdOption ?? oldHeartBoard.thresholdNumber,
-          emojis: emojisOption ?? oldHeartBoard.emojis,
-          outputChannel: outputChannelOption?.id ?? oldHeartBoard.outputChannel,
-        };
-
-        interaction.reply({ embeds: [HeartBoardFeature.configEmbedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
-      } else if (subCommand === VoicePingFeature.name) {
-        const messageOption = interaction.options.getString('message');
-        const inputChannelsOption = interaction.options.getString('input-channels')?.split(' '); // separate each channelID
-        const outputChannelOption = interaction.options.getChannel('output-channel');
-
-        // if we don't receive any arguments, tell them and return
-        if (messageOption === null && inputChannelsOption === null && outputChannelOption === null) {
-          interaction.reply({ content: 'please provide an argument to update!', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        const oldVoicePingConfig = serverConfig.voicePing;
-
-        // update the values if we received them, otherwise keep their old value
-        serverConfig.voicePing = {
-          enabled: oldVoicePingConfig.enabled,
-          voicePingMessage: messageOption ?? oldVoicePingConfig.voicePingMessage,
-          inputChannels: inputChannelsOption ?? oldVoicePingConfig.inputChannels,
-          outputChannel: outputChannelOption?.id ?? oldVoicePingConfig.outputChannel,
-        };
-
-        interaction.reply({ embeds: [VoicePingFeature.configEmbedBuilder('New Config', serverConfig)], flags: MessageFlags.Ephemeral });
-      }
-    } else if (subCommand === 'view') {
-      const featureNameOption = interaction.options.getString('feature-name')!;
-      const feature = featureMap.get(featureNameOption)!;
-
-      await interaction.reply({
-        embeds: [feature.configEmbedBuilder('Current Config', serverConfig)],
-        flags: MessageFlags.Ephemeral,
-      });
-
-      return; // we aren't changing config, so return early
-    }
-
-    return serverConfig;
-  },
-};
-
-function responseEmbedBuilder(response: AutomaticResponse): EmbedBuilder {
-  return new EmbedBuilder()
-    .setTitle(`${response.name} response`)
-    .addFields([
-      { name: 'Enabled', value: response.enabled ? 'Yes' : 'No' },
-      { name: 'Activation Regex', value: response.activationRegex },
-      { name: 'Capture Regex', value: response.captureRegex ?? 'None' },
-      { name: 'Output Template', value: response.outputTemplateString },
-    ]);
-}
-
-const ResponseCommand: Command = {
+const ResponseCommand: ConfigCommand = {
   data: new SlashCommandBuilder()
     .setName('response').setDescription('A response is an automated, generated response, upon a specific phrase.')
+    .addSubcommand((listSubcommand) => listSubcommand.setName('list')
+      .setDescription('List all existing Responses'))
+    .addSubcommand((statusSubcommand) => statusSubcommand.setName('status')
+      .setDescription('Set status of an existing Response')
+      .addStringOption((nameOption) => nameOption.setName('name')
+        .setDescription('Name of the Response you wish to change the status of')
+        .setAutocomplete(true)
+        .setRequired(true))
+      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .setDescription('Whether the Response should be enabled or not. True = Enable')
+        .setRequired(true)))
     .addSubcommand((createResponseSubcommand) => createResponseSubcommand.setName('create')
       .setDescription('Creates an automated, generated response, when a specific phrase is sent')
       .addStringOption((nameOption) => nameOption.setName('name')
@@ -695,6 +593,7 @@ const ResponseCommand: Command = {
       .setDescription('Edit pre-existing responses')
       .addStringOption((nameOption) => nameOption.setName('name')
         .setDescription('Name of the response to edit')
+        .setAutocomplete(true)
         .setRequired(true))
       .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
         .setDescription('Whether the response is enabled or not'))
@@ -712,11 +611,48 @@ const ResponseCommand: Command = {
     .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
       .setDescription('View current settings for a given response')
       .addStringOption((nameOption) => nameOption.setName('name')
-        .setDescription('Name of the response to view'))),
-  async execute(interaction: ChatInputCommandInteraction, serverConfig: ServerConfig): Promise<ServerConfig | void> {
-    if (serverConfig === undefined) { console.error('Server is undefined'); return; }
+        .setDescription('Name of the response to view')
+        .setAutocomplete(true)
+        .setRequired(true))),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+    if (serverID === undefined) { console.error('Server is undefined'); return; }
 
     const subCommand = interaction.options.getSubcommand();
+
+    if (subCommand === 'list') {
+      const responses = getAutomaticResponsesByServer(serverID);
+
+      if (!responses || responses.length === 0) {
+        interaction.reply({ content: 'There are zero Responses on this server!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const responseEmbeds = responses.map((response) => ResponseCommand.configEmbedBuilder(serverID, response));
+      interaction.reply({ embeds: responseEmbeds, flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (subCommand === 'status') {
+      const nameOption = interaction.options.getString('name')!;
+      const enabledOption = interaction.options.getBoolean('enabled')! ?? false;
+
+      const referencedResponse = getAutomaticResponse(serverID, nameOption);
+      if (!referencedResponse) {
+        interaction.reply({ content: 'There are no existing Responses with this name! Ensure you spelled it correctly.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      referencedResponse.enabled = enabledOption;
+
+      try {
+        updateAutomaticResponse(referencedResponse);
+        interaction.reply({ content: 'Successfully edited Response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, referencedResponse)], flags: MessageFlags.Ephemeral });
+        return;
+      } catch {
+        interaction.reply({ content: 'There was an error editing the Response! Please try again later.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
 
     if (subCommand === 'create') {
       const nameOption = interaction.options.getString('name')!;
@@ -725,24 +661,24 @@ const ResponseCommand: Command = {
       const captureRegex = interaction.options.getString('capture-regex')!;
       const outputTemplate = interaction.options.getString('output-template')!;
 
-      if (serverConfig.serverResponses.findIndex((r) => r.name === nameOption) !== -1) {
-        interaction.reply({ content: 'There is already a response with this name. Choose another and try again', flags: MessageFlags.Ephemeral });
+      if (getAutomaticResponse(serverID, nameOption)) {
+        interaction.reply({ content: 'There is already a response with this name. Please try again with a unique name', flags: MessageFlags.Ephemeral });
         return;
       }
 
-      const newResponse: AutomaticResponse = {
+      const newResponse: AutomaticResponseTable = {
+        server_id: serverID,
         name: nameOption,
         enabled: enabledOption,
-        activationRegex,
-        captureRegex,
-        outputTemplateString: outputTemplate,
+        activation_regex: activationRegex,
+        capture_regex: captureRegex,
+        output_template: outputTemplate,
       };
 
-      serverConfig.serverResponses.push(newResponse);
+      insertAutomaticResponse(newResponse);
 
-      interaction.reply({ content: 'Successfully created response', embeds: [responseEmbedBuilder(newResponse)], flags: MessageFlags.Ephemeral });
-
-      return serverConfig;
+      interaction.reply({ content: 'Successfully created response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, newResponse)], flags: MessageFlags.Ephemeral });
+      return;
     }
 
     if (subCommand === 'edit') {
@@ -759,65 +695,144 @@ const ResponseCommand: Command = {
         return;
       }
 
-      const referencedResponseIndex = serverConfig.serverResponses.findIndex((r) => r.name === nameOption);
-      if (referencedResponseIndex === -1) {
+      const referencedResponse = getAutomaticResponse(serverID, nameOption);
+      if (!referencedResponse) {
         interaction.reply({ content: 'No server responses with that name were found. Ensure you spelled it correctly!', flags: MessageFlags.Ephemeral });
-
         return;
       }
-
-      const referencedResponse = serverConfig.serverResponses[referencedResponseIndex];
 
       if (enabledOption !== null) {
         referencedResponse.enabled = enabledOption;
       }
 
-      referencedResponse.activationRegex = activationRegex ?? referencedResponse.activationRegex;
-      referencedResponse.captureRegex = captureRegex ?? referencedResponse.captureRegex;
-      referencedResponse.outputTemplateString = outputTemplate ?? referencedResponse.outputTemplateString;
+      if (activationRegex) {
+        referencedResponse.activation_regex = activationRegex;
+      }
+      if (captureRegex) {
+        referencedResponse.capture_regex = captureRegex;
+      }
+      if (outputTemplate) {
+        referencedResponse.output_template = outputTemplate;
+      }
 
-      serverConfig.serverResponses[referencedResponseIndex] = referencedResponse;
-
-      interaction.reply({ content: 'Successfully edited response!', flags: MessageFlags.Ephemeral });
-
-      return serverConfig;
+      try {
+        updateAutomaticResponse(referencedResponse);
+        interaction.reply({ content: 'Successfully edited the Response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, referencedResponse)], flags: MessageFlags.Ephemeral });
+        return;
+      } catch {
+        interaction.reply({ content: 'There was an error when attempting to edit the Response. Please try again later. ', flags: MessageFlags.Ephemeral });
+        return;
+      }
     }
 
     if (subCommand === 'view') {
       const nameOption = interaction.options.getString('name')!;
 
-      const referencedResponse = serverConfig.serverResponses.find((r) => r.name === nameOption);
+      const referencedResponse = getAutomaticResponse(serverID, nameOption);
       if (!referencedResponse) { // none specified, so we'll view all
-        const embeds = serverConfig.serverResponses.map((response) => responseEmbedBuilder(response));
-
-        if (embeds.length === 0) {
-          interaction.reply({ content: 'There are zero responses', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        interaction.reply(({ embeds, flags: MessageFlags.Ephemeral }));
+        interaction.reply({ content: 'There are no Responses with that name! Ensure you spelled it correctly.', flags: MessageFlags.Ephemeral });
         return;
       }
 
-      interaction.reply(({ embeds: [responseEmbedBuilder(referencedResponse)], flags: MessageFlags.Ephemeral }));
+      interaction.reply(({ embeds: [ResponseCommand.configEmbedBuilder(serverID, referencedResponse)], flags: MessageFlags.Ephemeral }));
       return;
     }
 
     if (subCommand === 'remove') {
       const nameOption = interaction.options.getString('name')!;
 
-      const referencedResponseIndex = serverConfig.serverResponses.findIndex((r) => r.name === nameOption);
+      const referencedResponse = getAutomaticResponse(serverID, nameOption);
 
-      if (referencedResponseIndex === -1) {
+      if (!referencedResponse) {
         interaction.reply({ content: 'No server responses with that name were found. Ensure you spelled it correctly!', flags: MessageFlags.Ephemeral });
         return;
       }
 
-      serverConfig.serverResponses.splice(referencedResponseIndex, 1);
+      try {
+        deleteAutomaticResponse(serverID, nameOption);
+        interaction.reply({ content: 'Successfully removed response!', flags: MessageFlags.Ephemeral });
+      } catch {
+        interaction.reply({ content: 'There was an error when deleting this Response! Please try again later.', flags: MessageFlags.Ephemeral });
+      }
+    }
+  },
+  async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
+    const focusedValue = interaction.options.getFocused();
 
-      interaction.reply({ content: 'Successfully removed response', flags: MessageFlags.Ephemeral });
+    const responses = getAutomaticResponsesByServer(serverID);
+    const choices = responses.map((response) => response.name);
 
-      return serverConfig;
+    const filtered = choices.filter((choice) => choice.startsWith(focusedValue));
+    interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
+  },
+  configEmbedBuilder(serverID: Snowflake, automaticResponse: AutomaticResponseTable) {
+    return new EmbedBuilder().setTitle(automaticResponse.name)
+      .addFields([
+        { name: 'Status', value: automaticResponse.enabled ? 'Enabled' : 'Disabled' },
+        { name: 'Activation Phrase', value: automaticResponse.activation_regex },
+        { name: 'Capture Regex', value: automaticResponse.capture_regex },
+        { name: 'Output Channel', value: automaticResponse.output_template },
+      ]);
+  },
+};
+
+const SettingsCommand: Command = {
+  data: new SlashCommandBuilder()
+    .setName('config')
+    .setDescription('Control server-wide settings of bot\'s features')
+    .addSubcommand(
+      (statusSubcommand) => statusSubcommand.setName('status')
+        .setDescription('Enable or disable a feature')
+        .addStringOption((statusFeatureName) => statusFeatureName.setName('feature-name')
+          .setDescription('Name of the feature you wish to view')
+          .setRequired(true)
+          .addChoices(
+            Array.from(featureMap.values()).map((feature) => ({ name: feature.name, value: feature.name })),
+          ))
+        .addBooleanOption((statusEnabled) => statusEnabled.setName('enabled')
+          .setDescription('Whether the feature is enabled (true) or not (false)')
+          .setRequired(true)),
+    )
+    .addSubcommand((viewSubcommandGroup) => viewSubcommandGroup.setName('view')
+      .setDescription('View current config settings of a feature')
+      .addStringOption((viewFeatureName) => viewFeatureName.setName('feature-name')
+        .setDescription('Name of the feature you wish to view')
+        .setRequired(true)
+        .addChoices(Array.from(featureMap.values()).map((feature) => ({ name: feature.name, value: feature.name }))))),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+    if (serverID === undefined) { console.error('Server is undefined'); return; }
+
+    const subCommand = interaction.options.getSubcommand();
+
+    if (subCommand === 'status') {
+      const enabledOption = interaction.options.getBoolean('enabled')!;
+      const featureNameOption = interaction.options.getString('feature-name')!;
+      const feature = featureMap.get(featureNameOption)!;
+
+      if (featureNameOption === AIFeature.name) {
+        let chatbot = getChatbot(serverID);
+        if (!chatbot) {
+          chatbot = {
+            server_id: serverID,
+            chatbot_enabled: enabledOption,
+            chatbot_core_memory: '',
+          };
+          upsertChatbot(chatbot);
+        } else if (enabledOption !== chatbot.chatbot_enabled) {
+          chatbot.chatbot_enabled = enabledOption;
+          upsertChatbot(chatbot);
+        }
+      }
+
+      interaction.reply({ embeds: [feature.configEmbedBuilder('Updated Config', serverID)], flags: MessageFlags.Ephemeral });
+    } else if (subCommand === 'view') {
+      const featureNameOption = interaction.options.getString('feature-name')!;
+      const feature = featureMap.get(featureNameOption)!;
+
+      await interaction.reply({
+        embeds: [feature.configEmbedBuilder('Current Config', serverID)],
+        flags: MessageFlags.Ephemeral,
+      });
     }
   },
 };

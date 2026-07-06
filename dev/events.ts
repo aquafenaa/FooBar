@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { BaseMessageOptions, Client, EmbedBuilder, Events, GuildMember, Message, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, TextChannel, User } from 'discord.js';
+import { BaseMessageOptions, Channel, Client, EmbedBuilder, Events, GuildMember, Message, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, User } from 'discord.js';
 
 import { commandMap } from './commands';
 import { generateMessage } from './chatbot';
@@ -120,7 +120,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
       if (!groups) return; // return undefined, if no groups were found
 
       // parse groups, and replace them with respective group number
-      if (!response.output_template) { console.log(response); return; }
+      if (!response.output_template) return;
       const responseStr = response.output_template.replace(/\{(\d+)\}/g, (_, index) => { // thank u claude. this is actually a cute little implementation
         const i = parseInt(index, 10);
         return groups[i] ?? '';
@@ -132,7 +132,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     // ChatbotResponse Handling
     const chatbot = getChatbot(serverID);
     // if chatbot doesn't exist, or isn't enabled, we don't care
-    if (!chatbot || chatbot.chatbot_enabled) return;
+    if (!chatbot || !chatbot.chatbot_enabled) return;
 
     // the bot cannot respond to itself
     if (!author.id || author.id === discordClient.user?.id) return;
@@ -147,7 +147,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
       || message.author.id === discordClient.user?.id)) return; // ...or the bot mentioned itself...
     // && Math.random() < 1 / 4096) return; // ...and we don't roll a 1% chance to respond anyway... <-- big bug, will fix.
 
-    let userContent = message.content; // remove '-ai' marker from beginning of text
+    let userContent = message.content;
     const messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
     const context: Message<boolean>[] | undefined = Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: message.id }))).values()); // fetch 5 most recent messages as context
 
@@ -193,15 +193,21 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     const voicePings = getVoicePingsByServer(serverID);
 
     voicePings.forEach(async (voicePing) => {
+      if (!voicePing.output_channel) return;
+
       const voicePingInputs = getVoicePingInputs(serverID, voicePing.voiceping_name);
       // checks if the user wasn't in a vc earlier, we're listening to the joined vc, and they're the first to join the channel
       if (oldState.channelId == null && voicePingInputs.find((vpi) => vpi.channel_id === newState.channelId)
         && newState.channel?.members.size === 1) {
-        const outputChannel: TextChannel | undefined = await server.channels.fetch(voicePing.output_channel) as TextChannel;
+        const outputChannel: Channel | undefined = await server.channels.fetch(voicePing.output_channel ?? 'undefined') as Channel;
 
         // send message to output channel
-        if (outputChannel) {
-          outputChannel.send(voicePing.message_template.replace('{user}', `<@${newState.member?.user.id!}>`).replace('{channel}', `<#${newState.channelId!}>`));
+        if (outputChannel && outputChannel.isSendable()) {
+          try {
+            outputChannel.send(voicePing.message_template.replace('{user}', `<@${newState.member?.user.id!}>`).replace('{channel}', `<#${newState.channelId!}>`));
+          } catch (error) {
+            console.error(error);
+          }
         }
       }
     });
