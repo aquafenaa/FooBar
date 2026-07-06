@@ -63,7 +63,7 @@ async function summarizeMemory(agentClient:OpenAIClient, server_id: Snowflake, l
   }];
 
   const response = await agentClient.chat.completions.create({
-    model: 'deepseek-v4-pro',
+    model: 'grok-4.3',
     messages: agentInput,
     reasoning_effort: 'high',
   });
@@ -88,7 +88,7 @@ async function cullMemory(agentClient: OpenAIClient, server_id: Snowflake, short
   }))];
 
   const summaryResponse = await agentClient.chat.completions.create({
-    model: 'deepseek-v4-pro',
+    model: 'grok-4.3',
     messages: grokInput,
     reasoning_effort: 'high',
   });
@@ -167,12 +167,17 @@ async function generateMessage(agentClient: OpenAIClient, discordClient: Client<
 
   try {
     const response = await agentClient.chat.completions.create({
-      model: 'deepseek-v4-flash',
-      reasoning_effort: 'medium',
+      model: 'grok-4.3',
+      reasoning_effort: 'low',
       messages: agentInput.reverse(), // reverse for some reason?? i'm not sure but it randomly started working this way
     });
 
-    const responseContent = response.choices[0].message.content ?? 'idk bruh 💀';
+    let responseContent = response.choices[0].message.content ?? 'idk bruh 💀';
+    const thinkStartIndex = responseContent.indexOf('<think>');
+    if (thinkStartIndex !== -1) {
+      const thinkEndIndex = responseContent.indexOf('</think>') + '</think>'.length;
+      responseContent = responseContent.substring(0, thinkStartIndex) + responseContent.substring(thinkEndIndex);
+    }
 
     testMemoryEncoding(agentClient, serverID, longTermMemory, shortTermMemory);
     clearInterval(typingIndicator);
