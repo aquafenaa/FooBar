@@ -5,7 +5,7 @@ import { commandMap } from './commands';
 import { generateMessage } from './chatbot';
 
 import { Command } from './types/bot';
-import { deleteHeartBoardMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, isEmbedMessage, syncServer, updateHeartBoardMessage } from './data';
+import { deleteHeartBoardMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isEmbedMessage, syncDatabase, updateHeartBoardMessage } from './data';
 
 const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boolean> | PartialMessage<boolean>, reaction: MessageReaction): BaseMessageOptions => {
   const authorName = author?.nickname ?? author?.displayName;
@@ -39,12 +39,12 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     console.log(`Client logged in as ${discordClient.user?.tag}!`);
 
     // verify all server data
+    syncDatabase();
+
     const guilds = await discordClient.guilds.fetch();
     guilds.forEach(async (guild) => {
       const server = await discordClient.guilds.fetch(guild.id);
       if (!server) return;
-
-      syncServer(server.id);
 
       // load all heartbaord messages to cache
       const heartboardMessages = getHeartBoardMessagesByServer(server.id);
@@ -64,7 +64,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
 
   // Add server to data when bot joins
   discordClient.on(Events.GuildCreate, (guild) => {
-    syncServer(guild.id);
+    insertServer(guild.id);
   });
 
   // On command
