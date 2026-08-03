@@ -29,7 +29,7 @@ const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boo
     embeds.push(new EmbedBuilder().setImage(attachment.url ?? attachment.proxyURL));
   });
 
-  const messageOptions: BaseMessageOptions = { content: `${reaction.emoji.toString()} // ${reaction.count}`, embeds };
+  const messageOptions: BaseMessageOptions = { content: `${reaction.emoji.toString()} // ${reaction.count}\n${message.url}`, embeds };
 
   return messageOptions;
 };
@@ -193,7 +193,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     const voicePings = getVoicePingsByServer(serverID);
 
     voicePings.forEach(async (voicePing) => {
-      if (!voicePing.output_channel) return;
+      if (!voicePing.output_channel || !voicePing.enabled) return;
 
       const voicePingInputs = getVoicePingInputs(serverID, voicePing.voiceping_name);
       // checks if the user wasn't in a vc earlier, we're listening to the joined vc, and they're the first to join the channel
@@ -214,7 +214,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
   });
 
   // Heartboard reaction function
-  const reactionFunction = async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+  const handleReaction = async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     const { message } = reaction;
 
     if (!message.guild) return;
@@ -222,16 +222,15 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     const { guild, id: messageID } = message;
     const serverID = guild.id;
     const emojiString = reaction.emoji.toString();
-    const totalReactions = reaction.count;
+    const totalReactions = reaction.count ?? 0;
 
     if (isEmbedMessage(message.id)) return; // we don't wish to process this reaction if it's to an existing HeartBoard embed
-    if (!totalReactions) return; // nor do we wish to proceed if there are no reactions
 
     const heartBoards = getHeartBoardsByEmoji(serverID, emojiString);
     heartBoards.forEach(async (heartBoard) => {
       if (!heartBoard.enabled) return;
       if (heartBoard.deny_author && user.id === message.author?.id) {
-        reaction.remove();
+        reaction.users.remove(user.id);
         return;
       }
 
@@ -244,11 +243,23 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
       if (!heartboardMessage && totalReactions < heartBoard.threshold) return;
 
       // if it's already in this board, we simply wish to update it
+      let embedMessage;
       if (heartboardMessage) {
-        const embedMessage = await outputChannel.messages.fetch(heartboardMessage.embed_id);
+        try {
+          embedMessage = await outputChannel.messages.fetch(heartboardMessage?.embed_id ?? 'unknown');
+        } catch { // if the embedMessage was deleted, delete heartboardMessage and recreate it down below
+          if (totalReactions < heartBoard.threshold || reaction.partial) { // unless it is below required threshold
+            deleteHeartBoardMessage(serverID, heartBoard.board_name, messageID);
+            return;
+          }
+          deleteHeartBoardMessage(serverID, heartboardMessage.board_name, heartboardMessage.message_id);
+          heartboardMessage = undefined;
+        }
+      }
 
+      if (heartboardMessage && embedMessage) {
         // if the message no longer has enough reactions, we should delete the HeartBoardMessage
-        if (totalReactions < heartBoard.threshold) {
+        if (totalReactions < heartBoard.threshold || reaction.partial) {
           embedMessage.delete();
           deleteHeartBoardMessage(serverID, heartBoard.board_name, messageID);
           return;
@@ -267,8 +278,8 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
 
       // if it's not in the board, but still elligible, we must add a new HeartBoardMessage
       const authorMember = await guild.members.fetch(message.author?.id ?? 'unknown');
-      const messageOptions = heartboardEmbedBuilder(authorMember, message, reaction);
-      const embedMessage = await outputChannel.send(messageOptions);
+      const messageOptions = heartboardEmbedBuilder(authorMember, message, await reaction.fetch());
+      embedMessage = await outputChannel.send(messageOptions);
 
       heartboardMessage = {
         server_id: serverID,
@@ -283,11 +294,11 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     });
   };
 
-  discordClient.on('messageReactionAdd', async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
-    await reactionFunction(reaction, user);
+  discordClient.on(Events.MessageReactionAdd, async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+    await handleReaction(reaction, user);
   });
-  discordClient.on('messageReactionRemove', async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
-    await reactionFunction(reaction, user);
+  discordClient.on(Events.MessageReactionRemove, async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+    await handleReaction(reaction, user);
   });
 }
 
