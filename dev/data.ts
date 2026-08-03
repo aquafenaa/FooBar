@@ -19,33 +19,6 @@ db.pragma('foreign_keys = ON');
 
 db.exec(schema);
 
-// function getUser(user_id: Snowflake): UserTable | undefined {
-//   return db.prepare('SELECT * FROM User WHERE user_id = ?').get(user_id) as UserTable | undefined;
-// }
-// function insertUser(user: UserTable): void {
-//   db.prepare('INSERT OR IGNORE INTO User (user_id, user_name, user_display) VALUES (?, ?, ?)')
-//     .run(user.user_id, user.user_name, user.user_display);
-// }
-// function updateUser(user: UserTable): void {
-//   db.prepare('UPDATE User SET user_name = ?, user_display = ? WHERE user_id = ?')
-//     .run(user.user_name, user.user_display, user.user_id);
-// }
-// function deleteUser(user_id: Snowflake): void {
-//   db.prepare('DELETE FROM User WHERE user_id = ?').run(user_id);
-// }
-
-// ==================== Server ====================
-
-function getServer(server_id: Snowflake): ServerTable | undefined {
-  return db.prepare('SELECT * FROM Server WHERE server_id = ?').get(server_id) as ServerTable | undefined;
-}
-function insertServer(server_id: Snowflake): void {
-  db.prepare('INSERT OR IGNORE INTO Server (server_id) VALUES (?)').run(server_id);
-}
-function deleteServer(server_id: Snowflake): void {
-  db.prepare('DELETE FROM Server WHERE server_id = ?').run(server_id);
-}
-
 // ==================== Chatbot ====================
 function getChatbot(server_id: Snowflake): ChatbotTable | undefined {
   return db.prepare('SELECT * FROM Chatbot WHERE server_id = ?').get(server_id) as ChatbotTable | undefined;
@@ -59,22 +32,6 @@ function upsertChatbot(chatbot: ChatbotTable): void {
       chatbot_core_memory = excluded.chatbot_core_memory
   `).run(chatbot.server_id, chatbot.chatbot_enabled ? 1 : 0, chatbot.chatbot_core_memory);
 }
-
-// ==================== Channel ====================
-// function getChannel(channel_id: Snowflake): ChannelTable | undefined {
-//   return db.prepare('SELECT * FROM Channel WHERE channel_id = ?').get(channel_id) as ChannelTable | undefined;
-// }
-// function getChannelsByServer(server_id: Snowflake): ChannelTable[] {
-//   return db.prepare('SELECT * FROM Channel WHERE server_id = ?').all(server_id) as ChannelTable[];
-// }
-// function insertChannel(channel: ChannelTable): void {
-//   db.prepare('INSERT OR IGNORE INTO Channel (server_id, channel_id) VALUES (?, ?)')
-//     .run(channel.server_id, channel.channel_id);
-// }
-// function deleteChannel(channel_id: Snowflake): void {
-//   // NOTE: Cascades to Message, HeartBoardMessage, VoicePingInput
-//   db.prepare('DELETE FROM Channel WHERE channel_id = ?').run(channel_id);
-// }
 
 // ==================== ChatbotLongTermMemory ====================
 function getChatbotLongTermMemory(server_id: Snowflake, memory_id: number): ChatbotLongTermMemoryTable | undefined {
@@ -122,19 +79,6 @@ function deleteNOldestShortTermMemory(server_id: Snowflake, n: number): void {
   db.prepare('DELETE FROM ChatbotShortTermMemory WHERE server_id = ? AND memory_id IN (SELECT memory_id FROM ChatbotShortTermMemory WHERE server_id = ? ORDER BY timestamp ASC LIMIT ?)')
     .run(server_id, server_id, n);
 }
-
-// ==================== Message ====================
-// function getMessage(message_id: Snowflake): MessageTable | undefined {
-//   return db.prepare('SELECT * FROM Message WHERE message_id = ?').get(message_id) as MessageTable | undefined;
-// }
-// function insertMessage(message: MessageTable): void {
-//   db.prepare('INSERT OR IGNORE INTO Message (server_id, channel_id, message_id, author_id) VALUES (?, ?, ?, ?)')
-//     .run(message.server_id, message.channel_id, message.message_id, message.author_id);
-// }
-// function deleteMessage(message_id: Snowflake): void {
-//   // NOTE: Cascades to HeartBoardMessage
-//   db.prepare('DELETE FROM Message WHERE message_id = ?').run(message_id);
-// }
 
 // ==================== HeartBoard ====================
 function getHeartBoard(server_id: Snowflake, board_name: string): HeartBoardTable | undefined {
@@ -273,79 +217,107 @@ function deleteAutomaticResponse(server_id: Snowflake, name: string): void {
   db.prepare('DELETE FROM AutomaticResponse WHERE server_id = ? AND name = ?').run(server_id, name);
 }
 
-const syncServer = db.transaction((server_id: Snowflake) => {
-  insertServer(server_id);
+// ==================== Server ====================
+function getServer(server_id: Snowflake): ServerTable | undefined {
+  return db.prepare('SELECT * FROM Server WHERE server_id = ?').get(server_id) as ServerTable | undefined;
+}
+function insertServer(server_id: Snowflake): void {
+  db.prepare('INSERT OR IGNORE INTO Server (server_id) VALUES (?)').run(server_id);
+  upsertChatbot({
+    server_id,
+    chatbot_core_memory: '',
+    chatbot_enabled: false,
+  });
+}
+function deleteServer(server_id: Snowflake): void {
+  db.prepare('DELETE FROM Server WHERE server_id = ?').run(server_id);
+}
 
+const syncDatabase = db.transaction(() => {
   const currentVersion = (db.pragma('user_version', { simple: true }) as number);
   if (!currentVersion || currentVersion < 0) {
     const configData: ConfigData = JSON.parse(readFileSync(configPath, { encoding: 'utf-8' }));
     const data: ServerData[] = JSON.parse(readFileSync(dataPath, { encoding: 'utf-8' })).servers;
+    configData.servers.forEach((server) => {
+      const serverID = server.id;
+      insertServer(serverID);
 
-    const serverConfig: ServerConfig = configData.servers.filter((cd) => cd.id === server_id)[0];
-    const serverData: ServerData = data.filter((d) => d.id === server_id)[0];
+      const serverConfig: ServerConfig = configData.servers.filter((cd) => cd.id === serverID)[0];
+      const serverData: ServerData = data.filter((d) => d.id === serverID)[0];
 
-    if (!serverConfig || !serverData) return;
+      if (!serverConfig || !serverData) return;
 
-    serverConfig.serverResponses.forEach((response) => {
-      const existingServerResponse = getAutomaticResponse(server_id, response.name);
-      if (existingServerResponse) return;
+      console.log(serverConfig);
 
-      insertAutomaticResponse({
-        server_id,
-        name: response.name,
-        enabled: response.enabled,
-        activation_regex: response.activationRegex,
-        capture_regex: response.captureRegex ?? '*',
-        output_template: response.outputTemplateString,
+      serverConfig.serverResponses.forEach((response) => {
+        const existingServerResponse = getAutomaticResponse(serverID, response.name);
+        if (existingServerResponse) return;
+
+        insertAutomaticResponse({
+          server_id: serverID,
+          name: response.name,
+          enabled: response.enabled,
+          activation_regex: response.activationRegex,
+          capture_regex: response.captureRegex ?? '*',
+          output_template: response.outputTemplateString,
+        });
       });
+
+      upsertChatbot({ server_id: serverID, chatbot_enabled: false, chatbot_core_memory: '' });
+
+      const existingDefaultHeartboard = getHeartBoard(serverID, 'legacy-heartboard');
+      if (!existingDefaultHeartboard) {
+        const board = serverConfig.heartBoard;
+
+        insertHeartBoard({
+          server_id: serverID,
+          board_name: 'legacy-heartboard',
+          enabled: board.enabled,
+          deny_author: board.denyAuthor,
+          threshold: board.thresholdNumber,
+          output_channel: board.outputChannel,
+        });
+
+        board.emojis.forEach((emoji) => {
+          insertHeartBoardEmoji({
+            server_id: serverID,
+            board_name: 'legacy-heartboard',
+            emoji,
+          });
+        });
+
+        serverData.heartBoardMessages.forEach((hbm) => insertHeartBoardMessage({
+          server_id: serverID,
+          board_name: 'legacy-heartboard',
+          channel_id: hbm.channelID,
+          embed_id: hbm.embedMessageID,
+          message_id: hbm.messageID,
+          total_emojis: -1,
+        }));
+      }
+
+      const existingDefaultVoiceping = getVoicePing(serverID, 'legacy-voiceping');
+      if (!existingDefaultVoiceping) {
+        const ping = serverConfig.voicePing;
+
+        insertVoicePing({
+          server_id: serverID,
+          voiceping_name: 'legacy-voiceping',
+          enabled: ping.enabled,
+          message_template: ping.voicePingMessage,
+          output_channel: ping.outputChannel,
+        });
+
+        ping.inputChannels.forEach((inputChannel) => insertVoicePingInput({
+          server_id: serverID,
+          voiceping_name: 'legacy-voiceping',
+          channel_id: inputChannel,
+        }));
+      }
+
+      // chatbot's data can be deleted. it's not as important as other data
+      db.pragma('user_version = 1');
     });
-
-    upsertChatbot({ server_id, chatbot_enabled: false, chatbot_core_memory: '' });
-
-    const existingDefaultHeartboard = getHeartBoard(server_id, 'legacy-heartboard');
-    if (!existingDefaultHeartboard) {
-      const board = serverConfig.heartBoard;
-
-      insertHeartBoard({
-        server_id,
-        board_name: 'legacy-heartboard',
-        enabled: board.enabled,
-        deny_author: board.denyAuthor,
-        threshold: board.thresholdNumber,
-        output_channel: board.outputChannel,
-      });
-
-      serverData.heartBoardMessages.forEach((hbm) => insertHeartBoardMessage({
-        server_id,
-        board_name: 'legacy-heartboard',
-        channel_id: hbm.channelID,
-        embed_id: hbm.embedMessageID,
-        message_id: hbm.messageID,
-        total_emojis: -1,
-      }));
-    }
-
-    const existingDefaultVoiceping = getVoicePing(server_id, 'legacy-voiceping');
-    if (!existingDefaultVoiceping) {
-      const ping = serverConfig.voicePing;
-
-      insertVoicePing({
-        server_id,
-        voiceping_name: 'legacy-voiceping',
-        enabled: ping.enabled,
-        message_template: ping.voicePingMessage,
-        output_channel: ping.outputChannel,
-      });
-
-      ping.inputChannels.forEach((inputChannel) => insertVoicePingInput({
-        server_id,
-        voiceping_name: 'legacy-voiceping',
-        channel_id: inputChannel,
-      }));
-    }
-
-    db.pragma('user_version = 1');
-    // chatbot's data can be deleted. it's not as important as other data
   }
   // if (currentVersion < 1) {
   // }
@@ -353,7 +325,7 @@ const syncServer = db.transaction((server_id: Snowflake) => {
 
 export {
   db,
-  getServer, insertServer, deleteServer, syncServer,
+  getServer, insertServer, deleteServer, syncDatabase,
   getChatbot, upsertChatbot,
   getHeartBoard, getHeartBoardsByServer, getHeartBoardsByEmoji, insertHeartBoard, updateHeartBoard, deleteHeartBoard,
   getHeartBoardEmojis, insertHeartBoardEmoji, deleteHeartBoardEmoji, deleteAllHeartBoardEmojis,
