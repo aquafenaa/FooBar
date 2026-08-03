@@ -247,8 +247,6 @@ const syncDatabase = db.transaction(() => {
 
       if (!serverConfig || !serverData) return;
 
-      console.log(serverConfig);
-
       serverConfig.serverResponses.forEach((response) => {
         const existingServerResponse = getAutomaticResponse(serverID, response.name);
         if (existingServerResponse) return;
