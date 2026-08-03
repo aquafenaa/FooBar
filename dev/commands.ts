@@ -120,14 +120,14 @@ const HeartboardCommand: ConfigCommand = {
 
     if (subCommand === 'list') {
       const heartBoards = getHeartBoardsByServer(serverID);
-      if (!heartBoards) {
+      if (!heartBoards || heartBoards.length === 0) {
         interaction.reply({ content: 'There are currently no heartboards on this server.', flags: MessageFlags.Ephemeral });
         return;
       }
 
       const heartboardFields = heartBoards.map((heartboard) => ({
         name: `${heartboard.board_name} (${heartboard.enabled ? '✔' : '✘'})`,
-        value: getHeartBoardEmojis(serverID, heartboard.board_name).join(', '),
+        value: getHeartBoardEmojis(serverID, heartboard.board_name).map((emoji) => emoji.emoji).join(', '),
       }));
       const embed = new EmbedBuilder().setTitle('Heartboards').addFields(...heartboardFields);
 
@@ -371,7 +371,7 @@ const VoicePingCommand: ConfigCommand = {
 
     if (subCommand === 'list') {
       const voicePings = getVoicePingsByServer(serverID);
-      if (!voicePings) {
+      if (!voicePings || voicePings.length === 0) {
         interaction.reply({ content: 'There are currently no VoicePings on this server.', flags: MessageFlags.Ephemeral });
         return;
       }
@@ -607,6 +607,7 @@ const ResponseCommand: ConfigCommand = {
       .setDescription('Remove a response')
       .addStringOption((nameOption) => nameOption.setName('name')
         .setDescription('Name of the response to remove')
+        .setAutocomplete(true)
         .setRequired(true)))
     .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
       .setDescription('View current settings for a given response')
@@ -778,7 +779,7 @@ const ResponseCommand: ConfigCommand = {
 
 const SettingsCommand: Command = {
   data: new SlashCommandBuilder()
-    .setName('config')
+    .setName('settings')
     .setDescription('Control server-wide settings of bot\'s features')
     .addSubcommand(
       (statusSubcommand) => statusSubcommand.setName('status')

@@ -226,8 +226,8 @@ function insertVoicePing(ping: VoicePingTable): void {
     .run(ping.server_id, ping.voiceping_name, ping.enabled ? 1 : 0, ping.message_template, ping.output_channel);
 }
 function updateVoicePing(ping: VoicePingTable): void {
-  db.prepare('UPDATE VoicePing SET message_template = ?, output_channel = ? WHERE server_id = ? AND voiceping_name = ?')
-    .run(ping.message_template, ping.output_channel, ping.server_id, ping.voiceping_name);
+  db.prepare('UPDATE VoicePing SET message_template = ?, enabled = ?, output_channel = ? WHERE server_id = ? AND voiceping_name = ?')
+    .run(ping.message_template, ping.enabled ? 1 : 0, ping.output_channel, ping.server_id, ping.voiceping_name);
 }
 function deleteVoicePing(server_id: Snowflake, voiceping_name: string): void {
   // NOTE: Cascades to VoicePingInput
@@ -262,7 +262,7 @@ function getAutomaticResponsesByServer(server_id: Snowflake): AutomaticResponseT
   return db.prepare('SELECT * FROM AutomaticResponse WHERE server_id = ?').all(server_id) as AutomaticResponseTable[];
 }
 function insertAutomaticResponse(response: AutomaticResponseTable): void {
-  db.prepare('INSERT OR IGNORE INTO AutomaticResponse (server_id, name, enabled, ctivation_regex, capture_regex, output_template) VALUES (?, ?, ?, ?, ?)')
+  db.prepare('INSERT OR IGNORE INTO AutomaticResponse (server_id, name, enabled, activation_regex, capture_regex, output_template) VALUES (?, ?, ?, ?, ?, ?)')
     .run(response.server_id, response.name, response.enabled ? 1 : 0, response.activation_regex, response.capture_regex, response.output_template);
 }
 function updateAutomaticResponse(response: AutomaticResponseTable): void {
@@ -275,7 +275,6 @@ function deleteAutomaticResponse(server_id: Snowflake, name: string): void {
 
 const syncServer = db.transaction((server_id: Snowflake) => {
   insertServer(server_id);
-  upsertChatbot({ server_id, chatbot_enabled: false, chatbot_core_memory: '' });
 
   const currentVersion = (db.pragma('user_version', { simple: true }) as number);
   if (!currentVersion || currentVersion < 0) {
@@ -300,6 +299,8 @@ const syncServer = db.transaction((server_id: Snowflake) => {
         output_template: response.outputTemplateString,
       });
     });
+
+    upsertChatbot({ server_id, chatbot_enabled: false, chatbot_core_memory: '' });
 
     const existingDefaultHeartboard = getHeartBoard(server_id, 'legacy-heartboard');
     if (!existingDefaultHeartboard) {
@@ -343,6 +344,7 @@ const syncServer = db.transaction((server_id: Snowflake) => {
       }));
     }
 
+    db.pragma('user_version = 1');
     // chatbot's data can be deleted. it's not as important as other data
   }
   // if (currentVersion < 1) {
@@ -351,11 +353,8 @@ const syncServer = db.transaction((server_id: Snowflake) => {
 
 export {
   db,
-  // getUser, insertUser, updateUser, deleteUser,
   getServer, insertServer, deleteServer, syncServer,
   getChatbot, upsertChatbot,
-  // getChannel, getChannelsByServer, insertChannel, deleteChannel,
-  // getMessage, insertMessage, deleteMessage,
   getHeartBoard, getHeartBoardsByServer, getHeartBoardsByEmoji, insertHeartBoard, updateHeartBoard, deleteHeartBoard,
   getHeartBoardEmojis, insertHeartBoardEmoji, deleteHeartBoardEmoji, deleteAllHeartBoardEmojis,
   getHeartBoardMessage, getHeartBoardMessagesByServer, getEmbedMessagesByBoard, insertHeartBoardMessage, updateHeartBoardMessage, deleteHeartBoardMessage, isEmbedMessage,
@@ -365,199 +364,3 @@ export {
   getChatbotShortTermMemoriesByServer, insertChatbotShortTermMemory, deleteChatbotShortTermMemory, clearChatbotShortTermMemory, deleteNOldestShortTermMemory,
   getAutomaticResponse, getAutomaticResponsesByServer, insertAutomaticResponse, updateAutomaticResponse, deleteAutomaticResponse,
 };
-
-// let configBeingUsed = false;
-// let dataBeingUsed = false;
-
-// // WRITES GIVEN DATA TO RELATIVE LOCATION
-// async function writeData(saveData: SaveData) {
-//   if (dataBeingUsed) {
-//     return new Promise((resolve) => {
-//       setTimeout(async () => {
-//         resolve(await writeData(saveData));
-//       }, 200);
-//     });
-//   }
-
-//   dataBeingUsed = true;
-
-//   const saveDataString = JSON.stringify(saveData, null, 2);
-//   // console.log('String:');
-//   // console.log(saveDataString);
-//   await writeFile(dataPath, saveDataString);
-
-//   dataBeingUsed = false;
-// }
-
-// async function writeConfig(saveData: ConfigData) {
-//   if (configBeingUsed) {
-//     return new Promise((resolve) => {
-//       setTimeout(async () => {
-//         resolve(await writeConfig(saveData));
-//       }, 200);
-//     });
-//   }
-
-//   configBeingUsed = true;
-
-//   const saveDataString = JSON.stringify(saveData, null, 2);
-//   await writeFile(configPath, saveDataString);
-
-//   configBeingUsed = false;
-// }
-
-// // READS DATA FROM RELATIVE LOCATION
-// async function readData(): Promise<SaveData> {
-//   if (dataBeingUsed) {
-//     return new Promise((resolve) => {
-//       setTimeout(async () => {
-//         resolve(await readData());
-//       }, 200);
-//     });
-//   }
-
-//   dataBeingUsed = true;
-
-//   const result = JSON.parse(await readFile(dataPath, 'utf-8'));
-
-//   dataBeingUsed = false;
-//   return result;
-// }
-
-// async function readConfig(): Promise<ConfigData> {
-//   if (configBeingUsed) {
-//     return new Promise((resolve) => {
-//       setTimeout(async () => {
-//         resolve(await readConfig());
-//       }, 200);
-//     });
-//   }
-
-//   return JSON.parse(await readFile(configPath, 'utf-8'));
-// }
-
-// // ADDS A NEW SERVER IF GUILD ID DOESN'T EXIST
-// async function addData(guildID: string): Promise<ServerData> {
-//   const data = await readData();
-
-//   const oldData = data.servers.find((s) => s.id === guildID);
-//   if (oldData) return oldData;
-
-//   const serverData: ServerData = {
-//     id: guildID,
-//     heartBoardMessages: [],
-
-//     chatbotCoreMemory: '',
-//     chatbotLongtermMemory: [],
-//     chatbotShortTermMessages: [],
-//   };
-
-//   data.servers.push(serverData);
-//   writeData(data);
-
-//   return serverData;
-// }
-
-// async function addConfig(guildID: string): Promise<ServerConfig> {
-//   const config = await readConfig();
-
-//   const oldConfig = config.servers.find((s) => s.id === guildID);
-//   if (oldConfig) return oldConfig;
-
-//   const serverConfig: ServerConfig = {
-//     id: guildID,
-
-//     aiEnabled: false,
-//     serverResponses: [],
-//     heartBoard: defaultHeartboardConfig,
-//     voicePing: defaultVoicepingConfig,
-//   };
-
-//   config.servers.push(serverConfig);
-//   writeConfig(config);
-
-//   return serverConfig;
-// }
-
-// // GETS DATA GIVEN A GUILD ID
-// async function getServerData(guildID: Snowflake): Promise<ServerData | undefined> {
-//   const data = await readData();
-
-//   const serverData = data.servers.find((s) => s.id === guildID);
-
-//   return serverData ?? await addData(guildID);
-// }
-
-// async function getServerConfig(guildID: Snowflake): Promise<ServerConfig | undefined> {
-//   const config = await readConfig();
-
-//   return config.servers.find((server) => server.id === guildID);
-// }
-
-// // EDITS AN EXISTING SERVER IF IT EXISTS, OR CREATES ONE
-// async function editServerData(serverData: ServerData) {
-//   const data = await readData();
-//   const index = data.servers.findIndex((server) => server.id === serverData.id);
-
-//   if (index === -1) {
-//     data.servers.push(serverData);
-//   } else {
-//     data.servers[index] = serverData;
-//   }
-
-//   console.log('\n\n\nData:');
-//   console.log(data);
-
-//   await writeData(data);
-// }
-
-// async function editServerConfig(serverConfig: ServerConfig) {
-//   const config = await readConfig();
-//   const index = config.servers.findIndex((server) => server.id === serverConfig.id);
-
-//   if (index === -1) {
-//     config.servers.push(serverConfig);
-//   } else {
-//     config.servers[index] = serverConfig;
-//   }
-
-//   writeConfig(config);
-// }
-
-// // REPAIRS AN INCOMPLETE SERVER DATA WITH DEFAULT DATA
-// async function repairServerData(serverData: any): Promise<ServerData> {
-//   if (!serverData.id) return serverData;
-
-//   const fixedData: ServerData = {
-//     id: serverData.id,
-
-//     heartBoardMessages: serverData.heartBoardMessages ?? [],
-//     chatbotCoreMemory: serverData.chatbotCoreMemory ?? '',
-//     chatbotLongtermMemory: serverData.chatbotLongtermMemory ?? [],
-//     chatbotShortTermMessages: serverData.chatbotShortTermMessages ?? [],
-//   };
-
-//   // console.log(fixedData);
-
-//   await editServerData(fixedData); // update if changed
-//   return fixedData;
-// }
-
-// async function repairServerConfig(serverConfig: any): Promise<ServerConfig> {
-//   const fixedConfig: ServerConfig = {
-//     id: serverConfig.id,
-
-//     aiEnabled: serverConfig.aiEnabled ?? false,
-//     serverResponses: serverConfig.serverResponses ?? [],
-//     heartBoard: serverConfig.heartBoard ?? defaultHeartboardConfig,
-//     voicePing: serverConfig.voicePing ?? defaultVoicepingConfig,
-//   };
-
-//   await editServerConfig(fixedConfig); // update if changed
-//   return fixedConfig;
-// }
-
-// export {
-//   writeData, readData, writeConfig, readConfig, getServerConfig, getServerData, addData, addConfig,
-//   editServerData, editServerConfig, repairServerData, repairServerConfig,
-// };

@@ -63,7 +63,7 @@ async function summarizeMemory(agentClient:OpenAIClient, server_id: Snowflake, l
   }];
 
   const response = await agentClient.chat.completions.create({
-    model: 'grok-4.3',
+    model: 'grok-4.5',
     messages: agentInput,
     reasoning_effort: 'high',
   });
@@ -88,7 +88,7 @@ async function cullMemory(agentClient: OpenAIClient, server_id: Snowflake, short
   }))];
 
   const summaryResponse = await agentClient.chat.completions.create({
-    model: 'grok-4.3',
+    model: 'grok-4.5',
     messages: grokInput,
     reasoning_effort: 'high',
   });
@@ -167,9 +167,9 @@ async function generateMessage(agentClient: OpenAIClient, discordClient: Client<
 
   try {
     const response = await agentClient.chat.completions.create({
-      model: 'grok-4.3',
-      reasoning_effort: 'low',
-      messages: agentInput.reverse(), // reverse for some reason?? i'm not sure but it randomly started working this way
+      model: 'grok-4.5',
+      reasoning_effort: 'medium',
+      messages: agentInput.reverse(), // reverse to ensure newer messages are last
     });
 
     let responseContent = response.choices[0].message.content ?? 'idk bruh 💀';
