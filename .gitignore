@@ -10,3 +10,4 @@ modelfile
 
 data.json
 config.json
+*.db

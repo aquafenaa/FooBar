@@ -1,54 +1,70 @@
 import OpenAI from 'openai';
-import { Client, EmbedBuilder, Events, Message, MessageReaction, PartialMessageReaction, PartialUser, Snowflake, TextChannel, User } from 'discord.js';
+import { BaseMessageOptions, Channel, Client, EmbedBuilder, Events, GuildMember, Message, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, User } from 'discord.js';
 
-import { Command } from './types';
 import { commandMap } from './commands';
 import { generateMessage } from './chatbot';
 
-import { addConfig, addData, editServerConfig, editServerData, getServerConfig, getServerData, readConfig, readData, repairServerConfig, repairServerData } from './data';
+import { Command } from './types/bot';
+import { deleteHeartBoardMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, isEmbedMessage, syncServer, updateHeartBoardMessage } from './data';
+
+const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boolean> | PartialMessage<boolean>, reaction: MessageReaction): BaseMessageOptions => {
+  const authorName = author?.nickname ?? author?.displayName;
+  const authorIconURL = author?.displayAvatarURL({ forceStatic: true });
+  const timestamp = message.createdTimestamp;
+  const messageContent = message.content;
+  const messageAttachments = Array.from(message.attachments.values()).filter((attachment) => attachment.contentType?.startsWith('image'));
+
+  const mainEmbed = new EmbedBuilder().setTimestamp(timestamp);
+  if (author) mainEmbed.setAuthor({ name: authorName!, iconURL: authorIconURL });
+  if (messageContent) mainEmbed.setDescription(messageContent);
+  if (messageAttachments.length > 0) {
+    const mainImage = messageAttachments.shift()!;
+    mainEmbed.setImage(mainImage.url ?? mainImage.proxyURL);
+  }
+
+  const embeds = [mainEmbed];
+
+  // add blank embeds filled with only remaining image attachments
+  messageAttachments.forEach((attachment) => {
+    embeds.push(new EmbedBuilder().setImage(attachment.url ?? attachment.proxyURL));
+  });
+
+  const messageOptions: BaseMessageOptions = { content: `${reaction.emoji.toString()} // ${reaction.count}\n${message.url}`, embeds };
+
+  return messageOptions;
+};
 
 function clientEvents(discordClient: Client, grokClient: OpenAI) {
   discordClient.on(Events.ClientReady, async () => {
     console.log(`Client logged in as ${discordClient.user?.tag}!`);
 
-    // verify all data and configs in case structures changed
-    const data = await readData();
-    const config = await readConfig();
+    // verify all server data
+    const guilds = await discordClient.guilds.fetch();
+    guilds.forEach(async (guild) => {
+      const server = await discordClient.guilds.fetch(guild.id);
+      if (!server) return;
 
-    data.servers.forEach((s) => repairServerData(s));
-    config.servers.forEach((s) => repairServerConfig(s));
+      syncServer(server.id);
 
-    const invalidMessages: Snowflake[] = [];
-    // load all heartboard messages to cache
-    data.servers.forEach(async (server) => {
-      const { id, heartBoardMessages } = server;
-      const guild = await discordClient.guilds.fetch(id);
-
-      if (!guild || !heartBoardMessages) return;
-
-      heartBoardMessages.forEach(async (messageTuple) => {
-        const { channelID, messageID } = messageTuple;
-        const channel = await guild.channels.fetch(channelID ?? 'undefined');
+      // load all heartbaord messages to cache
+      const heartboardMessages = getHeartBoardMessagesByServer(server.id);
+      heartboardMessages.forEach(async (heartboardMessage) => {
+        const channel = await server.channels.fetch(heartboardMessage.channel_id);
 
         if (!channel || !channel.isSendable()) return;
 
         try {
-          await channel.messages.fetch(messageID ?? 'undefined'); // load message into cache
-        } catch (error) {
-          invalidMessages.push(messageID);
+          await channel.messages.fetch(heartboardMessage.message_id);
+        } catch {
+          deleteHeartBoardMessage(server.id, heartboardMessage.board_name, heartboardMessage.message_id);
         }
       });
-      const filteredMessages = heartBoardMessages.filter((m) => !invalidMessages.find((invalidMessageID) => m.messageID === invalidMessageID));
-
-      server.heartBoardMessages = filteredMessages;
-      editServerData(server);
     });
   });
 
-  // Create a base config when joining a new server
-  discordClient.on('guildCreate', (guild) => {
-    addData(guild.id);
-    addConfig(guild.id);
+  // Add server to data when bot joins
+  discordClient.on(Events.GuildCreate, (guild) => {
+    syncServer(guild.id);
   });
 
   // On command
@@ -59,14 +75,12 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
 
     const { commandName } = interaction;
     const command: Command = commandMap.get(commandName)!;
-    const guildID: string = interaction.guild.id;
+    const serverID: string = interaction.guild.id;
 
     if (!command) { console.error(`No command found! Command Name: ${commandName}`); return; }
 
-    const serverConfig = await getServerConfig(guildID) ?? await addConfig(guildID);
-
     if (interaction.isAutocomplete()) {
-      command.autocomplete!(interaction, serverConfig);
+      command.autocomplete!(interaction, serverID);
       return;
     }
 
@@ -77,11 +91,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     }
 
     try {
-      const tempConfig = await command.execute(interaction, serverConfig);
-
-      if (tempConfig) {
-        editServerConfig(tempConfig);
-      }
+      await command.execute(interaction, serverID);
     } catch (error) {
       console.error(error);
       await interaction.reply({ content: 'There was an error while executing this command!', ephemeral: true });
@@ -91,28 +101,27 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
   const allowedServers = ['917588427959058462', '1064698336185172010', '708642778300547142', '1148069131711680633'];
 
   // grok functionality, when message was sent
-  discordClient.on('messageCreate', async (message) => {
-    const { author, channel, guildId } = message;
+  discordClient.on(Events.MessageCreate, async (message) => {
+    const { author, channel, guildId: serverID } = message;
 
     // if we can't send messages, we don't care about the message
-    if (!guildId || !channel.isTextBased()) return;
+    if (!serverID || !channel.isTextBased()) return;
 
+    // Check AutomaticResponses
     const messageContent = message.content;
-    const serverConfig = await getServerConfig(guildId);
+    const serverResponses = getAutomaticResponsesByServer(serverID);
 
-    if (!serverConfig) return;
-
-    serverConfig.serverResponses.forEach((response) => {
+    serverResponses.forEach((response) => {
       // continue to next if response isn't enabled, or activation phrase isn't found
-      if (!response.enabled || !messageContent.match(response.activationRegex)) return;
+      if (!response.enabled || !messageContent.match(response.activation_regex)) return;
 
-      const groups = messageContent.match(response.captureRegex!);
+      const groups = messageContent.match(response.capture_regex!);
 
       if (!groups) return; // return undefined, if no groups were found
 
       // parse groups, and replace them with respective group number
-      if (!response.outputTemplateString) { console.log(response); return; }
-      const responseStr = response.outputTemplateString.replace(/\{(\d+)\}/g, (_, index) => { // thank u claude. this is actually a cute little implementation
+      if (!response.output_template) return;
+      const responseStr = response.output_template.replace(/\{(\d+)\}/g, (_, index) => { // thank u claude. this is actually a cute little implementation
         const i = parseInt(index, 10);
         return groups[i] ?? '';
       });
@@ -120,26 +129,25 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
       message.reply({ content: responseStr });
     });
 
-    // cancel if the message starts with "-ai"
-    if (messageContent.substring(0, 3) === '-ai') return;
+    // ChatbotResponse Handling
+    const chatbot = getChatbot(serverID);
+    // if chatbot doesn't exist, or isn't enabled, we don't care
+    if (!chatbot || !chatbot.chatbot_enabled) return;
 
     // the bot cannot respond to itself
     if (!author.id || author.id === discordClient.user?.id) return;
 
     // only works within my servers, sorry! otherwise it's a waste of xAI tokens & money :/
-    if (!allowedServers.find((id) => guildId === id)) return;
+    if (!allowedServers.find((id) => serverID === id)) return;
 
-    // we do not care if...
+    // we also do not care if...
     if ((
       message.content.includes('@everyone') || message.content.includes('@here') // ...it's a mass ping...
       || !message.mentions.has(discordClient.user?.id ?? 'undefined') // ... bot isn't mentioned...
       || message.author.id === discordClient.user?.id)) return; // ...or the bot mentioned itself...
     // && Math.random() < 1 / 4096) return; // ...and we don't roll a 1% chance to respond anyway... <-- big bug, will fix.
 
-    // if the ai feature isn't enabled, or there isn't an available server config
-    if (!(await getServerConfig(guildId))?.aiEnabled) return;
-
-    let userContent = message.content; // remove '-ai' marker from beginning of text
+    let userContent = message.content;
     const messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
     const context: Message<boolean>[] | undefined = Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: message.id }))).values()); // fetch 5 most recent messages as context
 
@@ -157,16 +165,16 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
       clearInterval(typingExtension);
     }, 20000); // cancel interval after 20 seconds, if it's still somehow going
 
-    // get response from grok, and reply
-    const grokReply = await generateMessage(message, userContent, context ?? [], grokClient, (await getServerData(guildId))!, discordClient.user!.id, typingExtension);
+    // get response from LLM, and reply
+    const agentReply = await generateMessage(grokClient, discordClient, serverID, typingExtension, message, userContent, context ?? []);
     try {
-      if (!grokReply) return;
+      if (!agentReply || agentReply === '') return;
       clearInterval(typingExtension); // disables typing
 
-      if (grokReply.length < 2000) {
-        await message.reply(grokReply);
+      if (agentReply.length < 2000) {
+        await message.reply(agentReply);
       } else {
-        await message.reply(grokReply.substring(0, 2000));
+        await message.reply(agentReply.substring(0, 2000));
       }
     } catch (error) {
       clearInterval(typingExtension); // disables typing
@@ -176,145 +184,121 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
   });
 
   // On user joining/leaving voice call
-  discordClient.on('voiceStateUpdate', async (oldState, newState) => {
-    const guildID = newState.guild?.id;
+  discordClient.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+    const serverID = newState.guild?.id;
 
-    if (!guildID) return; // we don't care if this isn't happening a server
+    if (!serverID) return; // we don't care if this isn't happening a server
 
-    const serverConfig = await getServerConfig(guildID);
-    const server = await discordClient.guilds.fetch(guildID);
+    const server = await discordClient.guilds.fetch(serverID);
+    const voicePings = getVoicePingsByServer(serverID);
 
-    const { voicePing } = serverConfig!;
+    voicePings.forEach(async (voicePing) => {
+      if (!voicePing.output_channel || !voicePing.enabled) return;
 
-    if (!server || !voicePing) return; // we don't care if we aren't able to make out a server, or if voice ping is disabled
+      const voicePingInputs = getVoicePingInputs(serverID, voicePing.voiceping_name);
+      // checks if the user wasn't in a vc earlier, we're listening to the joined vc, and they're the first to join the channel
+      if (oldState.channelId == null && voicePingInputs.find((vpi) => vpi.channel_id === newState.channelId)
+        && newState.channel?.members.size === 1) {
+        const outputChannel: Channel | undefined = await server.channels.fetch(voicePing.output_channel ?? 'undefined') as Channel;
 
-    // checks if the user wasn't in a vc earlier, we're listening to the joined vc, and they're the first to join the channel
-    if (oldState.channelId == null && voicePing.inputChannels.find((id) => id === newState.channelId)
-      && newState.channel?.members.size === 1) {
-      const guild = await discordClient.guilds.fetch(server.id);
-      const outputChannel: TextChannel | undefined = await guild.channels.fetch(voicePing.outputChannel) as TextChannel;
-      const { voicePingMessage } = voicePing;
-
-      // send message to output channel
-      if (outputChannel) {
-        outputChannel.send(voicePingMessage.replace('{user}', `<@${newState.member?.user.id!}>`).replace('{channel}', `<#${newState.channelId!}>`));
+        // send message to output channel
+        if (outputChannel && outputChannel.isSendable()) {
+          try {
+            outputChannel.send(voicePing.message_template.replace('{user}', `<@${newState.member?.user.id!}>`).replace('{channel}', `<#${newState.channelId!}>`));
+          } catch (error) {
+            console.error(error);
+          }
+        }
       }
-    }
+    });
   });
 
   // Heartboard reaction function
-  const reactionFunction = async (reactionAdded: boolean, reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+  const handleReaction = async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     const { message } = reaction;
 
     if (!message.guild) return;
 
-    const { guild } = message;
-    const guildID = guild.id;
+    const { guild, id: messageID } = message;
+    const serverID = guild.id;
+    const emojiString = reaction.emoji.toString();
+    const totalReactions = reaction.count ?? 0;
 
-    const serverConfig = await getServerConfig(guildID) ?? await addConfig(guildID);
+    if (isEmbedMessage(message.id)) return; // we don't wish to process this reaction if it's to an existing HeartBoard embed
 
-    const heartBoardConfig = serverConfig.heartBoard;
-
-    const { enabled, cumulative, denyAuthor, emojis, thresholdNumber } = heartBoardConfig;
-    const outputChannel = await guild.channels.fetch(heartBoardConfig.outputChannel);
-
-    const serverData = await getServerData(guildID) ?? await addData(guildID);
-    const { heartBoardMessages } = serverData;
-
-    // ignore this reaction if...
-    if (!enabled || !outputChannel || !outputChannel.isSendable() // ...the option is disabled or we can't send the message
-      || !emojis.includes(reaction.emoji.toString()) // ...the emoji isn't relevant to our search
-      || heartBoardMessages.find((mTuple) => message.id === mTuple.embedMessageID)) return; // ...the targeted message is a heartboard embed
-
-    // remove author's reaction if the setting is turned on, and the emote's relevant
-    if (denyAuthor && reactionAdded && user.id === message.author?.id && emojis.includes(reaction.emoji.toString())) {
-      reaction.users.remove(user.id);
-      return;
-    }
-
-    let total = 0;
-    const reactedEmojis = [];
-    const messageReactions = message.reactions.cache.filter((r) => emojis.includes(r.emoji.toString())); // filter relevant emojis
-
-    if (cumulative) { // whether we should tally all valid emojis
-      messageReactions.forEach(({ emoji, count }) => {
-        total += count;
-        reactedEmojis.push(emoji.toString());
-      });
-    } else { // if we only care about a specific emoji being above threshold value instead
-      const reactionsWithVotes = messageReactions.filter(({ emoji, count }) => emojis.includes(emoji.toString()) && (count >= thresholdNumber));
-
-      if (reactionsWithVotes.size >= 1) {
-        total = Math.max(...reactionsWithVotes.map((r) => r.count));
-        const largestReaction = reactionsWithVotes.find(({ count }) => count === total)!; // get emoji with largest amount of reactions to use
-
-        reactedEmojis.push(largestReaction.emoji.toString());
-      }
-    }
-
-    const messageTupleIndex = heartBoardMessages.findIndex((mTuple) => mTuple.messageID === message.id);
-    const contentMessage = `${reactedEmojis.join('')} // **${total}**\n${message.url}`;
-
-    if (total < thresholdNumber && messageTupleIndex === -1) return;
-
-    if (messageTupleIndex !== -1) {
-      const messageTuple = heartBoardMessages[messageTupleIndex];
-
-      const { embedMessageID } = messageTuple;
-      const embedMessage = await outputChannel.messages.fetch(embedMessageID);
-
-      if (!embedMessage) return;
-
-      if (total >= thresholdNumber) {
-        await embedMessage.edit({ content: contentMessage, embeds: embedMessage.embeds });
+    const heartBoards = getHeartBoardsByEmoji(serverID, emojiString);
+    heartBoards.forEach(async (heartBoard) => {
+      if (!heartBoard.enabled) return;
+      if (heartBoard.deny_author && user.id === message.author?.id) {
+        reaction.users.remove(user.id);
         return;
       }
 
-      // if removing the reaction has dipped below our threshold value, delete the message and tuple
-      await embedMessage.delete();
-      heartBoardMessages.splice(messageTupleIndex, 1);
+      const outputChannel = await guild.channels.fetch(heartBoard.output_channel);
+      if (!outputChannel || !outputChannel.isTextBased()) return;
 
-      serverData.heartBoardMessages = heartBoardMessages;
-      await editServerData(serverData);
+      let heartboardMessage = getHeartBoardMessage(serverID, heartBoard.board_name, messageID);
 
-      return;
-    }
+      // if it's not currently in the board, and it's not elligible, skip processing
+      if (!heartboardMessage && totalReactions < heartBoard.threshold) return;
 
-    const guildUser = await guild.members.fetch(message.author?.id ?? 'undefined');
-    const embeds = [ // create embed
-      (message.content ? new EmbedBuilder().setDescription(message.content) : new EmbedBuilder()) // set description to content if it exists
-        .setAuthor({ name: guildUser?.nickname ?? guildUser?.user.username ?? '', iconURL: guildUser?.displayAvatarURL() ?? '' })
-        .setTimestamp(message.createdTimestamp),
-    ];
+      // if it's already in this board, we simply wish to update it
+      let embedMessage;
+      if (heartboardMessage) {
+        try {
+          embedMessage = await outputChannel.messages.fetch(heartboardMessage?.embed_id ?? 'unknown');
+        } catch { // if the embedMessage was deleted, delete heartboardMessage and recreate it down below
+          if (totalReactions < heartBoard.threshold || reaction.partial) { // unless it is below required threshold
+            deleteHeartBoardMessage(serverID, heartBoard.board_name, messageID);
+            return;
+          }
+          deleteHeartBoardMessage(serverID, heartboardMessage.board_name, heartboardMessage.message_id);
+          heartboardMessage = undefined;
+        }
+      }
 
-    // scrape attachments and add them to extra embeds
-    const attachments = Array.from(message.attachments.values()).filter((attachment) => attachment.contentType?.startsWith('image'));
-    if (attachments.length >= 1) {
-      const mainImage = attachments.shift();
-      embeds[0].setImage(mainImage?.url!);
+      if (heartboardMessage && embedMessage) {
+        // if the message no longer has enough reactions, we should delete the HeartBoardMessage
+        if (totalReactions < heartBoard.threshold || reaction.partial) {
+          embedMessage.delete();
+          deleteHeartBoardMessage(serverID, heartBoard.board_name, messageID);
+          return;
+        }
 
-      embeds.push(...attachments.map((image) => new EmbedBuilder().setImage(image.url)));
-    }
+        // if it's still above the threshold, we wish to simply edit the message
+        const authorMember = await guild.members.fetch(message.author?.id ?? 'unknown');
+        const messageOptions = heartboardEmbedBuilder(authorMember, message, reaction);
 
-    const heartboardMessage = await outputChannel.send({ content: `${reactedEmojis.join('')} // **${total}**\n${message.url}`, embeds });
+        embedMessage.edit(messageOptions);
+        heartboardMessage.total_emojis = totalReactions;
+        updateHeartBoardMessage(heartboardMessage);
 
-    heartBoardMessages.push({
-      channelID: outputChannel.id,
-      messageID: message.id,
-      embedMessageID: heartboardMessage.id,
-    }); // add to data for future cache reference
+        return;
+      }
 
-    serverData.heartBoardMessages = heartBoardMessages; // not sure if necessary due to confusion abt JS references, but best to be cautious
-    await editServerData(serverData);
+      // if it's not in the board, but still elligible, we must add a new HeartBoardMessage
+      const authorMember = await guild.members.fetch(message.author?.id ?? 'unknown');
+      const messageOptions = heartboardEmbedBuilder(authorMember, message, await reaction.fetch());
+      embedMessage = await outputChannel.send(messageOptions);
+
+      heartboardMessage = {
+        server_id: serverID,
+        board_name: heartBoard.board_name,
+        channel_id: message.channelId,
+        message_id: messageID,
+        total_emojis: totalReactions,
+        embed_id: embedMessage.id,
+      };
+
+      insertHeartBoardMessage(heartboardMessage);
+    });
   };
 
-  // when user adds a reaction
-  discordClient.on('messageReactionAdd', async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
-    await reactionFunction(true, reaction, user);
+  discordClient.on(Events.MessageReactionAdd, async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+    await handleReaction(reaction, user);
   });
-
-  discordClient.on('messageReactionRemove', async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
-    await reactionFunction(false, reaction, user);
+  discordClient.on(Events.MessageReactionRemove, async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
+    await handleReaction(reaction, user);
   });
 }
 
