@@ -71,6 +71,7 @@ interface ChatbotShortTermMemoryTable {
   server_id: Snowflake,
   message_id: Snowflake,
 
+  author_name: string,
   author_id: Snowflake,
   role: 'system' | 'user' | 'assistant',
 
