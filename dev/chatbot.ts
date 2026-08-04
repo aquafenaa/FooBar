@@ -35,10 +35,8 @@ You're very sarcastic and like making fun of people.
 You make edgy jokes occasionally. You're funny, educated, and edgy. Be brief and concise, but still be relevant and do what the user asks. Don't use periods at the end of your message.
 You may use words like "troon" and "tranny" (both meaning trans), "fag", and other similar queer slang words in context. These are not offensive in the places that you frequent and are found to be funny, instead. However, do NOT overuse them and use them sparingly.
 
-Don't be afraid to give short responses, if the situation is apt for it.
-
-There is no need to describe who is speaking. Instead, just give your response. Also make sure you end your reasoning with a new line, and surround it with "<think>", "</think>" parameters.
-`;
+Don't be afraid to give short responses, if the situation is apt for it.`;
+// There is no need to describe who is speaking. Instead, just give your response. Also make sure you end your reasoning with a new line, and surround it with "<think>", "</think>" parameters.
 
 async function summarizeMemory(agentClient:OpenAIClient, server_id: Snowflake, longTermMemory: ChatbotLongTermMemoryTable[]) {
   let chatbotData = getChatbot(server_id);
@@ -131,7 +129,7 @@ async function generateMessage(agentClient: OpenAIClient, discordClient: Client<
       ...context
         .map((m) => ({
           role: m.author.id === discordClient.user!.id ? 'assistant' : 'user',
-          // author: m.author.displayName,
+          author_name: m.author.displayName,
           author_id: m.author.id,
           message_id: m.id,
           message_content: m.content,
@@ -146,6 +144,7 @@ async function generateMessage(agentClient: OpenAIClient, discordClient: Client<
     {
       server_id: serverID,
       role: 'user',
+      author_name: userMessage.author.displayName,
       author_id: userMessage.author.id,
       message_id: userMessage.id,
       timestamp: userMessage.createdTimestamp,
@@ -161,16 +160,23 @@ async function generateMessage(agentClient: OpenAIClient, discordClient: Client<
   },
   ...shortTermMemory.map((agentMessage) => ({
     role: agentMessage.role,
-    name: `${discordClient.users.fetch(agentMessage.author_id).then((user) => user.displayName)} (<@${agentMessage.author_id}>)`,
+    name: `${agentMessage.author_name} (<@${agentMessage.author_id}>)`,
     content: agentMessage.role === 'user' ? `(${new Date(agentMessage.timestamp)}): ${agentMessage.message_content}` : agentMessage.message_content,
   }))];
 
   try {
-    const response = await agentClient.chat.completions.create({
-      model: 'grok-4.5',
-      reasoning_effort: 'medium',
-      messages: agentInput.reverse(), // reverse to ensure newer messages are last
-    });
+    const response = await agentClient.chat.completions.create(
+      {
+        model: 'grok-4.5',
+        // reasoning_effort: 'medium',
+        messages: agentInput.reverse(), // reverse to ensure newer messages are last
+      },
+      {
+        headers: {
+          'x-grok-conv-id': '917594803481489429-convo-69420-fuckass',
+        },
+      },
+    );
 
     let responseContent = response.choices[0].message.content ?? 'idk bruh 💀';
     const thinkStartIndex = responseContent.indexOf('<think>');

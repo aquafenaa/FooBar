@@ -65,8 +65,8 @@ function getChatbotShortTermMemoriesByServer(server_id: Snowflake): ChatbotShort
 function insertChatbotShortTermMemory(memory: Omit<ChatbotShortTermMemoryTable, 'message_id'>): number {
   const { nextID } = db.prepare('SELECT COALESCE(MAX(message_id), 0) + 1 AS next_id FROM ChatbotShortTermMemory WHERE server_id = ?')
     .get(memory.server_id) as { nextID: number };
-  db.prepare('INSERT INTO ChatbotShortTermMemory (server_id, message_id, author_id, role, message_content, timestamp) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(memory.server_id, nextID, memory.author_id, memory.role, memory.message_content, memory.timestamp);
+  db.prepare('INSERT INTO ChatbotShortTermMemory (server_id, message_id, author_name, author_id, role, message_content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(memory.server_id, nextID, memory.author_name, memory.author_id, memory.role, memory.message_content, memory.timestamp);
   return nextID;
 }
 function deleteChatbotShortTermMemory(server_id: Snowflake, message_id: number): void {

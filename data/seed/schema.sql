@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS ChatbotLongTermMemory(
 CREATE TABLE IF NOT EXISTS ChatbotShortTermMemory(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
   message_id VARCHAR(20) NOT NULL,
+
+  author_name VARCHAR(40) NOT NULL,
   
   author_id VARCHAR(20) NOT NULL REFERENCES User(user_id),
   role VARCHAR (9),
