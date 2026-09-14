@@ -11,8 +11,13 @@ import {
   TextInputStyle,
 } from 'discord.js';
 import { Command, ConfigCommand } from './types/bot';
-import { addChatbotSubscriber, deleteAllHeartBoardEmojis, deleteAllVoicePingInputs, deleteAutomaticResponse, deleteChatbot, deleteChatbotLongTermMemory, deleteHeartBoard, deleteVoicePing, getAutomaticResponse, getAutomaticResponsesByServer, getChatbot, getChatbotLongTermMemoriesByServer, getChatbotLongTermMemory, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getVoicePing, getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertChatbotLongTermMemory, insertHeartBoard, insertHeartBoardEmoji, insertVoicePing, insertVoicePingInput, isChatbotSubscriber, removeChatbotSubscriber, setChatbotPrompt, updateAutomaticResponse, updateChatbotLongTermMemory, updateHeartBoard, updateVoicePing, upsertChatbot } from './data';
-import { AutomaticResponseTable, HeartBoardTable, VoicePingTable } from './types/schema';
+import { addChatbotSubscriber, deleteAllHeartBoardEmojis, deleteAllVoicePingInputs, deleteAutomaticResponse, deleteChatbot,
+  deleteChatbotLongTermMemory, deleteHeartBoard, deleteNOldestShortTermMemory, deleteVoicePing, getAutomaticResponse, getAutomaticResponsesByServer, getChatbot,
+  getChatbotLongTermMemoriesByServer, getChatbotLongTermMemory, getChatbotShortTermMemoriesByServer, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getVoicePing,
+  getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertChatbotLongTermMemory, insertHeartBoard, insertHeartBoardEmoji,
+  insertVoicePing, insertVoicePingInput, isChatbotSubscriber, removeChatbotSubscriber, setChatbotPrompt, updateAutomaticResponse, updateChatbotLongTermMemory,
+  updateHeartBoard, updateVoicePing, upsertChatbot } from './data';
+import { AutomaticResponseTable, ChatbotTable, HeartBoardTable, VoicePingTable } from './types/schema';
 import { getDefaultSystemPrompt } from './chatbot';
 
 const commandMap: Map<string, Command> = new Map();
@@ -22,7 +27,7 @@ const ChatbotCommand: ConfigCommand = {
     .setName('chatbot').setDescription('Chatbot for the server.').setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand((createSubcommand) => createSubcommand.setName('create')
       .setDescription('Create the chatbot for a server that doesn\'t currently have one.'))
-    .addSubcommand((removeSubcommand) => removeSubcommand.setName('remove')
+    .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete')
       .setDescription('Remove the chatbot for a server that already has one.'))
     .addSubcommandGroup((promptSubcommandGroup) => promptSubcommandGroup.setName('prompt')
       .setDescription('Set or delete the system prompt for the chatbot.')
@@ -30,14 +35,17 @@ const ChatbotCommand: ConfigCommand = {
         .setDescription('Set the system prompt.'))
       .addSubcommand((deletePromptSubcommand) => deletePromptSubcommand.setName('delete')
         .setDescription('Delete the system prompt.')))
+    .addSubcommand((clearMemoryCommand) => clearMemoryCommand.setName('clear-memory').setDescription('Clears the memory of the bot')
+      .addBooleanOption((confirmationOption) => confirmationOption.setName('confirmation').setDescription('Are you sure you wish to clear the memory? True = Yes, False = No.')))
     .addSubcommandGroup((coreMemoryGroup) => coreMemoryGroup.setName('core-memory')
       .setDescription('View, edit, and delete the longterm memory for the chatbot.')
       .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
         .setDescription('Edit the core memory for the chatbot')
         .addStringOption((textOption) => textOption.setName('memory-text')
           .setDescription('The new content of the core memory.')
-          .setRequired(true))))
-    .addSubcommandGroup((longterMemoryGroup) => longterMemoryGroup.setName('longterm-memory')
+          .setRequired(true)))
+      .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View the current core memory.')))
+    .addSubcommandGroup((longtermMemoryGroup) => longtermMemoryGroup.setName('longterm-memory')
       .setDescription('View, and delete the longterm memory for the chatbot.')
       .addSubcommand((addSubcommand) => addSubcommand.setName('add')
         .setDescription('Add a longterm memory for the bot to use.')
@@ -70,6 +78,30 @@ const ChatbotCommand: ConfigCommand = {
     const subcommandGroup = interaction.options.getSubcommandGroup();
     const subcommand = interaction.options.getSubcommand();
 
+    if (subcommandGroup === 'core-memory') {
+      const chatbot = getChatbot(serverID);
+      if (!chatbot) {
+        interaction.reply({ content: 'No current chatbot in the server! Try /chatbot create', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (subcommand === 'view') {
+        const coreMemory = chatbot.chatbot_core_memory;
+
+        interaction.reply({ content: coreMemory, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (subcommand === 'edit') {
+        const memoryText = interaction.options.getString('memory-text');
+
+        chatbot.chatbot_core_memory = memoryText ?? '';
+        upsertChatbot(chatbot);
+
+        interaction.reply({ content: 'Successfully updated core memory', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
     if (subcommandGroup === 'longterm-memory') {
       const longtermMemories = getChatbotLongTermMemoriesByServer(serverID);
       if (subcommand === 'add') {
@@ -187,6 +219,25 @@ const ChatbotCommand: ConfigCommand = {
         return;
       }
     }
+    if (subcommand === 'clear-memory') {
+      const confirmation = interaction.options.getBoolean('confirmation')!;
+
+      if (!confirmation) {
+        interaction.reply({ content: 'Confirmation set to false! To clear the memory, set the confirmation option to true!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const shortTermMemories = getChatbotShortTermMemoriesByServer(serverID);
+
+      if (!shortTermMemories || shortTermMemories.length === 0) {
+        interaction.reply({ content: 'There are no short term memories on the server!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      deleteNOldestShortTermMemory(serverID, shortTermMemories.length);
+      interaction.reply({ content: 'Successfully deleted all short term memories!', flags: MessageFlags.Ephemeral });
+      return;
+    }
     if (subcommand === 'create') {
       const chatbot = getChatbot(serverID);
       if (chatbot) {
@@ -204,7 +255,7 @@ const ChatbotCommand: ConfigCommand = {
       interaction.reply({ content: 'Successfully created chatbot!', flags: MessageFlags.Ephemeral });
       return;
     }
-    if (subcommand === 'remove') {
+    if (subcommand === 'delete') {
       const chatbot = getChatbot(serverID);
 
       if (!chatbot) {
@@ -233,62 +284,49 @@ const ChatbotCommand: ConfigCommand = {
     setChatbotPrompt(serverID, newPrompt);
     interaction.reply({ content: 'Successfully updated prompt!', flags: MessageFlags.Ephemeral });
   },
-  configEmbedBuilder(title: string, serverID: Snowflake) {
-    const chatbot = getChatbot(serverID);
+  configEmbedBuilder(serverID: Snowflake, chatbot: ChatbotTable) {
+    if (!chatbot) {
+      return new EmbedBuilder()
+        .setTitle('No current chatbot');
+    }
 
     return new EmbedBuilder()
-      .setTitle(title)
+      .setTitle('Chatbot settings')
       .addFields(
         { name: 'Enabled', value: (chatbot?.chatbot_enabled ? 'Yes' : 'No') },
       );
   },
 };
 
-// have to have this command separate from Chatbot, as anyone may use this command, and i cannot change perms between subcommands.
+// have to have these commands separate from Chatbot, as anyone may use this command, and i cannot change perms between subcommands.
 const SubscribeCommand: Command = {
-  data: new SlashCommandBuilder().setName('subscribe').setDescription('Subscribe to the chatbot, allowing it to reply and talk to you.')
-    .addSubcommand((setSubcommand) => setSubcommand.setName('set').setDescription('Set your subscription status')
-      .addBooleanOption((boolOption) => boolOption.setName('enabled')
-        .setDescription('Enables your subscription. True = Enabled, False = Disabled.')
-        .setRequired(true)))
-    .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View your current subscription status')),
+  data: new SlashCommandBuilder().setName('subscribe').setDescription('Subscribe to the chatbot, allowing it to reply and talk to you.'),
   async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake) {
-    const subcommand = interaction.options.getSubcommand();
     const userID = interaction.user.id;
     const isSubscriber = isChatbotSubscriber(serverID, userID);
 
-    if (subcommand === 'set') {
-      const enabledOption = interaction.options.getBoolean('enabled')!;
-
-      if (enabledOption && isSubscriber) {
-        interaction.reply({ content: 'You are already subscribed!', flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (!enabledOption && !isSubscriber) {
-        interaction.reply({ content: 'You are already unsubscribed!', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      if (!enabledOption) {
-        removeChatbotSubscriber(serverID, userID);
-        interaction.reply({ content: 'Successfully unsubscribed you!', flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (enabledOption) {
-        addChatbotSubscriber(serverID, userID);
-        interaction.reply({ content: 'Successfully subscribed you!', flags: MessageFlags.Ephemeral });
-        return;
-      }
+    if (isSubscriber) {
+      interaction.reply({ content: 'You are already subscribed!', flags: MessageFlags.Ephemeral });
+      return;
     }
 
-    if (subcommand === 'view') {
-      if (isSubscriber) {
-        interaction.reply({ content: 'You are currently subscribed!', flags: MessageFlags.Ephemeral });
-        return;
-      }
+    addChatbotSubscriber(serverID, userID);
+    interaction.reply({ content: 'Successfully subscribed you!', flags: MessageFlags.Ephemeral });
+  },
+};
+const UnsubscribeCommand: Command = {
+  data: new SlashCommandBuilder().setName('unsubscribe').setDescription('Unsubscribe to the chatbot, disallowing it to reply and talk to you.'),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake) {
+    const userID = interaction.user.id;
+    const isSubscriber = isChatbotSubscriber(serverID, userID);
 
-      interaction.reply({ content: 'You are not currently subscribed!', flags: MessageFlags.Ephemeral });
+    if (!isSubscriber) {
+      interaction.reply({ content: 'You are already unsubscribed!', flags: MessageFlags.Ephemeral });
+      return;
     }
+
+    removeChatbotSubscriber(serverID, userID);
+    interaction.reply({ content: 'Successfully unsubscribed you!', flags: MessageFlags.Ephemeral });
   },
 };
 
@@ -383,23 +421,18 @@ const HeartboardCommand: ConfigCommand = {
       const nameOption = interaction.options.getString('name')!;
       const enabledOption = interaction.options.getBoolean('enabled')!;
 
-      try {
-        const heartBoard = getHeartBoard(serverID, nameOption);
+      const heartBoard = getHeartBoard(serverID, nameOption);
 
-        if (!heartBoard) {
-          interaction.reply({ content: 'There is no heartboard with that name', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        heartBoard.enabled = enabledOption;
-        updateHeartBoard(heartBoard);
-
-        interaction.reply({ content: 'Successfully updated heartboard', flags: MessageFlags.Ephemeral });
-        return;
-      } catch (exception) {
-        interaction.reply({ content: 'There was an error updating the board. Please try again later.', flags: MessageFlags.Ephemeral });
+      if (!heartBoard) {
+        interaction.reply({ content: 'There is no heartboard with that name', flags: MessageFlags.Ephemeral });
         return;
       }
+
+      heartBoard.enabled = enabledOption;
+      updateHeartBoard(heartBoard);
+
+      interaction.reply({ content: 'Successfully updated heartboard', flags: MessageFlags.Ephemeral });
+      return;
     }
     if (subCommand === 'create') {
       const nameOption = interaction.options.getString('name')!;
@@ -424,22 +457,17 @@ const HeartboardCommand: ConfigCommand = {
         output_channel: outputChannel.id,
       };
 
-      try {
-        insertHeartBoard(heartboard);
-        emojisOption.forEach((emoji) => {
-          insertHeartBoardEmoji({
-            server_id: serverID,
-            board_name: heartboard.board_name,
-            emoji: emoji.toString(),
-          });
+      insertHeartBoard(heartboard);
+      emojisOption.forEach((emoji) => {
+        insertHeartBoardEmoji({
+          server_id: serverID,
+          board_name: heartboard.board_name,
+          emoji: emoji.toString(),
         });
+      });
 
-        interaction.reply({ content: 'Successfully create heartboard!', flags: MessageFlags.Ephemeral });
-        return;
-      } catch (exception) {
-        interaction.reply({ content: 'There was an error creating the board. Please try again later!', flags: MessageFlags.Ephemeral });
-        return;
-      }
+      interaction.reply({ content: 'Successfully create heartboard!', flags: MessageFlags.Ephemeral });
+      return;
     }
     if (subCommand === 'edit') {
       const nameOption = interaction.options.getString('name')!;
@@ -490,14 +518,9 @@ const HeartboardCommand: ConfigCommand = {
         heartBoard.threshold = thresholdOption;
       }
 
-      try {
-        updateHeartBoard(heartBoard);
-        interaction.reply({ content: 'Successfully updated heartboard!', flags: MessageFlags.Ephemeral });
-        return;
-      } catch (exception) {
-        interaction.reply({ content: 'There was an error when editing the heartboard. Please try again later. ', flags: MessageFlags.Ephemeral });
-        return;
-      }
+      updateHeartBoard(heartBoard);
+      interaction.reply({ content: 'Successfully updated heartboard!', flags: MessageFlags.Ephemeral });
+      return;
     }
     if (subCommand === 'delete') {
       const nameOption = interaction.options.getString('name')!;
@@ -508,14 +531,9 @@ const HeartboardCommand: ConfigCommand = {
         return;
       }
 
-      try {
-        deleteHeartBoard(serverID, heartBoard.board_name);
-        interaction.reply({ content: 'Successfully deleted heartboard.', flags: MessageFlags.Ephemeral });
-        return;
-      } catch (exception) {
-        interaction.reply({ content: 'There was error deleting the heartboard. Please try again later.', flags: MessageFlags.Ephemeral });
-        return;
-      }
+      deleteHeartBoard(serverID, heartBoard.board_name);
+      interaction.reply({ content: 'Successfully deleted heartboard.', flags: MessageFlags.Ephemeral });
+      return;
     }
     if (subCommand === 'view') {
       const nameOption = interaction.options.getString('name')!;
@@ -635,23 +653,18 @@ const VoicePingCommand: ConfigCommand = {
       const nameOption = interaction.options.getString('name')!;
       const enabledOption = interaction.options.getBoolean('enabled')!;
 
-      try {
-        const voicePing = getVoicePing(serverID, nameOption);
+      const voicePing = getVoicePing(serverID, nameOption);
 
-        if (!voicePing) {
-          interaction.reply({ content: 'There is no VoicePings with that name', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        voicePing.enabled = enabledOption;
-        updateVoicePing(voicePing);
-
-        interaction.reply({ content: 'Successfully updated VoicePing', flags: MessageFlags.Ephemeral });
-        return;
-      } catch (exception) {
-        interaction.reply({ content: 'There was an error updating the VoicePing. Please try again later.', flags: MessageFlags.Ephemeral });
+      if (!voicePing) {
+        interaction.reply({ content: 'There is no VoicePings with that name', flags: MessageFlags.Ephemeral });
         return;
       }
+
+      voicePing.enabled = enabledOption;
+      updateVoicePing(voicePing);
+
+      interaction.reply({ content: 'Successfully updated VoicePing', flags: MessageFlags.Ephemeral });
+      return;
     }
     if (subCommand === 'create') {
       const nameOption = interaction.options.getString('name')!;
@@ -676,22 +689,17 @@ const VoicePingCommand: ConfigCommand = {
         output_channel: outputChannel.id,
       };
 
-      try {
-        insertVoicePing(voicePing);
-        inputChannels.forEach((channel) => {
-          insertVoicePingInput({
-            server_id: serverID,
-            voiceping_name: voicePing.voiceping_name,
-            channel_id: channel.id,
-          });
+      insertVoicePing(voicePing);
+      inputChannels.forEach((channel) => {
+        insertVoicePingInput({
+          server_id: serverID,
+          voiceping_name: voicePing.voiceping_name,
+          channel_id: channel.id,
         });
+      });
 
-        interaction.reply({ content: 'Successfully created VoicePing!', flags: MessageFlags.Ephemeral });
-        return;
-      } catch (exception) {
-        interaction.reply({ content: 'There was an error creating the ping. Please try again later!', flags: MessageFlags.Ephemeral });
-        return;
-      }
+      interaction.reply({ content: 'Successfully created VoicePing!', flags: MessageFlags.Ephemeral });
+      return;
     }
     if (subCommand === 'edit') {
       const nameOption = interaction.options.getString('name')!;
@@ -742,14 +750,9 @@ const VoicePingCommand: ConfigCommand = {
         voicePing.message_template = messageTemplateOption;
       }
 
-      try {
-        updateVoicePing(voicePing);
-        interaction.reply({ content: 'Successfully updated voiceping!', flags: MessageFlags.Ephemeral });
-        return;
-      } catch (exception) {
-        interaction.reply({ content: 'There was an error when editing the voiceping. Please try again later. ', flags: MessageFlags.Ephemeral });
-        return;
-      }
+      updateVoicePing(voicePing);
+      interaction.reply({ content: 'Successfully updated voiceping!', flags: MessageFlags.Ephemeral });
+      return;
     }
     if (subCommand === 'delete') {
       const nameOption = interaction.options.getString('name')!;
@@ -760,14 +763,9 @@ const VoicePingCommand: ConfigCommand = {
         return;
       }
 
-      try {
-        deleteVoicePing(serverID, nameOption);
-        interaction.reply({ content: 'Successfully deleted VoicePing', flags: MessageFlags.Ephemeral });
-        return;
-      } catch {
-        interaction.reply({ content: 'There was an issue when deleting the VoicePing. Please try again later.', flags: MessageFlags.Ephemeral });
-        return;
-      }
+      deleteVoicePing(serverID, nameOption);
+      interaction.reply({ content: 'Successfully deleted VoicePing', flags: MessageFlags.Ephemeral });
+      return;
     }
     if (subCommand === 'view') {
       const nameOption = interaction.options.getString('name')!;
@@ -892,14 +890,8 @@ const ResponseCommand: ConfigCommand = {
 
       referencedResponse.enabled = enabledOption;
 
-      try {
-        updateAutomaticResponse(referencedResponse);
-        interaction.reply({ content: 'Successfully edited Response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, referencedResponse)], flags: MessageFlags.Ephemeral });
-        return;
-      } catch {
-        interaction.reply({ content: 'There was an error editing the Response! Please try again later.', flags: MessageFlags.Ephemeral });
-        return;
-      }
+      updateAutomaticResponse(referencedResponse);
+      interaction.reply({ content: 'Successfully edited Response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, referencedResponse)], flags: MessageFlags.Ephemeral });
     }
 
     if (subCommand === 'create') {
@@ -963,14 +955,8 @@ const ResponseCommand: ConfigCommand = {
         referencedResponse.output_template = outputTemplate;
       }
 
-      try {
-        updateAutomaticResponse(referencedResponse);
-        interaction.reply({ content: 'Successfully edited the Response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, referencedResponse)], flags: MessageFlags.Ephemeral });
-        return;
-      } catch {
-        interaction.reply({ content: 'There was an error when attempting to edit the Response. Please try again later. ', flags: MessageFlags.Ephemeral });
-        return;
-      }
+      updateAutomaticResponse(referencedResponse);
+      interaction.reply({ content: 'Successfully edited the Response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, referencedResponse)], flags: MessageFlags.Ephemeral });
     }
 
     if (subCommand === 'view') {
@@ -996,12 +982,8 @@ const ResponseCommand: ConfigCommand = {
         return;
       }
 
-      try {
-        deleteAutomaticResponse(serverID, nameOption);
-        interaction.reply({ content: 'Successfully removed response!', flags: MessageFlags.Ephemeral });
-      } catch {
-        interaction.reply({ content: 'There was an error when deleting this Response! Please try again later.', flags: MessageFlags.Ephemeral });
-      }
+      deleteAutomaticResponse(serverID, nameOption);
+      interaction.reply({ content: 'Successfully removed response!', flags: MessageFlags.Ephemeral });
     }
   },
   async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
@@ -1026,8 +1008,9 @@ const ResponseCommand: ConfigCommand = {
 
 commandMap.set(ChatbotCommand.data.name, ChatbotCommand);
 commandMap.set(SubscribeCommand.data.name, SubscribeCommand);
+commandMap.set(UnsubscribeCommand.data.name, UnsubscribeCommand);
 commandMap.set(HeartboardCommand.data.name, HeartboardCommand);
 commandMap.set(VoicePingCommand.data.name, VoicePingCommand);
 commandMap.set(ResponseCommand.data.name, ResponseCommand);
 
-export { commandMap, ChatbotCommand, SubscribeCommand, ResponseCommand, HeartboardCommand, VoicePingCommand };
+export { commandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, HeartboardCommand, VoicePingCommand };

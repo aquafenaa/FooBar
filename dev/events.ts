@@ -94,7 +94,7 @@ function clientEvents(discordClient: Client) {
       await command.execute(interaction, serverID);
     } catch (error) {
       console.error(error);
-      await interaction.reply({ content: 'There was an error while executing this command!', ephemeral: true });
+      await interaction.reply({ content: 'There was an error while executing this command! Please try again later!', ephemeral: true });
     }
   });
 
@@ -141,11 +141,13 @@ function clientEvents(discordClient: Client) {
     if (!allowedServers.find((id) => serverID === id)) return;
 
     // we also do not care if...
-    if ((
-      message.content.includes('@everyone') || message.content.includes('@here') // ...it's a mass ping...
+    if (
+      (
+        message.content.includes('@everyone') || message.content.includes('@here') // ...it's a mass ping...
       || !message.mentions.has(discordClient.user?.id ?? 'undefined') // ... bot isn't mentioned...
-      || message.author.id === discordClient.user?.id)) return; // ...or the bot mentioned itself...
-    // && Math.random() < 1 / 4096) return; // ...and we don't roll a 1% chance to respond anyway... <-- big bug, will fix.
+      || message.author.id === discordClient.user?.id // ...or the bot mentioned itself...
+      )
+    && Math.random() >= 1 / 4096) return; // ...and we don't roll a small chance to respond anyway
 
     const userContent = message.content;
     const messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
@@ -160,8 +162,10 @@ function clientEvents(discordClient: Client) {
       clearInterval(typingExtension);
     }, 60000); // cancel interval after 60 seconds, if it's still somehow going
 
+    const authorNick = (await message.guild!.members.fetch(message.author.id)).nickname;
+
     // get response from LLM, and reply
-    const agentReply = await generateMessage(discordClient, serverID, typingExtension, message, userContent, messageReference, context ?? []);
+    const agentReply = await generateMessage(discordClient, serverID, typingExtension, message, authorNick, userContent, messageReference, context ?? []);
     try {
       if (!agentReply || agentReply === '') return;
       clearInterval(typingExtension); // disables typing

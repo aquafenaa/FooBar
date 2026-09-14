@@ -5,13 +5,23 @@ If you would like to add this bot to your own server, feel free! If you encounte
 ### Features
 - [x] Voice Ping 
   - Sends a message in a given text channel if a user joins a specified voice channel
-  - [ ] Message / Role tied to each channel
-
 - [x] Heartboard
   - When a message receives enough reactions, it is captured as an embed and sent to a specified channel
-- [ ] Hateboard
-  - Like heartboard but negative, and with separate reactions
-  - Perhaps just allow multiple heartboards, but that's harder
+- [x] Automatic Responses
+  - Given a capture regex, input regex, and output template, the bot automatically responds to certain key phrases. (e.g. https://x.com/ -> https://vxtwitter.com/)
+- [ ] Reminder Command
+  - Gives a reminder given a chron schedule
+
+- [x] Grok AI
+  - Opt-In LLM that responds when pinged or replied to.
+  - /subscribe to Opt-In
+  - [x] Command to reset AI memory
+  - [x] Ability to change prompt between servers
+  - [ ] Skills
+    - [ ] Change nickname
+    - [ ] Reminder / Message scheduler
+    - [ ] Get profile / bio (?)
+    - [ ] Play sounds in voice chat (?)
 
 - [ ] Show ratings
   - Calculates average score of a show via user's reactions / interations
@@ -19,9 +29,6 @@ If you would like to add this bot to your own server, feel free! If you encounte
  - Command to keep track of position in shows
  - Includes season, episode, and possible time
 
-- [x] Grok AI?? <small>*highly experimental, recommended to keep disabled*</small>
-  - Stupid LLM that responds when pinged or replied to
-  - [ ] Command to reset AI memory
 
 - [ ] Woke Meter
   - [ ] You can upvote or downvote a message there's the woker of the month
@@ -34,11 +41,3 @@ If you would like to add this bot to your own server, feel free! If you encounte
   - [ ] Choose local timezone. Whenever you mention a time in a message, it sends a localized response for everyone else. React with 🗑️ to delete the response
   - [ ] Localized command to get pregenerated localized time tags
   - [ ] Birthdate reminders
----
-#### **TODO**
-- [ ] Fix help command
-- [x] Solidify config as its own command
-- [ ] Permission-only access to admin commands
-- [ ] Test subcommand of config
-- [ ] Replied-to heartboard message added as preliminary embed
-- [ ] Command to reset config & data
