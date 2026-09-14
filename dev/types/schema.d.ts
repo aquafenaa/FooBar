@@ -84,6 +84,13 @@ interface ChatbotShortTermMemoryTable {
   message_content: string,
   timestamp: number;
 }
+interface SavedAnonymizedChat {
+  server_id: Snowflake,
+  message_id: Snowflake,
+
+  reference_content?: string,
+  message_content: string,
+}
 
 interface AutomaticResponseTable {
   server_id: Snowflake,
@@ -98,5 +105,5 @@ interface AutomaticResponseTable {
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
   AutomaticResponseTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
-  ChatbotTable, ChatbotSubscriberTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, /* AI-related structures */
+  ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, /* AI-related structures */
 };

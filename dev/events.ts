@@ -4,7 +4,7 @@ import { commandMap } from './commands';
 import { generateMessage } from './chatbot';
 
 import { Command } from './types/bot';
-import { deleteChatbotShortTermMemory, deleteHeartBoardMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotShortTermMemory, isChatbotSubscriber, isEmbedMessage, syncDatabase, updateHeartBoardMessage } from './data';
+import { deleteChatbotShortTermMemory, deleteHeartBoardMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotShortTermMemory, isChatbotSubscriber, isEmbedMessage, saveAnonymizedMessage, syncDatabase, updateHeartBoardMessage } from './data';
 
 const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boolean> | PartialMessage<boolean>, reaction: MessageReaction): BaseMessageOptions => {
   const authorName = author?.nickname ?? author?.displayName;
@@ -192,9 +192,9 @@ function clientEvents(discordClient: Client) {
 
     if (!serverID) return; // only care if it's in a server
 
-    const messageID = message.id;
-    if (isChatbotShortTermMemory(serverID, Number(messageID))) {
-      deleteChatbotShortTermMemory(serverID, Number(messageID));
+    const messageID = Number(message.id);
+    if (isChatbotShortTermMemory(serverID, messageID)) {
+      deleteChatbotShortTermMemory(serverID, messageID);
     }
   });
 
@@ -228,16 +228,30 @@ function clientEvents(discordClient: Client) {
     });
   });
 
+  const acceptedEmojis = ['🩷', '❤️', '💛', '🧡', '💚'];
   // Heartboard reaction function
   const handleReaction = async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     const { message } = reaction;
 
     if (!message.guild) return;
 
+    const refMessage = await message.fetchReference();
     const { guild, id: messageID } = message;
+
     const serverID = guild.id;
     const emojiString = reaction.emoji.toString();
     const totalReactions = reaction.count ?? 0;
+
+    // if in acceptedEmojis, save anonymized chat
+    if (acceptedEmojis.includes(emojiString) && message.content) {
+      saveAnonymizedMessage({
+        server_id: serverID,
+        message_id: messageID,
+
+        reference_content: refMessage ? refMessage.content : undefined,
+        message_content: message.content,
+      });
+    }
 
     if (isEmbedMessage(message.id)) return; // we don't wish to process this reaction if it's to an existing HeartBoard embed
 

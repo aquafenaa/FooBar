@@ -3,7 +3,7 @@ import { Snowflake } from 'discord.js';
 import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 
-import { AutomaticResponseTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, ServerTable, VoicePingInputTable, VoicePingTable } from './types/schema';
+import { AutomaticResponseTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable } from './types/schema';
 import { ConfigData, ServerConfig, ServerData } from './types/bot';
 import { getDefaultSystemPrompt } from './chatbot';
 
@@ -102,6 +102,10 @@ function clearChatbotShortTermMemory(server_id: Snowflake): void {
 function deleteNOldestShortTermMemory(server_id: Snowflake, n: number): void {
   db.prepare('DELETE FROM ChatbotShortTermMemory WHERE server_id = ? AND message_id IN (SELECT message_id FROM ChatbotShortTermMemory WHERE server_id = ? ORDER BY timestamp ASC LIMIT ?)')
     .run(server_id, server_id, n > 0 ? n : 1);
+}
+function saveAnonymizedMessage(anonymizedChat: SavedAnonymizedChat) {
+  db.prepare('INSERT OR IGNORE INTO SavedAnonymizedChats (server_id, message_id, reference_content, message_content) VALUES (?, ?, ?, ?)')
+    .run(anonymizedChat.server_id, anonymizedChat.message_id, anonymizedChat.reference_content, anonymizedChat.message_content);
 }
 
 // ==================== HeartBoard ====================
@@ -352,6 +356,11 @@ const syncDatabase = db.transaction(() => {
 
     db.pragma('user_version = 2');
   }
+  if (currentVersion < 3) {
+    db.exec(schema);
+
+    db.pragma('user_version = 3');
+  }
 });
 
 export {
@@ -366,6 +375,6 @@ export {
   getVoicePing, getVoicePingsByServer, insertVoicePing, updateVoicePing, deleteVoicePing,
   getVoicePingInputs, insertVoicePingInput, deleteAllVoicePingInputs, deleteVoicePingInput,
   getChatbotLongTermMemory, getChatbotLongTermMemoriesByServer, updateChatbotLongTermMemory, insertChatbotLongTermMemory, deleteChatbotLongTermMemory, deleteNOldestLongTermMemories,
-  getChatbotShortTermMemoriesByServer, isChatbotShortTermMemory, insertChatbotShortTermMemory, deleteChatbotShortTermMemory, clearChatbotShortTermMemory, deleteNOldestShortTermMemory,
+  getChatbotShortTermMemoriesByServer, isChatbotShortTermMemory, insertChatbotShortTermMemory, deleteChatbotShortTermMemory, clearChatbotShortTermMemory, deleteNOldestShortTermMemory, saveAnonymizedMessage,
   getAutomaticResponse, getAutomaticResponsesByServer, insertAutomaticResponse, updateAutomaticResponse, deleteAutomaticResponse,
 };
