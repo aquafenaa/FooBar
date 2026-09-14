@@ -342,8 +342,6 @@ const syncDatabase = db.transaction(() => {
     getDefaultSystemPrompt().then((defaultPrompt) => {
       if (!servers) return;
 
-      console.log(servers);
-
       servers.forEach((serverID) => {
         const chatbot = getChatbot(serverID);
         if (chatbot && (!chatbot.chatbot_prompt || chatbot.chatbot_prompt === '')) {

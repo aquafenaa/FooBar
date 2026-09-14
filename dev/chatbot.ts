@@ -9,8 +9,7 @@ import { deleteNOldestLongTermMemories, deleteNOldestShortTermMemory, getChatbot
 import { ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable } from './types/schema';
 
 const promptPath = path.join(__dirname, '../data/SYSTEM.md');
-// const discordClientID = '917594803481489429'; // working
-const discordClientID = '1211461538859327560'; // testing
+const { DISCORD_ID } = process.env;
 
 const longMemoryLength = 5; // number of messages allowed before being summarized to core memory
 const shortMemoryLength = 30; // number of messages allowed in short-term memory
@@ -27,7 +26,7 @@ Please summarize the important information, and information that will most likel
 If you have information to add to a member's personality, then add it. Do not restate any information. It will stay as a list for you to read in the future. Keep it to 200 words or less.`;
 
 async function getDefaultSystemPrompt(): Promise<string> {
-  return (await readFile(promptPath, 'utf-8')).replace('<discord-id>', discordClientID);
+  return (await readFile(promptPath, 'utf-8')).replace('<discord-id>', DISCORD_ID ?? 'undefined');
 }
 
 async function summarizeMemory(server_id: Snowflake, longTermMemory: ChatbotLongTermMemoryTable[]) {
@@ -197,6 +196,7 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
     return responseContent;
   } catch (error: any) {
     clearInterval(typingIndicator);
+    console.log(error);
     return error.toString();
   }
 }
