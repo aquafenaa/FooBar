@@ -1001,7 +1001,7 @@ const ResponseCommand: ConfigCommand = {
         { name: 'Status', value: automaticResponse.enabled ? 'Enabled' : 'Disabled' },
         { name: 'Activation Phrase', value: automaticResponse.activation_regex },
         { name: 'Capture Regex', value: automaticResponse.capture_regex },
-        { name: 'Output Channel', value: automaticResponse.output_template },
+        { name: 'Output Channel', value: automaticResponse.output_template.replace('https://', 'https​://') }, // invsible character to stop {1} displaying as %7B1%7D in link
       ]);
   },
 };

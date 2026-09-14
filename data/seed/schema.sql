@@ -130,3 +130,9 @@ CREATE TABLE IF NOT EXISTS AutomaticResponse(
 
   PRIMARY KEY (server_id, name)
 );
+CREATE TABLE IF NOT EXISTS ResponseMessage(
+  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
+  message_id VARCHAR(20) NOT NULL,
+
+  PRIMARY KEY (server_id, message_id)
+);

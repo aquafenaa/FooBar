@@ -9,6 +9,7 @@ If you would like to add this bot to your own server, feel free! If you encounte
   - When a message receives enough reactions, it is captured as an embed and sent to a specified channel
 - [x] Automatic Responses
   - Given a capture regex, input regex, and output template, the bot automatically responds to certain key phrases. (e.g. https://x.com/ -> https://vxtwitter.com/)
+  - [x] Add 🗑️ react that automatically deletes the response
 - [ ] Reminder Command
   - Gives a reminder given a chron schedule
 
