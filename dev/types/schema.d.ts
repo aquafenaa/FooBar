@@ -59,7 +59,12 @@ interface ChatbotTable {
   server_id: Snowflake,
 
   chatbot_enabled: boolean,
+  chatbot_prompt: string,
   chatbot_core_memory: string;
+}
+interface ChatbotSubscriberTable {
+  server_id: Snowflake,
+  user_id: Snowflake;
 }
 interface ChatbotLongTermMemoryTable {
   server_id: Snowflake,
@@ -70,6 +75,7 @@ interface ChatbotLongTermMemoryTable {
 interface ChatbotShortTermMemoryTable {
   server_id: Snowflake,
   message_id: Snowflake,
+  reference_id?: Snowflake,
 
   author_name: string,
   author_id: Snowflake,
@@ -92,5 +98,5 @@ interface AutomaticResponseTable {
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
   AutomaticResponseTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
-  ChatbotTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, /* AI-related structures */
+  ChatbotTable, ChatbotSubscriberTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, /* AI-related structures */
 };

@@ -5,6 +5,7 @@ import { readFileSync } from 'fs';
 
 import { AutomaticResponseTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, ServerTable, VoicePingInputTable, VoicePingTable } from './types/schema';
 import { ConfigData, ServerConfig, ServerData } from './types/bot';
+import { getDefaultSystemPrompt } from './chatbot';
 
 const schemaPath = path.join(__dirname, '../data/seed/schema.sql');
 const schema = readFileSync(schemaPath, 'utf-8');
@@ -14,14 +15,19 @@ const configPath = path.join(__dirname, '../data/config.json');
 
 const dbPath = path.join(__dirname, '../data/foobar.db');
 const db = new Database(dbPath);
-// db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
 db.exec(schema);
 
+// ==================== Server ====================
+function getAllServers(): Snowflake[] {
+  const servers = db.prepare('SELECT server_id FROM Server').all() as { server_id: Snowflake }[];
+  return servers.map((srv) => srv.server_id);
+}
+
 // ==================== Chatbot ====================
 function getChatbot(server_id: Snowflake): ChatbotTable | undefined {
-  return db.prepare('SELECT * FROM Chatbot WHERE server_id = ?').get(server_id) as ChatbotTable | undefined;
+  return db.prepare('SELECT * FROM Chatbot WHERE server_id = ?').get(server_id ?? '') as ChatbotTable | undefined;
 }
 function upsertChatbot(chatbot: ChatbotTable): void {
   db.prepare(`
@@ -32,6 +38,21 @@ function upsertChatbot(chatbot: ChatbotTable): void {
       chatbot_core_memory = excluded.chatbot_core_memory
   `).run(chatbot.server_id, chatbot.chatbot_enabled ? 1 : 0, chatbot.chatbot_core_memory);
 }
+function deleteChatbot(server_id: Snowflake) {
+  db.prepare('DELETE FROM Chatbot WHERE server_id = ?').run(server_id);
+}
+function setChatbotPrompt(server_id: Snowflake, new_prompt: string): void {
+  db.prepare('UPDATE Chatbot SET chatbot_prompt = ? WHERE server_id = ?').run(new_prompt, server_id);
+}
+function isChatbotSubscriber(server_id: Snowflake, user_id: Snowflake): boolean {
+  return db.prepare('SELECT * FROM ChatbotSubscriber WHERE server_id = ? AND user_id = ?').get(server_id, user_id) as boolean;
+}
+function addChatbotSubscriber(server_id: Snowflake, user_id: Snowflake): void {
+  db.prepare('INSERT INTO ChatbotSubscriber (server_id, user_id) VALUES (?, ?)').run(server_id, user_id);
+}
+function removeChatbotSubscriber(server_id: Snowflake, user_id: Snowflake): void {
+  db.prepare('DELETE FROM ChatbotSubscriber WHERE server_id = ? AND user_id = ?').run(server_id, user_id);
+}
 
 // ==================== ChatbotLongTermMemory ====================
 function getChatbotLongTermMemory(server_id: Snowflake, memory_id: number): ChatbotLongTermMemoryTable | undefined {
@@ -41,19 +62,22 @@ function getChatbotLongTermMemory(server_id: Snowflake, memory_id: number): Chat
 function getChatbotLongTermMemoriesByServer(server_id: Snowflake): ChatbotLongTermMemoryTable[] {
   return db.prepare('SELECT * FROM ChatbotLongTermMemory WHERE server_id = ?').all(server_id) as ChatbotLongTermMemoryTable[];
 }
+function updateChatbotLongTermMemory(server_id: Snowflake, memory_id: number, content: string): void {
+  db.prepare('UPDATE ChatbotLongTermMemory SET message_content = ? WHERE server_id = ? AND memory_id = ?').run(content, server_id, memory_id);
+}
 function insertChatbotLongTermMemory(memory: Omit<ChatbotLongTermMemoryTable, 'memory_id'>): number {
-  const { nextID } = db.prepare('SELECT COALESCE(MAX(memory_id), 0) + 1 AS next_id FROM ChatbotLongTermMemory WHERE server_id = ?')
-    .get(memory.server_id) as { nextID: number };
+  const { next_id: NEXT_ID } = db.prepare('SELECT COALESCE(MAX(memory_id), 0) + 1 AS next_id FROM ChatbotLongTermMemory WHERE server_id = ?')
+    .get(memory.server_id) as { next_id: number };
   db.prepare('INSERT INTO ChatbotLongTermMemory (server_id, memory_id, message_content, timestamp) VALUES (?, ?, ?, ?)')
-    .run(memory.server_id, nextID, memory.message_content, memory.timestamp);
-  return nextID;
+    .run(memory.server_id, NEXT_ID, memory.message_content, memory.timestamp);
+  return NEXT_ID;
 }
 function deleteChatbotLongTermMemory(server_id: Snowflake, memory_id: number): void {
   db.prepare('DELETE FROM ChatbotLongTermMemory WHERE server_id = ? AND memory_id = ?').run(server_id, memory_id);
 }
 function deleteNOldestLongTermMemories(server_id: Snowflake, n: number): void {
   db.prepare('DELETE FROM ChatbotLongTermMemory WHERE server_id = ? AND memory_id IN (SELECT memory_id FROM ChatbotLongTermMemory WHERE server_id = ? ORDER BY timestamp ASC LIMIT ?)')
-    .run(server_id, server_id, n);
+    .run(server_id, server_id, n > 1 ? n : 1);
 }
 
 // ==================== ChatbotShortTermMemory ====================
@@ -62,12 +86,12 @@ function getChatbotShortTermMemoriesByServer(server_id: Snowflake): ChatbotShort
   return db.prepare('SELECT * FROM ChatbotShortTermMemory WHERE server_id = ? ORDER BY timestamp ASC')
     .all(server_id) as ChatbotShortTermMemoryTable[];
 }
-function insertChatbotShortTermMemory(memory: Omit<ChatbotShortTermMemoryTable, 'message_id'>): number {
-  const { nextID } = db.prepare('SELECT COALESCE(MAX(message_id), 0) + 1 AS next_id FROM ChatbotShortTermMemory WHERE server_id = ?')
-    .get(memory.server_id) as { nextID: number };
-  db.prepare('INSERT INTO ChatbotShortTermMemory (server_id, message_id, author_name, author_id, role, message_content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(memory.server_id, nextID, memory.author_name, memory.author_id, memory.role, memory.message_content, memory.timestamp);
-  return nextID;
+function isChatbotShortTermMemory(server_id: Snowflake, message_id: number): boolean {
+  return db.prepare('SELECT * FROM ChatbotShortTermMemory WHERE server_id = ? AND message_id = ?').get(server_id, message_id) !== undefined;
+}
+function insertChatbotShortTermMemory(memory: ChatbotShortTermMemoryTable): void {
+  db.prepare('INSERT OR IGNORE INTO ChatbotShortTermMemory (server_id, message_id, reference_id, author_name, author_id, role, message_content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(memory.server_id, memory.message_id, memory.reference_id, memory.author_name, memory.author_id, memory.role, memory.message_content, memory.timestamp);
 }
 function deleteChatbotShortTermMemory(server_id: Snowflake, message_id: number): void {
   db.prepare('DELETE FROM ChatbotShortTermMemory WHERE server_id = ? AND message_id = ?').run(server_id, message_id);
@@ -76,8 +100,8 @@ function clearChatbotShortTermMemory(server_id: Snowflake): void {
   db.prepare('DELETE FROM ChatbotShortTermMemory WHERE server_id = ?').run(server_id);
 }
 function deleteNOldestShortTermMemory(server_id: Snowflake, n: number): void {
-  db.prepare('DELETE FROM ChatbotShortTermMemory WHERE server_id = ? AND memory_id IN (SELECT memory_id FROM ChatbotShortTermMemory WHERE server_id = ? ORDER BY timestamp ASC LIMIT ?)')
-    .run(server_id, server_id, n);
+  db.prepare('DELETE FROM ChatbotShortTermMemory WHERE server_id = ? AND message_id IN (SELECT message_id FROM ChatbotShortTermMemory WHERE server_id = ? ORDER BY timestamp ASC LIMIT ?)')
+    .run(server_id, server_id, n > 0 ? n : 1);
 }
 
 // ==================== HeartBoard ====================
@@ -106,7 +130,6 @@ function updateHeartBoard(board: HeartBoardTable): void {
     .run(board.enabled ? 1 : 0, board.deny_author ? 1 : 0, board.threshold, board.output_channel, board.server_id, board.board_name);
 }
 function deleteHeartBoard(server_id: Snowflake, board_name: string): void {
-  // NOTE: Cascades to HeartBoardEmoji and HeartBoardMessage
   db.prepare('DELETE FROM HeartBoard WHERE server_id = ? AND board_name = ?').run(server_id, board_name);
 }
 
@@ -174,7 +197,6 @@ function updateVoicePing(ping: VoicePingTable): void {
     .run(ping.message_template, ping.enabled ? 1 : 0, ping.output_channel, ping.server_id, ping.voiceping_name);
 }
 function deleteVoicePing(server_id: Snowflake, voiceping_name: string): void {
-  // NOTE: Cascades to VoicePingInput
   db.prepare('DELETE FROM VoicePing WHERE server_id = ? AND voiceping_name = ?').run(server_id, voiceping_name);
 }
 
@@ -202,7 +224,6 @@ function getAutomaticResponse(server_id: Snowflake, name: string): AutomaticResp
     .get(server_id, name) as AutomaticResponseTable | undefined;
 }
 function getAutomaticResponsesByServer(server_id: Snowflake): AutomaticResponseTable[] {
-  // NOTE: Regex matching is done in JS after fetching all rows, not in SQL
   return db.prepare('SELECT * FROM AutomaticResponse WHERE server_id = ?').all(server_id) as AutomaticResponseTable[];
 }
 function insertAutomaticResponse(response: AutomaticResponseTable): void {
@@ -223,11 +244,6 @@ function getServer(server_id: Snowflake): ServerTable | undefined {
 }
 function insertServer(server_id: Snowflake): void {
   db.prepare('INSERT OR IGNORE INTO Server (server_id) VALUES (?)').run(server_id);
-  upsertChatbot({
-    server_id,
-    chatbot_core_memory: '',
-    chatbot_enabled: false,
-  });
 }
 function deleteServer(server_id: Snowflake): void {
   db.prepare('DELETE FROM Server WHERE server_id = ?').run(server_id);
@@ -260,8 +276,6 @@ const syncDatabase = db.transaction(() => {
           output_template: response.outputTemplateString,
         });
       });
-
-      upsertChatbot({ server_id: serverID, chatbot_enabled: false, chatbot_core_memory: '' });
 
       const existingDefaultHeartboard = getHeartBoard(serverID, 'legacy-heartboard');
       if (!existingDefaultHeartboard) {
@@ -317,20 +331,43 @@ const syncDatabase = db.transaction(() => {
       db.pragma('user_version = 1');
     });
   }
-  // if (currentVersion < 1) {
-  // }
+  if (currentVersion < 2) {
+    db.prepare('ALTER TABLE Chatbot ADD COLUMN chatbot_prompt TEXT;').run();
+    db.prepare('DROP TABLE ChatbotShortTermMemory;').run();
+    db.exec(schema);
+
+    const servers = getAllServers();
+
+    // add default prompt for all server chatbots
+    getDefaultSystemPrompt().then((defaultPrompt) => {
+      if (!servers) return;
+
+      console.log(servers);
+
+      servers.forEach((serverID) => {
+        const chatbot = getChatbot(serverID);
+        if (chatbot && (!chatbot.chatbot_prompt || chatbot.chatbot_prompt === '')) {
+          setChatbotPrompt(serverID, defaultPrompt);
+        }
+      });
+    });
+
+    db.pragma('user_version = 2');
+  }
 });
 
 export {
   db,
+  getAllServers,
   getServer, insertServer, deleteServer, syncDatabase,
-  getChatbot, upsertChatbot,
+  getChatbot, upsertChatbot, deleteChatbot, setChatbotPrompt,
+  isChatbotSubscriber, addChatbotSubscriber, removeChatbotSubscriber,
   getHeartBoard, getHeartBoardsByServer, getHeartBoardsByEmoji, insertHeartBoard, updateHeartBoard, deleteHeartBoard,
   getHeartBoardEmojis, insertHeartBoardEmoji, deleteHeartBoardEmoji, deleteAllHeartBoardEmojis,
   getHeartBoardMessage, getHeartBoardMessagesByServer, getEmbedMessagesByBoard, insertHeartBoardMessage, updateHeartBoardMessage, deleteHeartBoardMessage, isEmbedMessage,
   getVoicePing, getVoicePingsByServer, insertVoicePing, updateVoicePing, deleteVoicePing,
   getVoicePingInputs, insertVoicePingInput, deleteAllVoicePingInputs, deleteVoicePingInput,
-  getChatbotLongTermMemory, getChatbotLongTermMemoriesByServer, insertChatbotLongTermMemory, deleteChatbotLongTermMemory, deleteNOldestLongTermMemories,
-  getChatbotShortTermMemoriesByServer, insertChatbotShortTermMemory, deleteChatbotShortTermMemory, clearChatbotShortTermMemory, deleteNOldestShortTermMemory,
+  getChatbotLongTermMemory, getChatbotLongTermMemoriesByServer, updateChatbotLongTermMemory, insertChatbotLongTermMemory, deleteChatbotLongTermMemory, deleteNOldestLongTermMemories,
+  getChatbotShortTermMemoriesByServer, isChatbotShortTermMemory, insertChatbotShortTermMemory, deleteChatbotShortTermMemory, clearChatbotShortTermMemory, deleteNOldestShortTermMemory,
   getAutomaticResponse, getAutomaticResponsesByServer, insertAutomaticResponse, updateAutomaticResponse, deleteAutomaticResponse,
 };
