@@ -2,18 +2,237 @@ import {
   ChatInputCommandInteraction,
   Snowflake, AutocompleteInteraction,
   EmbedBuilder, MessageFlags, SlashCommandBuilder,
+  ModalSubmitInteraction,
   ChannelType,
+  PermissionFlagsBits,
+  ModalBuilder,
+  LabelBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from 'discord.js';
-import { Command, ConfigCommand, Feature } from './types/bot';
-import { deleteAllHeartBoardEmojis, deleteAllVoicePingInputs, deleteAutomaticResponse, deleteHeartBoard, deleteVoicePing, getAutomaticResponse, getAutomaticResponsesByServer, getChatbot, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getVoicePing, getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertHeartBoard, insertHeartBoardEmoji, insertVoicePing, insertVoicePingInput, updateAutomaticResponse, updateHeartBoard, updateVoicePing, upsertChatbot } from './data';
+import { Command, ConfigCommand } from './types/bot';
+import { addChatbotSubscriber, deleteAllHeartBoardEmojis, deleteAllVoicePingInputs, deleteAutomaticResponse, deleteChatbot, deleteChatbotLongTermMemory, deleteHeartBoard, deleteVoicePing, getAutomaticResponse, getAutomaticResponsesByServer, getChatbot, getChatbotLongTermMemoriesByServer, getChatbotLongTermMemory, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getVoicePing, getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertChatbotLongTermMemory, insertHeartBoard, insertHeartBoardEmoji, insertVoicePing, insertVoicePingInput, isChatbotSubscriber, removeChatbotSubscriber, setChatbotPrompt, updateAutomaticResponse, updateChatbotLongTermMemory, updateHeartBoard, updateVoicePing, upsertChatbot } from './data';
 import { AutomaticResponseTable, HeartBoardTable, VoicePingTable } from './types/schema';
+import { getDefaultSystemPrompt } from './chatbot';
 
 const commandMap: Map<string, Command> = new Map();
-const featureMap: Map<string, Feature> = new Map();
 
-const AIFeature: Feature = {
-  name: 'ai-messages',
-  description: 'When pinged or replied to, the bot generates an LLM response',
+const ChatbotCommand: ConfigCommand = {
+  data: new SlashCommandBuilder()
+    .setName('chatbot').setDescription('Chatbot for the server.').setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand((createSubcommand) => createSubcommand.setName('create')
+      .setDescription('Create the chatbot for a server that doesn\'t currently have one.'))
+    .addSubcommand((removeSubcommand) => removeSubcommand.setName('remove')
+      .setDescription('Remove the chatbot for a server that already has one.'))
+    .addSubcommandGroup((promptSubcommandGroup) => promptSubcommandGroup.setName('prompt')
+      .setDescription('Set or delete the system prompt for the chatbot.')
+      .addSubcommand((setPromptSubcommand) => setPromptSubcommand.setName('set')
+        .setDescription('Set the system prompt.'))
+      .addSubcommand((deletePromptSubcommand) => deletePromptSubcommand.setName('delete')
+        .setDescription('Delete the system prompt.')))
+    .addSubcommandGroup((coreMemoryGroup) => coreMemoryGroup.setName('core-memory')
+      .setDescription('View, edit, and delete the longterm memory for the chatbot.')
+      .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
+        .setDescription('Edit the core memory for the chatbot')
+        .addStringOption((textOption) => textOption.setName('memory-text')
+          .setDescription('The new content of the core memory.')
+          .setRequired(true))))
+    .addSubcommandGroup((longterMemoryGroup) => longterMemoryGroup.setName('longterm-memory')
+      .setDescription('View, and delete the longterm memory for the chatbot.')
+      .addSubcommand((addSubcommand) => addSubcommand.setName('add')
+        .setDescription('Add a longterm memory for the bot to use.')
+        .addStringOption((textOption) => textOption.setName('text')
+          .setDescription('Text of the longterm memory.')
+          .setRequired(true)))
+      .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
+        .setDescription('View the current longterm memory of the bot'))
+      .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
+        .setDescription('Edit a current longterm memory.')
+        .addNumberOption((idOption) => idOption.setName('ltm-id')
+          .setDescription('ID of the longterm memory to edit.')
+          .setRequired(true))
+        .addStringOption((textOption) => textOption.setName('memory-text')
+          .setDescription('The new content of the core memory.')
+          .setRequired(true)))
+      .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete')
+        .setDescription('Delete a current longterm memory of the bot')
+        .addNumberOption((ltmIDOption) => ltmIDOption.setName('ltm-id')
+          .setDescription('ID of the longterm memory. Leave blank to delete all'))))
+    .addSubcommandGroup((statusGroup) => statusGroup.setName('status')
+      .setDescription('Whether the chatbot is enabled or disabled.')
+      .addSubcommand((setSubcommand) => setSubcommand.setName('set')
+        .setDescription('Set the status of the chatbot')
+        .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+          .setDescription('True = Enable, False = Disable')))
+      .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
+        .setDescription('View the current enabled status of the chatbot.'))),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake) {
+    const subcommandGroup = interaction.options.getSubcommandGroup();
+    const subcommand = interaction.options.getSubcommand();
+
+    if (subcommandGroup === 'longterm-memory') {
+      const longtermMemories = getChatbotLongTermMemoriesByServer(serverID);
+      if (subcommand === 'add') {
+        const textOption = interaction.options.getString('text')!;
+        if (textOption === '') {
+          interaction.reply({ content: 'You must enter some text for the memory!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        insertChatbotLongTermMemory({
+          server_id: serverID,
+          timestamp: Date.now(),
+          message_content: textOption,
+        });
+
+        interaction.reply({ content: 'Successfully added longterm memory!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (subcommand === 'view') {
+        if (!longtermMemories || longtermMemories.length === 0) {
+          interaction.reply({ content: 'There are no longterm memories in this server!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        const longtermMemoryEmbed = new EmbedBuilder().setTitle('Long Term Memories')
+          .addFields(...longtermMemories.map((ltm) => ({ name: `${ltm.memory_id}`, value: ltm.message_content })));
+        interaction.reply({ embeds: [longtermMemoryEmbed], flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (subcommand === 'edit') {
+        const ltmID = interaction.options.getNumber('ltm-id')!;
+        const longtermMemory = getChatbotLongTermMemory(serverID, ltmID);
+        const newContent = interaction.options.getString('memory-text') ?? '';
+
+        if (!longtermMemory) {
+          interaction.reply({ content: 'There is no message with that ID!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        updateChatbotLongTermMemory(serverID, ltmID, newContent);
+
+        interaction.reply({ content: 'Successfully updated memory!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (subcommand === 'delete') {
+        const ltmID = interaction.options.getNumber('ltm-id')!;
+        const longtermMemory = getChatbotLongTermMemory(serverID, ltmID);
+
+        if (!longtermMemory) {
+          interaction.reply({ content: 'There is no memory with that ID!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        deleteChatbotLongTermMemory(serverID, ltmID);
+        interaction.reply({ content: 'Successfully deleted memory!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subcommandGroup === 'status') {
+      const chatbot = getChatbot(serverID);
+      if (!chatbot) {
+        interaction.reply('There is no chatbot on this server! Try making one with /chatbot create');
+        return;
+      }
+
+      if (subcommand === 'set') {
+        const enabledOption = interaction.options.getBoolean('enabled')!;
+
+        if (enabledOption !== chatbot.chatbot_enabled) {
+          chatbot.chatbot_enabled = enabledOption;
+          upsertChatbot(chatbot);
+          interaction.reply({ content: 'Successfully set bot status.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        interaction.reply({ content: 'Already set to status!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (subcommand === 'view') {
+        interaction.reply({ embeds: [ChatbotCommand.configEmbedBuilder('Chatbot Settings', serverID)], flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subcommandGroup === 'prompt') {
+      if (subcommand === 'set') {
+        const chatbot = getChatbot(serverID);
+        if (!chatbot) {
+          interaction.reply({ content: 'There is no chatbot! Try making one first with /chatbot create', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        const promptModal = new ModalBuilder().setCustomId(ChatbotCommand.data.name).setTitle('Set System Prompt');
+
+        const promptParagraph = new TextInputBuilder()
+          .setCustomId('chatbot-prompt')
+          .setStyle(TextInputStyle.Paragraph)
+          .setValue(chatbot.chatbot_prompt ?? '')
+          .setMaxLength(4_000);
+        const promptLabel = new LabelBuilder().setLabel('Set the system prompt for the bot.').setTextInputComponent(promptParagraph);
+
+        promptModal.addLabelComponents(promptLabel);
+
+        interaction.showModal(promptModal);
+        return;
+      }
+      if (subcommand === 'delete') {
+        const chatbot = getChatbot(serverID);
+        if (!chatbot) {
+          interaction.reply({ content: 'There is no chatbot! Try making one first with /chatbot create', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        setChatbotPrompt(serverID, await getDefaultSystemPrompt());
+        interaction.reply({ content: 'Successfully updated system prompt!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subcommand === 'create') {
+      const chatbot = getChatbot(serverID);
+      if (chatbot) {
+        interaction.reply({ content: 'There is already a chatbot in this server! Try deleting it first to create a new one!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      upsertChatbot({
+        server_id: serverID,
+        chatbot_enabled: false,
+        chatbot_prompt: await getDefaultSystemPrompt(),
+        chatbot_core_memory: '',
+      });
+
+      interaction.reply({ content: 'Successfully created chatbot!', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'remove') {
+      const chatbot = getChatbot(serverID);
+
+      if (!chatbot) {
+        interaction.reply({ content: 'There is no chatbot in the server to delete!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      deleteChatbot(serverID);
+      interaction.reply({ content: 'Successfully deleted chatbot!', flags: MessageFlags.Ephemeral });
+    }
+  },
+  async handleModalSubmit(interaction: ModalSubmitInteraction, serverID: Snowflake) {
+    const chatbot = getChatbot(serverID);
+    if (!chatbot) {
+      interaction.reply({ content: 'There is no chatbot in the server! Please add one with /chatbot create', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    const newPrompt = interaction.fields.getTextInputValue('chatbot-prompt');
+
+    if (newPrompt === '') {
+      interaction.reply({ content: 'You must add some text to the new prompt!', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    setChatbotPrompt(serverID, newPrompt);
+    interaction.reply({ content: 'Successfully updated prompt!', flags: MessageFlags.Ephemeral });
+  },
   configEmbedBuilder(title: string, serverID: Snowflake) {
     const chatbot = getChatbot(serverID);
 
@@ -25,33 +244,59 @@ const AIFeature: Feature = {
   },
 };
 
-// const VoicePingFeature: Feature = {
-//   name: 'voice-ping',
-//   description: 'Sends a message when a user joins a voice channel',
-//   configEmbedBuilder(title: string, serverID: Snowflake) {
-//     const voicePing = getVoicePing(serverID);
-//     const { enabled, voicePingMessage, inputChannels, outputChannel } = serverConfig.voicePing;
+// have to have this command separate from Chatbot, as anyone may use this command, and i cannot change perms between subcommands.
+const SubscribeCommand: Command = {
+  data: new SlashCommandBuilder().setName('subscribe').setDescription('Subscribe to the chatbot, allowing it to reply and talk to you.')
+    .addSubcommand((setSubcommand) => setSubcommand.setName('set').setDescription('Set your subscription status')
+      .addBooleanOption((boolOption) => boolOption.setName('enabled')
+        .setDescription('Enables your subscription. True = Enabled, False = Disabled.')
+        .setRequired(true)))
+    .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View your current subscription status')),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake) {
+    const subcommand = interaction.options.getSubcommand();
+    const userID = interaction.user.id;
+    const isSubscriber = isChatbotSubscriber(serverID, userID);
 
-//     return new EmbedBuilder()
-//       .setTitle(titx le)
-//       .addFields(
-//         { name: 'Enabled', value: (enabled ? 'Yes' : 'No') },
-//         { name: 'Message', value: voicePingMessage ?? 'No message set' },
-//         { name: 'Listener Channels', value: inputChannels && inputChannels.length > 0 ? inputChannels?.map((id) => `<#${id}>`)?.join(', ') : 'No channels set' },
-//         { name: 'Log Channel', value: outputChannel ? `<#${outputChannel}>` : 'No channel set' },
-//       );
-//   },
-// };
+    if (subcommand === 'set') {
+      const enabledOption = interaction.options.getBoolean('enabled')!;
 
-// set features before config so that we can generate feature name choices
-// featureMap.set(HeartBoardFeature.name, HeartBoardFeature);
-// featureMap.set(VoicePingFeature.name, VoicePingFeature);
-featureMap.set(AIFeature.name, AIFeature);
+      if (enabledOption && isSubscriber) {
+        interaction.reply({ content: 'You are already subscribed!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (!enabledOption && !isSubscriber) {
+        interaction.reply({ content: 'You are already unsubscribed!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (!enabledOption) {
+        removeChatbotSubscriber(serverID, userID);
+        interaction.reply({ content: 'Successfully unsubscribed you!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (enabledOption) {
+        addChatbotSubscriber(serverID, userID);
+        interaction.reply({ content: 'Successfully subscribed you!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+
+    if (subcommand === 'view') {
+      if (isSubscriber) {
+        interaction.reply({ content: 'You are currently subscribed!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      interaction.reply({ content: 'You are not currently subscribed!', flags: MessageFlags.Ephemeral });
+    }
+  },
+};
 
 const HeartboardCommand: ConfigCommand = {
   data: new SlashCommandBuilder()
     .setName('heartboard')
     .setDescription('A board that keeps track of all messages above a threshold of reactions')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand((listSubcommand) => listSubcommand.setName('list')
       .setDescription('Lists existing boards in the server'))
     .addSubcommand((statusSubcommand) => statusSubcommand.setName('status')
@@ -310,6 +555,7 @@ const HeartboardCommand: ConfigCommand = {
 const VoicePingCommand: ConfigCommand = {
   data: new SlashCommandBuilder().setName('voiceping')
     .setDescription('Pings users when someone joins a specified voice channel')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand((listSubcommand) => listSubcommand.setName('list')
       .setDescription('List all existing voice pings'))
     .addSubcommand((statusSubcommand) => statusSubcommand.setName('status')
@@ -561,6 +807,7 @@ const VoicePingCommand: ConfigCommand = {
 const ResponseCommand: ConfigCommand = {
   data: new SlashCommandBuilder()
     .setName('response').setDescription('A response is an automated, generated response, upon a specific phrase.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand((listSubcommand) => listSubcommand.setName('list')
       .setDescription('List all existing Responses'))
     .addSubcommand((statusSubcommand) => statusSubcommand.setName('status')
@@ -777,70 +1024,10 @@ const ResponseCommand: ConfigCommand = {
   },
 };
 
-const SettingsCommand: Command = {
-  data: new SlashCommandBuilder()
-    .setName('settings')
-    .setDescription('Control server-wide settings of bot\'s features')
-    .addSubcommand(
-      (statusSubcommand) => statusSubcommand.setName('status')
-        .setDescription('Enable or disable a feature')
-        .addStringOption((statusFeatureName) => statusFeatureName.setName('feature-name')
-          .setDescription('Name of the feature you wish to view')
-          .setRequired(true)
-          .addChoices(
-            Array.from(featureMap.values()).map((feature) => ({ name: feature.name, value: feature.name })),
-          ))
-        .addBooleanOption((statusEnabled) => statusEnabled.setName('enabled')
-          .setDescription('Whether the feature is enabled (true) or not (false)')
-          .setRequired(true)),
-    )
-    .addSubcommand((viewSubcommandGroup) => viewSubcommandGroup.setName('view')
-      .setDescription('View current config settings of a feature')
-      .addStringOption((viewFeatureName) => viewFeatureName.setName('feature-name')
-        .setDescription('Name of the feature you wish to view')
-        .setRequired(true)
-        .addChoices(Array.from(featureMap.values()).map((feature) => ({ name: feature.name, value: feature.name }))))),
-  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
-    if (serverID === undefined) { console.error('Server is undefined'); return; }
-
-    const subCommand = interaction.options.getSubcommand();
-
-    if (subCommand === 'status') {
-      const enabledOption = interaction.options.getBoolean('enabled')!;
-      const featureNameOption = interaction.options.getString('feature-name')!;
-      const feature = featureMap.get(featureNameOption)!;
-
-      if (featureNameOption === AIFeature.name) {
-        let chatbot = getChatbot(serverID);
-        if (!chatbot) {
-          chatbot = {
-            server_id: serverID,
-            chatbot_enabled: enabledOption,
-            chatbot_core_memory: '',
-          };
-          upsertChatbot(chatbot);
-        } else if (enabledOption !== chatbot.chatbot_enabled) {
-          chatbot.chatbot_enabled = enabledOption;
-          upsertChatbot(chatbot);
-        }
-      }
-
-      interaction.reply({ embeds: [feature.configEmbedBuilder('Updated Config', serverID)], flags: MessageFlags.Ephemeral });
-    } else if (subCommand === 'view') {
-      const featureNameOption = interaction.options.getString('feature-name')!;
-      const feature = featureMap.get(featureNameOption)!;
-
-      await interaction.reply({
-        embeds: [feature.configEmbedBuilder('Current Config', serverID)],
-        flags: MessageFlags.Ephemeral,
-      });
-    }
-  },
-};
-
+commandMap.set(ChatbotCommand.data.name, ChatbotCommand);
+commandMap.set(SubscribeCommand.data.name, SubscribeCommand);
 commandMap.set(HeartboardCommand.data.name, HeartboardCommand);
 commandMap.set(VoicePingCommand.data.name, VoicePingCommand);
-commandMap.set(SettingsCommand.data.name, SettingsCommand);
 commandMap.set(ResponseCommand.data.name, ResponseCommand);
 
-export { commandMap, SettingsCommand, ResponseCommand, HeartboardCommand, VoicePingCommand };
+export { commandMap, ChatbotCommand, SubscribeCommand, ResponseCommand, HeartboardCommand, VoicePingCommand };

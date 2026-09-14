@@ -8,13 +8,6 @@ CREATE TABLE IF NOT EXISTS Server(
   server_id VARCHAR(20) PRIMARY KEY
 );
 
-CREATE TABLE IF NOT EXISTS Chatbot(
-  server_id VARCHAR(20) PRIMARY KEY REFERENCES Server(server_id) ON DELETE CASCADE,
-
-  chatbot_enabled BOOLEAN,
-  chatbot_core_memory TEXT
-);
-
 CREATE TABLE IF NOT EXISTS Channel(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
   channel_id VARCHAR(20) PRIMARY KEY
@@ -81,6 +74,19 @@ CREATE TABLE IF NOT EXISTS VoicePingInput(
   FOREIGN KEY (server_id, voiceping_name) REFERENCES VoicePing(server_id, voiceping_name) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS Chatbot(
+  server_id VARCHAR(20) PRIMARY KEY REFERENCES Server(server_id) ON DELETE CASCADE,
+
+  chatbot_enabled BOOLEAN,
+  chatbot_prompt TEXT,
+  chatbot_core_memory TEXT
+);
+CREATE TABLE IF NOT EXISTS ChatbotSubscriber(
+  server_id VARCHAR(20) REFERENCES Server(server_id) ON DELETE CASCADE,
+  user_id VARCHAR(20),
+
+  PRIMARY KEY(server_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS ChatbotLongTermMemory(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
   memory_id INTEGER NOT NULL,
@@ -92,10 +98,11 @@ CREATE TABLE IF NOT EXISTS ChatbotLongTermMemory(
 CREATE TABLE IF NOT EXISTS ChatbotShortTermMemory(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
   message_id VARCHAR(20) NOT NULL,
+  reference_id VARCHAR(20),
 
   author_name VARCHAR(40) NOT NULL,
+  author_id VARCHAR(20) NOT NULL,
   
-  author_id VARCHAR(20) NOT NULL REFERENCES User(user_id),
   role VARCHAR (9),
   message_content VARCHAR(2000),
   timestamp INTEGER,

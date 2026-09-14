@@ -1,11 +1,10 @@
-import OpenAI from 'openai';
 import { BaseMessageOptions, Channel, Client, EmbedBuilder, Events, GuildMember, Message, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, User } from 'discord.js';
 
 import { commandMap } from './commands';
 import { generateMessage } from './chatbot';
 
 import { Command } from './types/bot';
-import { deleteHeartBoardMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isEmbedMessage, syncDatabase, updateHeartBoardMessage } from './data';
+import { deleteChatbotShortTermMemory, deleteHeartBoardMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotShortTermMemory, isChatbotSubscriber, isEmbedMessage, syncDatabase, updateHeartBoardMessage } from './data';
 
 const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boolean> | PartialMessage<boolean>, reaction: MessageReaction): BaseMessageOptions => {
   const authorName = author?.nickname ?? author?.displayName;
@@ -34,7 +33,7 @@ const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boo
   return messageOptions;
 };
 
-function clientEvents(discordClient: Client, grokClient: OpenAI) {
+function clientEvents(discordClient: Client) {
   discordClient.on(Events.ClientReady, async () => {
     console.log(`Client logged in as ${discordClient.user?.tag}!`);
 
@@ -46,7 +45,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
       const server = await discordClient.guilds.fetch(guild.id);
       if (!server) return;
 
-      // load all heartbaord messages to cache
+      // load all heartboard messages to cache
       const heartboardMessages = getHeartBoardMessagesByServer(server.id);
       heartboardMessages.forEach(async (heartboardMessage) => {
         const channel = await server.channels.fetch(heartboardMessage.channel_id);
@@ -69,15 +68,22 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
 
   // On command
   discordClient.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isCommand() && !interaction.isAutocomplete()) return;
+    if (!interaction.isCommand() && !interaction.isAutocomplete() && !interaction.isModalSubmit()) return;
+    if (!interaction.guild) return;
 
-    if (!interaction.guild) { return; }
-
-    const { commandName } = interaction;
-    const command: Command = commandMap.get(commandName)!;
     const serverID: string = interaction.guild.id;
 
-    if (!command) { console.error(`No command found! Command Name: ${commandName}`); return; }
+    if (interaction.isModalSubmit()) {
+      const command: Command = commandMap.get(interaction.customId)!;
+      if (!command.handleModalSubmit) return;
+
+      command.handleModalSubmit(interaction, serverID);
+      return;
+    }
+
+    const command: Command = commandMap.get(interaction.commandName)!;
+
+    if (!command) { console.error(`No command found! Command Name: ${interaction.commandName}`); return; }
 
     if (interaction.isAutocomplete()) {
       command.autocomplete!(interaction, serverID);
@@ -135,7 +141,7 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
     if (!chatbot || !chatbot.chatbot_enabled) return;
 
     // the bot cannot respond to itself
-    if (!author.id || author.id === discordClient.user?.id) return;
+    if (!author.id || author.id === discordClient.user?.id || !isChatbotSubscriber(serverID, author.id)) return;
 
     // only works within my servers, sorry! otherwise it's a waste of xAI tokens & money :/
     if (!allowedServers.find((id) => serverID === id)) return;
@@ -147,14 +153,9 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
       || message.author.id === discordClient.user?.id)) return; // ...or the bot mentioned itself...
     // && Math.random() < 1 / 4096) return; // ...and we don't roll a 1% chance to respond anyway... <-- big bug, will fix.
 
-    let userContent = message.content;
+    const userContent = message.content;
     const messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
     const context: Message<boolean>[] | undefined = Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: message.id }))).values()); // fetch 5 most recent messages as context
-
-    // if a user is responding to a message, we add it to our message
-    if (messageReference && messageReference.content.length > 0) {
-      userContent = `Responding to: "${messageReference.content}"\nResponse: "${userContent}"`;
-    }
 
     message.channel.sendTyping(); // starts typing indicator...
     const typingExtension = setInterval(() => {
@@ -163,10 +164,10 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
 
     setTimeout(() => {
       clearInterval(typingExtension);
-    }, 20000); // cancel interval after 20 seconds, if it's still somehow going
+    }, 60000); // cancel interval after 60 seconds, if it's still somehow going
 
     // get response from LLM, and reply
-    const agentReply = await generateMessage(grokClient, discordClient, serverID, typingExtension, message, userContent, context ?? []);
+    const agentReply = await generateMessage(discordClient, serverID, typingExtension, message, userContent, messageReference, context ?? []);
     try {
       if (!agentReply || agentReply === '') return;
       clearInterval(typingExtension); // disables typing
@@ -174,12 +175,32 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
       if (agentReply.length < 2000) {
         await message.reply(agentReply);
       } else {
-        await message.reply(agentReply.substring(0, 2000));
+        const replyArray = agentReply.match(/[\s\S]{1,2000}/g)!; // split message into chunks of 2000
+
+        await message.reply(replyArray.shift()!);
+
+        // there is no simple way to send consecutive messages, without ignoring my linter, sorry 💔
+        // eslint-disable-next-line no-restricted-syntax
+        for (const reply of replyArray) {
+          // eslint-disable-next-line no-await-in-loop
+          await message.channel.send(reply);
+        }
       }
     } catch (error) {
       clearInterval(typingExtension); // disables typing
-
+      message.reply('I wasn\'t able to connect to the server... Please try again laer.');
       console.error(error);
+    }
+  });
+
+  discordClient.on(Events.MessageDelete, async (message) => {
+    const serverID = message.guild?.id;
+
+    if (!serverID) return; // only care if it's in a server
+
+    const messageID = message.id;
+    if (isChatbotShortTermMemory(serverID, Number(messageID))) {
+      deleteChatbotShortTermMemory(serverID, Number(messageID));
     }
   });
 
@@ -234,71 +255,83 @@ function clientEvents(discordClient: Client, grokClient: OpenAI) {
         return;
       }
 
-      const outputChannel = await guild.channels.fetch(heartBoard.output_channel);
-      if (!outputChannel || !outputChannel.isTextBased()) return;
+      try {
+        const outputChannel = await guild.channels.fetch(heartBoard.output_channel);
+        if (!outputChannel || !outputChannel.isTextBased()) return;
 
-      let heartboardMessage = getHeartBoardMessage(serverID, heartBoard.board_name, messageID);
+        let heartboardMessage = getHeartBoardMessage(serverID, heartBoard.board_name, messageID);
 
-      // if it's not currently in the board, and it's not elligible, skip processing
-      if (!heartboardMessage && totalReactions < heartBoard.threshold) return;
+        // if it's not currently in the board, and it's not elligible, skip processing
+        if (!heartboardMessage && totalReactions < heartBoard.threshold) return;
 
-      // if it's already in this board, we simply wish to update it
-      let embedMessage;
-      if (heartboardMessage) {
-        try {
-          embedMessage = await outputChannel.messages.fetch(heartboardMessage?.embed_id ?? 'unknown');
-        } catch { // if the embedMessage was deleted, delete heartboardMessage and recreate it down below
-          if (totalReactions < heartBoard.threshold || reaction.partial) { // unless it is below required threshold
+        // if it's already in this board, we simply wish to update it
+        let embedMessage;
+        if (heartboardMessage) {
+          try {
+            embedMessage = await outputChannel.messages.fetch(heartboardMessage?.embed_id ?? 'unknown');
+          } catch { // if the embedMessage was deleted, delete heartboardMessage and recreate it down below
+            if (totalReactions < heartBoard.threshold || reaction.partial) { // unless it is below required threshold
+              deleteHeartBoardMessage(serverID, heartBoard.board_name, messageID);
+              return;
+            }
+            deleteHeartBoardMessage(serverID, heartboardMessage.board_name, heartboardMessage.message_id);
+            heartboardMessage = undefined;
+          }
+        }
+
+        if (heartboardMessage && embedMessage) {
+          // if the message no longer has enough reactions, we should delete the HeartBoardMessage
+          if (totalReactions < heartBoard.threshold || reaction.partial) {
+            embedMessage.delete();
             deleteHeartBoardMessage(serverID, heartBoard.board_name, messageID);
             return;
           }
-          deleteHeartBoardMessage(serverID, heartboardMessage.board_name, heartboardMessage.message_id);
-          heartboardMessage = undefined;
-        }
-      }
 
-      if (heartboardMessage && embedMessage) {
-        // if the message no longer has enough reactions, we should delete the HeartBoardMessage
-        if (totalReactions < heartBoard.threshold || reaction.partial) {
-          embedMessage.delete();
-          deleteHeartBoardMessage(serverID, heartBoard.board_name, messageID);
+          // if it's still above the threshold, we wish to simply edit the message
+          const authorMember = await guild.members.fetch(message.author?.id ?? 'unknown');
+          const messageOptions = heartboardEmbedBuilder(authorMember, message, reaction);
+
+          embedMessage.edit(messageOptions);
+          heartboardMessage.total_emojis = totalReactions;
+          updateHeartBoardMessage(heartboardMessage);
+
           return;
         }
 
-        // if it's still above the threshold, we wish to simply edit the message
+        // if it's not in the board, but still elligible, we must add a new HeartBoardMessage
         const authorMember = await guild.members.fetch(message.author?.id ?? 'unknown');
-        const messageOptions = heartboardEmbedBuilder(authorMember, message, reaction);
+        const messageOptions = heartboardEmbedBuilder(authorMember, message, await reaction.fetch());
+        embedMessage = await outputChannel.send(messageOptions);
 
-        embedMessage.edit(messageOptions);
-        heartboardMessage.total_emojis = totalReactions;
-        updateHeartBoardMessage(heartboardMessage);
+        heartboardMessage = {
+          server_id: serverID,
+          board_name: heartBoard.board_name,
+          channel_id: message.channelId,
+          message_id: messageID,
+          total_emojis: totalReactions,
+          embed_id: embedMessage.id,
+        };
 
-        return;
+        insertHeartBoardMessage(heartboardMessage);
+      } catch (error) {
+        console.log(error);
       }
-
-      // if it's not in the board, but still elligible, we must add a new HeartBoardMessage
-      const authorMember = await guild.members.fetch(message.author?.id ?? 'unknown');
-      const messageOptions = heartboardEmbedBuilder(authorMember, message, await reaction.fetch());
-      embedMessage = await outputChannel.send(messageOptions);
-
-      heartboardMessage = {
-        server_id: serverID,
-        board_name: heartBoard.board_name,
-        channel_id: message.channelId,
-        message_id: messageID,
-        total_emojis: totalReactions,
-        embed_id: embedMessage.id,
-      };
-
-      insertHeartBoardMessage(heartboardMessage);
     });
   };
 
   discordClient.on(Events.MessageReactionAdd, async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
-    await handleReaction(reaction, user);
+    try {
+      await handleReaction(reaction, user);
+    } catch (error) {
+      console.log(error);
+    }
   });
   discordClient.on(Events.MessageReactionRemove, async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
-    await handleReaction(reaction, user);
+    try {
+      await handleReaction(reaction, user);
+    } catch (error) {
+      console.log(error);
+    }
   });
 }
 
