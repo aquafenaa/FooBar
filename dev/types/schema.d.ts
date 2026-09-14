@@ -101,9 +101,13 @@ interface AutomaticResponseTable {
   capture_regex: string,
   output_template: string;
 }
+interface ResponseMessageTable {
+  server_id: Snowflake,
+  message_id: Snowflake;
+}
 
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
-  AutomaticResponseTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
+  AutomaticResponseTable, ResponseMessageTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
   ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, /* AI-related structures */
 };

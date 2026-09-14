@@ -86,14 +86,14 @@ function getChatbotShortTermMemoriesByServer(server_id: Snowflake): ChatbotShort
   return db.prepare('SELECT * FROM ChatbotShortTermMemory WHERE server_id = ? ORDER BY timestamp ASC')
     .all(server_id) as ChatbotShortTermMemoryTable[];
 }
-function isChatbotShortTermMemory(server_id: Snowflake, message_id: number): boolean {
+function isChatbotShortTermMemory(server_id: Snowflake, message_id: Snowflake): boolean {
   return db.prepare('SELECT * FROM ChatbotShortTermMemory WHERE server_id = ? AND message_id = ?').get(server_id, message_id) !== undefined;
 }
 function insertChatbotShortTermMemory(memory: ChatbotShortTermMemoryTable): void {
   db.prepare('INSERT OR IGNORE INTO ChatbotShortTermMemory (server_id, message_id, reference_id, author_name, author_id, role, message_content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
     .run(memory.server_id, memory.message_id, memory.reference_id, memory.author_name, memory.author_id, memory.role, memory.message_content, memory.timestamp);
 }
-function deleteChatbotShortTermMemory(server_id: Snowflake, message_id: number): void {
+function deleteChatbotShortTermMemory(server_id: Snowflake, message_id: Snowflake): void {
   db.prepare('DELETE FROM ChatbotShortTermMemory WHERE server_id = ? AND message_id = ?').run(server_id, message_id);
 }
 function clearChatbotShortTermMemory(server_id: Snowflake): void {
@@ -241,6 +241,15 @@ function updateAutomaticResponse(response: AutomaticResponseTable): void {
 function deleteAutomaticResponse(server_id: Snowflake, name: string): void {
   db.prepare('DELETE FROM AutomaticResponse WHERE server_id = ? AND name = ?').run(server_id, name);
 }
+function addResponseMessage(server_id: Snowflake, message_id: Snowflake): void {
+  db.prepare('INSERT INTO ResponseMessage (server_id, message_id) VALUES (?, ?)').run(server_id, message_id);
+}
+function isResponseMessage(server_id: Snowflake, message_id: Snowflake): boolean {
+  return db.prepare('SELECT 1 FROM ResponseMessage WHERE server_id = ? AND message_id = ?').run(server_id, message_id) !== undefined;
+}
+function deleteResponseMessage(server_id: Snowflake, message_id: Snowflake): void {
+  db.prepare('DELETE FROM ResponseMessage WHERE server_id = ? AND message_id = ?').run(server_id, message_id);
+}
 
 // ==================== Server ====================
 function getServer(server_id: Snowflake): ServerTable | undefined {
@@ -356,17 +365,14 @@ const syncDatabase = db.transaction(() => {
 
     db.pragma('user_version = 2');
   }
-  if (currentVersion < 3) {
-    db.exec(schema);
-
-    db.pragma('user_version = 3');
+  if (currentVersion === 3) {
+    db.pragma('user_version = 2');
   }
 });
 
 export {
-  db,
-  getAllServers,
-  getServer, insertServer, deleteServer, syncDatabase,
+  db, syncDatabase,
+  getAllServers, getServer, insertServer, deleteServer,
   getChatbot, upsertChatbot, deleteChatbot, setChatbotPrompt,
   isChatbotSubscriber, addChatbotSubscriber, removeChatbotSubscriber,
   getHeartBoard, getHeartBoardsByServer, getHeartBoardsByEmoji, insertHeartBoard, updateHeartBoard, deleteHeartBoard,
@@ -376,5 +382,5 @@ export {
   getVoicePingInputs, insertVoicePingInput, deleteAllVoicePingInputs, deleteVoicePingInput,
   getChatbotLongTermMemory, getChatbotLongTermMemoriesByServer, updateChatbotLongTermMemory, insertChatbotLongTermMemory, deleteChatbotLongTermMemory, deleteNOldestLongTermMemories,
   getChatbotShortTermMemoriesByServer, isChatbotShortTermMemory, insertChatbotShortTermMemory, deleteChatbotShortTermMemory, clearChatbotShortTermMemory, deleteNOldestShortTermMemory, saveAnonymizedMessage,
-  getAutomaticResponse, getAutomaticResponsesByServer, insertAutomaticResponse, updateAutomaticResponse, deleteAutomaticResponse,
+  getAutomaticResponse, getAutomaticResponsesByServer, insertAutomaticResponse, updateAutomaticResponse, deleteAutomaticResponse, addResponseMessage, isResponseMessage, deleteResponseMessage,
 };

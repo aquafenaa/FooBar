@@ -4,7 +4,7 @@ import { commandMap } from './commands';
 import { generateMessage } from './chatbot';
 
 import { Command } from './types/bot';
-import { deleteChatbotShortTermMemory, deleteHeartBoardMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotShortTermMemory, isChatbotSubscriber, isEmbedMessage, saveAnonymizedMessage, syncDatabase, updateHeartBoardMessage } from './data';
+import { addResponseMessage, deleteChatbotShortTermMemory, deleteHeartBoardMessage, deleteResponseMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotShortTermMemory, isChatbotSubscriber, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, syncDatabase, updateHeartBoardMessage } from './data';
 
 const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boolean> | PartialMessage<boolean>, reaction: MessageReaction): BaseMessageOptions => {
   const authorName = author?.nickname ?? author?.displayName;
@@ -121,12 +121,15 @@ function clientEvents(discordClient: Client) {
 
       // parse groups, and replace them with respective group number
       if (!response.output_template) return;
-      const responseStr = response.output_template.replace(/\{(\d+)\}/g, (_, index) => { // thank u claude. this is actually a cute little implementation
+      const responseStr = response.output_template.replace(/\{(\d+)\}/g, (_, index) => {
         const i = parseInt(index, 10);
         return groups[i] ?? '';
       });
 
-      message.reply({ content: responseStr });
+      message.reply({ content: responseStr }).then((responseMessage) => {
+        responseMessage.react('🗑️');
+        addResponseMessage(serverID, responseMessage.id);
+      });
     });
 
     // ChatbotResponse Handling
@@ -196,9 +199,12 @@ function clientEvents(discordClient: Client) {
 
     if (!serverID) return; // only care if it's in a server
 
-    const messageID = Number(message.id);
+    const messageID = message.id;
     if (isChatbotShortTermMemory(serverID, messageID)) {
       deleteChatbotShortTermMemory(serverID, messageID);
+    }
+    if (isResponseMessage(serverID, messageID)) {
+      deleteResponseMessage(serverID, messageID);
     }
   });
 
@@ -232,19 +238,32 @@ function clientEvents(discordClient: Client) {
     });
   });
 
-  const acceptedEmojis = ['🩷', '❤️', '💛', '🧡', '💚'];
+  const acceptedEmojis = ['🩷', '❤️', '💛', '🧡', '💚', '🤍', '🩵', '💙'];
   // Heartboard reaction function
   const handleReaction = async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     const { message } = reaction;
 
     if (!message.guild) return;
 
-    const refMessage = await message.fetchReference();
     const { guild, id: messageID } = message;
 
     const serverID = guild.id;
     const emojiString = reaction.emoji.toString();
     const totalReactions = reaction.count ?? 0;
+
+    if (emojiString === '🗑️' && user.id !== discordClient.user?.id && isResponseMessage(serverID, messageID)) {
+      try {
+        deleteResponseMessage(serverID, messageID);
+        message.delete();
+
+        return;
+      } catch (error) {
+        console.error(error);
+        return;
+      }
+    }
+
+    const refMessage = message.reference ? await message.fetchReference() : undefined;
 
     // if in acceptedEmojis, save anonymized chat
     if (acceptedEmojis.includes(emojiString) && message.content) {
