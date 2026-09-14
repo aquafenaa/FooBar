@@ -21,9 +21,9 @@ Make sure to keep information about your personality, and how you talk including
 
 // prompt for summarizing short-term memory
 const cullingPrompt = `You're foo, a chatbot on a Discord server. The following messages are your short term memory. Summarize them to form your long-term memory.
-Only include the summarization, no preamble. Be as concise as possible, while still keeping importnat information. This will go into your long-term memory, and we wish to minimize tokens. Use bullet points to keep information concise.
-Please summarize the important information, and information that will most likely be relevant later. This may include a member's personality and/or your relationship to them if you have enough information.
-If you have information to add to a member's personality, then add it. Do not restate any information. It will stay as a list for you to read in the future. Keep it to 200 words or less.`;
+Only include the summarization, no preamble. Be as concise as possible, while still keeping important information. This will go into your long-term memory, and we wish to minimize tokens. Use bullet points to keep information concise.
+Please summarize the important information, and information that will most likely be relevant later. If you have information to add to a member's personality, then add it.
+Do not restate any information. It will stay as a list for you to read in the future. Keep it to 200 words or less.`;
 
 async function getDefaultSystemPrompt(): Promise<string> {
   return (await readFile(promptPath, 'utf-8')).replace('<discord-id>', DISCORD_ID ?? 'undefined');
@@ -100,7 +100,7 @@ async function testMemoryEncoding(server_id: Snowflake, longTermMemory: ChatbotL
   }
 }
 
-async function generateMessage(discordClient: Client<boolean>, serverID: Snowflake, typingIndicator: NodeJS.Timeout, userMessage: Message<boolean>, userContent: string, messageReference: Message<boolean> | undefined, context: Message<boolean>[]): Promise<string> {
+async function generateMessage(discordClient: Client<boolean>, serverID: Snowflake, typingIndicator: NodeJS.Timeout, userMessage: Message<boolean>, authorNick: string | null, userContent: string, messageReference: Message<boolean> | undefined, context: Message<boolean>[]): Promise<string> {
   const chatbot = getChatbot(serverID)!;
   const basePrompt = chatbot.chatbot_prompt;
   const coreMemory = chatbot.chatbot_core_memory;
@@ -157,18 +157,23 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
     // Rest of messages at end, reformatted
     ...shortTermMemory.map((msg) => ({
       role: msg.role,
-      content: `<msg user_id="${msg.author_id}" nick="${msg.author_name}" id="${msg.message_id}"${msg.reference_id ? ` references="${msg.reference_id}"` : ''} time="${new Date(msg.timestamp).toLocaleString()}">${msg.message_content}</msg>`,
+      content: `<msg user_id="${msg.author_id}" name="${msg.author_name}"${authorNick ? ` nick="${authorNick}"` : ''} id="${msg.message_id}"${msg.reference_id ? ` references="${msg.reference_id}"` : ''} time="${new Date(msg.timestamp).toLocaleString()}">${msg.message_content}</msg>`,
     })),
   ];
 
-  shortTermMemory.forEach((stm) => insertChatbotShortTermMemory(stm));
-
+  // add longterm memories to beginning of input
   const longtermMemoryStr = longTermMemory.map((ltm) => `[${new Date(ltm.timestamp)}]: ${ltm.message_content}`).join('\n');
+  agentInput.unshift({
+    role: 'assistant',
+    content: `Longterm Memory:\n${longtermMemoryStr}`,
+  });
+
+  shortTermMemory.forEach((stm) => insertChatbotShortTermMemory(stm));
 
   try {
     const { text } = await generateText({
       model: xai.responses('grok-4.5'),
-      system: `${basePrompt}\nCore Memory: ${coreMemory}\n Longterm Memory:\n${longtermMemoryStr}}`,
+      system: `${basePrompt}\nCore Memory: ${coreMemory}\n}`,
       prompt: agentInput,
       reasoning: 'medium',
       temperature: 1.2,
@@ -196,7 +201,7 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
     return responseContent;
   } catch (error: any) {
     clearInterval(typingIndicator);
-    console.log(error);
+    console.error(error);
     return error.toString();
   }
 }

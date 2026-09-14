@@ -112,29 +112,10 @@ interface ChatbotMessage {
   messageContent: string;
 }
 
-/*
- * Default values for feature configs. Useful for setting default configs
-*/
-// const defaultHeartboardConfig: HeartBoardConfig = {
-//   enabled: false,
-//   cumulative: false,
-//   denyAuthor: false,
-//   thresholdNumber: 3,
-//   emojis: ['❤️'], // all UTF emojis MUST be in their UTF form, instead of discord's :heart: format ("❤️", not ":heart:")
-//   outputChannel: '',
-// };
-// const defaultVoicepingConfig: VoicePingConfig = {
-//   enabled: false,
-//   voicePingMessage: 'Welcome to the voice channel, {user}',
-//   inputChannels: [],
-//   outputChannel: '',
-// };
-
 export {
   ConfigData, SaveData, ServerData, ServerConfig, // Save data
   Command, ConfigCommand, Feature, // Savedata, Commands, and Features
   AutomaticResponse,
   ChatbotMessage, // AI-related types (🤮)
   HeartBoardMessage, HeartBoardConfig, VoicePingConfig, // Feature config types
-  // defaultHeartboardConfig, defaultVoicepingConfig, // Defaults
 };
