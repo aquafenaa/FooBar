@@ -90,12 +90,6 @@ function clientEvents(discordClient: Client) {
       return;
     }
 
-    // deny dan.
-    if (interaction.user.id === '276892442521894913') {
-      await interaction.reply({ content: 'You are not to be trusted.', flags: 'Ephemeral' });
-      return;
-    }
-
     try {
       await command.execute(interaction, serverID);
     } catch (error) {
