@@ -109,6 +109,15 @@ CREATE TABLE IF NOT EXISTS ChatbotShortTermMemory(
   
   PRIMARY KEY (server_id, message_id)
 );
+CREATE TABLE IF NOT EXISTS SavedAnonymizedChats(
+  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
+  message_id VARCHAR(20),
+
+  reference_content TEXT,
+  message_content VARCHAR(2000) NOT NULL,
+
+  PRIMARY KEY (server_id, message_id)
+);
 
 CREATE TABLE IF NOT EXISTS AutomaticResponse(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
