@@ -106,8 +106,18 @@ interface ResponseMessageTable {
   message_id: Snowflake;
 }
 
+interface ReminderTable {
+  server_id: Snowflake,
+  reminder_name: string,
+
+  channel_id: Snowflake,
+  repeats: boolean,
+  cron_schedule: string,
+  message_content: string;
+}
+
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
-  AutomaticResponseTable, ResponseMessageTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
+  AutomaticResponseTable, ResponseMessageTable, ReminderTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
   ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, /* AI-related structures */
 };
