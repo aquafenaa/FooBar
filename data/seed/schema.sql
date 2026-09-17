@@ -136,3 +136,15 @@ CREATE TABLE IF NOT EXISTS ResponseMessage(
 
   PRIMARY KEY (server_id, message_id)
 );
+
+CREATE TABLE IF NOT EXISTS Reminder(
+  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
+  channel_id VARCHAR(20) NOT NULL,
+  reminder_name VARCHAR(40) NOT NULL,
+
+  repeats BOOLEAN,
+  cron_schedule VARCHAR(40) NOT NULL,
+  message_content TEXT,
+
+  PRIMARY KEY (server_id, reminder_name)
+);

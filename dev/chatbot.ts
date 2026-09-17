@@ -46,7 +46,7 @@ async function summarizeMemory(server_id: Snowflake, longTermMemory: ChatbotLong
   const { text } = await generateText({
     model: xai.responses('grok-4.6'),
     prompt: longtermMemoryStr,
-    system: `${summarizingPrompt}\n\nCURRENT CORE MEMORY: ${chatbotData.chatbot_core_memory}`,
+    system: `${summarizingPrompt}\n\n# PERSONALITY\n${chatbotData.chatbot_prompt}\n# CURRENT CORE MEMORY\n${chatbotData.chatbot_core_memory}`,
     headers: {
       'x-grok-conv-id': '917594803481489429',
     },
@@ -180,6 +180,8 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
       tools: {
         web_search: xai.tools.webSearch(),
         x_search: xai.tools.xSearch(),
+        code_execution: xai.tools.codeExecution(),
+        // view_image: xai.tools.viewImage(),
       },
       headers: {
         'x-grok-conv-id': '917594803481489429',

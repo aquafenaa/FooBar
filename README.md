@@ -18,6 +18,7 @@ If you would like to add this bot to your own server, feel free! If you encounte
   - /subscribe to Opt-In
   - [x] Command to reset AI memory
   - [x] Ability to change prompt between servers
+  - [ ] Publicize thinking and tool uses, but non-intrusive, closable
   - [ ] Skills
     - [ ] Change nickname
     - [ ] Reminder / Message scheduler
@@ -27,8 +28,8 @@ If you would like to add this bot to your own server, feel free! If you encounte
 - [ ] Show ratings
   - Calculates average score of a show via user's reactions / interations
 - [ ] Position Tracker
- - Command to keep track of position in shows
- - Includes season, episode, and possible time
+  - Command to keep track of position in shows
+  - Includes season, episode, and possible time
 
 
 - [ ] Woke Meter

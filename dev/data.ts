@@ -1,9 +1,10 @@
 import path from 'node:path';
 import { Snowflake } from 'discord.js';
 import Database from 'better-sqlite3';
+import cron from 'node-cron';
 import { readFileSync } from 'fs';
 
-import { AutomaticResponseTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable } from './types/schema';
+import { AutomaticResponseTable, ReminderTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable } from './types/schema';
 import { ConfigData, ServerConfig, ServerData } from './types/bot';
 import { getDefaultSystemPrompt } from './chatbot';
 
@@ -251,6 +252,33 @@ function deleteResponseMessage(server_id: Snowflake, message_id: Snowflake): voi
   db.prepare('DELETE FROM ResponseMessage WHERE server_id = ? AND message_id = ?').run(server_id, message_id);
 }
 
+// ==================== Reminder ====================
+function getReminder(server_id: Snowflake, reminder_name: string): ReminderTable {
+  return db.prepare('SELECT * FROM Reminder WHERE server_id = ? AND reminder_name = ?').get(server_id, reminder_name) as ReminderTable;
+}
+function getRemindersByServer(server_id: Snowflake): ReminderTable[] {
+  return db.prepare('SELECT * FROM Reminder WHERE server_id = ?').all(server_id) as ReminderTable[];
+}
+function addReminder(reminder: ReminderTable): void {
+  db.prepare('INSERT INTO Reminder (server_id, channel_id, reminder_name, repeats, cron_schedule, message_content) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(reminder.server_id, reminder.channel_id, reminder.reminder_name, reminder.repeats ? 1 : 0, reminder.cron_schedule, reminder.message_content);
+}
+function updateReminder(reminder: ReminderTable): void {
+  db.prepare('UPDATE Reminder SET channel_id = ?, repeats = ?, cron_schedule = ?, message_content = ? WHERE server_id = ? AND reminder_name = ?')
+    .run(reminder.channel_id, reminder.repeats, reminder.cron_schedule, reminder.message_content, reminder.server_id, reminder.reminder_name);
+}
+function deleteReminder(reminder: ReminderTable) {
+  // find task with name and delete it
+  const tasks = cron.getTasks();
+  tasks.forEach((task) => {
+    if (task.name === `${reminder.server_id}${reminder.reminder_name}`) {
+      task.destroy();
+    }
+  });
+
+  db.prepare('DELETE FROM Reminder WHERE server_id = ? AND reminder_name = ?').run(reminder.server_id, reminder.reminder_name);
+}
+
 // ==================== Server ====================
 function getServer(server_id: Snowflake): ServerTable | undefined {
   return db.prepare('SELECT * FROM Server WHERE server_id = ?').get(server_id) as ServerTable | undefined;
@@ -365,14 +393,15 @@ const syncDatabase = db.transaction(() => {
 
     db.pragma('user_version = 2');
   }
-  if (currentVersion === 3) {
-    db.pragma('user_version = 2');
+  if (currentVersion < 3) {
+    db.exec(schema);
   }
 });
 
 export {
   db, syncDatabase,
   getAllServers, getServer, insertServer, deleteServer,
+  getReminder, getRemindersByServer, addReminder, updateReminder, deleteReminder,
   getChatbot, upsertChatbot, deleteChatbot, setChatbotPrompt,
   isChatbotSubscriber, addChatbotSubscriber, removeChatbotSubscriber,
   getHeartBoard, getHeartBoardsByServer, getHeartBoardsByEmoji, insertHeartBoard, updateHeartBoard, deleteHeartBoard,

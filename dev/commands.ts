@@ -10,15 +10,17 @@ import {
   TextInputBuilder,
   TextInputStyle,
 } from 'discord.js';
+import cron from 'node-cron';
 import { Command, ConfigCommand } from './types/bot';
-import { addChatbotSubscriber, deleteAllHeartBoardEmojis, deleteAllVoicePingInputs, deleteAutomaticResponse, deleteChatbot,
-  deleteChatbotLongTermMemory, deleteHeartBoard, deleteNOldestShortTermMemory, deleteVoicePing, getAutomaticResponse, getAutomaticResponsesByServer, getChatbot,
-  getChatbotLongTermMemoriesByServer, getChatbotLongTermMemory, getChatbotShortTermMemoriesByServer, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getVoicePing,
+import { addChatbotSubscriber, addReminder, deleteAllHeartBoardEmojis, deleteAllVoicePingInputs, deleteAutomaticResponse, deleteChatbot,
+  deleteChatbotLongTermMemory, deleteHeartBoard, deleteNOldestShortTermMemory, deleteReminder, deleteVoicePing, getAutomaticResponse, getAutomaticResponsesByServer, getChatbot,
+  getChatbotLongTermMemoriesByServer, getChatbotLongTermMemory, getChatbotShortTermMemoriesByServer, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getReminder, getRemindersByServer, getVoicePing,
   getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertChatbotLongTermMemory, insertHeartBoard, insertHeartBoardEmoji,
   insertVoicePing, insertVoicePingInput, isChatbotSubscriber, removeChatbotSubscriber, setChatbotPrompt, updateAutomaticResponse, updateChatbotLongTermMemory,
-  updateHeartBoard, updateVoicePing, upsertChatbot } from './data';
-import { AutomaticResponseTable, ChatbotTable, HeartBoardTable, VoicePingTable } from './types/schema';
+  updateHeartBoard, updateReminder, updateVoicePing, upsertChatbot } from './data';
+import { AutomaticResponseTable, ChatbotTable, ReminderTable, HeartBoardTable, VoicePingTable } from './types/schema';
 import { getDefaultSystemPrompt } from './chatbot';
+import { inputToSchedule, sendReminder } from './utils';
 
 const commandMap: Map<string, Command> = new Map();
 
@@ -70,7 +72,7 @@ const ChatbotCommand: ConfigCommand = {
       .setDescription('Whether the chatbot is enabled or disabled.')
       .addSubcommand((setSubcommand) => setSubcommand.setName('set')
         .setDescription('Set the status of the chatbot')
-        .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
+        .addBooleanOption((enabledOption) => enabledOption.setName('enabled').setRequired(true)
           .setDescription('True = Enable, False = Disable')))
       .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
         .setDescription('View the current enabled status of the chatbot.'))),
@@ -1006,11 +1008,176 @@ const ResponseCommand: ConfigCommand = {
   },
 };
 
+const ReminderCommand: ConfigCommand = {
+  data: new SlashCommandBuilder().setName('reminder').setDescription('Create a reminder for a later date, or a reoccuring reminder')
+    .addSubcommand((addSubcommand) => addSubcommand.setName('add').setDescription('Add a reminder')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the reminder')
+        .setRequired(true).setMaxLength(40))
+      .addStringOption((scheduleOption) => scheduleOption.setName('schedule').setDescription('Discord @time string (<t:xxxxxxxxxx:s>) or cron schedule for the reminder')
+        .setRequired(true).setMaxLength(40))
+      .addStringOption((messageOption) => messageOption.setName('message').setDescription('Reminder message to send')
+        .setRequired(true).setMaxLength(2000))
+      .addChannelOption((channelOption) => channelOption.setName('output-channel').setDescription('Channel the reminder should be sent to')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.PublicThread, ChannelType.GuildAnnouncement, ChannelType.PrivateThread, ChannelType.GuildVoice))
+      .addBooleanOption((repeatsOption) => repeatsOption.setName('repeats').setDescription('Whether the schedule repeats, or deletes after single use. True = Repeats, False = Deletes')))
+    .addSubcommand((editSubcommand) => editSubcommand.setName('edit').setDescription('Edit a reminder')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the schedule to edit')
+        .setRequired(true).setAutocomplete(true))
+      .addStringOption((scheduleOption) => scheduleOption.setName('schedule').setDescription('New discord @time string or cron schedule to change to').setAutocomplete(true))
+      .addStringOption((messageOption) => messageOption.setName('message').setDescription('New message to change to'))
+      .addChannelOption((channelOption) => channelOption.setName('output-channel').setDescription('Channel the reminder should be sent to')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.PublicThread, ChannelType.GuildAnnouncement, ChannelType.PrivateThread, ChannelType.GuildVoice))
+      .addBooleanOption((repeatOption) => repeatOption.setName('repeat').setDescription('New value whether the schedule repeats, or deletes after single use.')))
+    .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View the contents of a reminder')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the reminder')
+        .setRequired(true).setAutocomplete(true)))
+    .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete').setDescription('Delete a reminder')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the reminder')
+        .setRequired(true).setAutocomplete(true))),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+    const subcommand = interaction.options.getSubcommand();
+
+    if (subcommand === 'add') {
+      const nameOption = interaction.options.getString('name')!;
+      const scheduleOption = interaction.options.getString('schedule')!;
+      const messageOption = interaction.options.getString('message')!;
+      const channelOption = interaction.options.getChannel('output-channel');
+      const repeatOption = interaction.options.getBoolean('repeats');
+
+      const existingReminder = getReminder(serverID, nameOption);
+      if (existingReminder) {
+        interaction.reply({ content: 'There is already a reminder with this name! Please try a different name!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      // create cron schedule either from the cron string, or the discord date tag
+      const cronSchedule = inputToSchedule(scheduleOption);
+
+      if (!cronSchedule) {
+        interaction.reply({ content: 'The given schedule is not a valid Discord @time or cron schedule! Please ensure it follows one of these formats!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const guild = interaction.guild!;
+      const outputChannel = channelOption ? (await guild.channels.fetch(channelOption.id))! : (await guild.channels.fetch(interaction.channelId))!;
+
+      const reminder = {
+        server_id: serverID,
+        reminder_name: nameOption,
+
+        channel_id: outputChannel.id,
+        repeats: repeatOption ?? false,
+        cron_schedule: scheduleOption,
+        message_content: messageOption,
+      };
+
+      addReminder(reminder);
+      cron.schedule(cronSchedule, () => sendReminder(outputChannel, serverID, reminder.reminder_name), {
+        name: `${reminder.server_id}${reminder.reminder_name}`,
+      });
+
+      interaction.reply({ content: 'Successfully created schedule!', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'edit') {
+      const nameOption = interaction.options.getString('name')!;
+      const scheduleOption = interaction.options.getString('schedule');
+      const messageOption = interaction.options.getString('message');
+      const channelOption = interaction.options.getChannel('output-channel');
+      const repeatOption = interaction.options.getBoolean('repeats');
+
+      const reminder = getReminder(serverID, nameOption);
+      if (!reminder) {
+        interaction.reply({ content: 'There is no reminder with this name! Please ensure you\'ve spelled it correctly!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (!scheduleOption && !messageOption && repeatOption === null) {
+        interaction.reply({ content: 'You must edit at least one field!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (scheduleOption) {
+        const cronSchedule = inputToSchedule(scheduleOption);
+        if (!cronSchedule) {
+          interaction.reply({ content: 'The given schedule is not a valid Discord @time or cron schedule! Please ensure it follows one of these formats!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        reminder.cron_schedule = cronSchedule;
+      }
+      if (channelOption) {
+        const guild = interaction.guild!;
+        const outputChannel = channelOption ? (await guild.channels.fetch(channelOption.id))! : (await guild.channels.fetch(interaction.channelId))!;
+        if (!outputChannel.isSendable()) {
+          interaction.reply({ content: 'The channel given must be able to be sent to!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        reminder.channel_id = outputChannel.id;
+      }
+      if (messageOption && messageOption !== '') {
+        reminder.message_content = messageOption;
+      }
+      if (repeatOption !== null) {
+        reminder.repeats = repeatOption;
+      }
+
+      updateReminder(reminder);
+      interaction.reply({ content: 'Successfully updated reminder!', flags: MessageFlags.Ephemeral });
+      // return;
+    }
+    if (subcommand === 'view') {
+      const nameOption = interaction.options.getString('name')!;
+
+      const reminder = getReminder(serverID, nameOption);
+      if (!reminder) {
+        interaction.reply({ content: 'There is no reminder by this name, ensure you\'ve spelled it correctly', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      interaction.reply({ embeds: [this.configEmbedBuilder(serverID, reminder)], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'delete') {
+      const nameOption = interaction.options.getString('name')!;
+
+      const reminder = getReminder(serverID, nameOption);
+      if (!reminder) {
+        interaction.reply({ content: 'There is no reminder by this name, ensure you\'ve spelled it correctly', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      deleteReminder(reminder);
+      interaction.reply({ content: 'Successfully deleted reminder!', flags: MessageFlags.Ephemeral });
+    }
+  },
+  async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
+    const focusedValue = interaction.options.getFocused();
+
+    const reminders = getRemindersByServer(serverID);
+    const choices = reminders.map((response) => response.reminder_name);
+
+    const filtered = choices.filter((choice) => choice.startsWith(focusedValue));
+    interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
+  },
+  configEmbedBuilder(serverID: Snowflake, reminder: ReminderTable) {
+    return new EmbedBuilder().setTitle('Reminder Settings')
+      .addFields(
+        { name: 'Name:', value: reminder.reminder_name },
+        { name: 'Output Channel', value: `<#${reminder.channel_id}>` },
+        { name: 'Schedule', value: reminder.cron_schedule },
+        { name: 'Message', value: reminder.message_content.substring(0, 1024) },
+        { name: 'Repeats', value: reminder.repeats ? 'Yes' : 'No' },
+      );
+  },
+};
+
 commandMap.set(ChatbotCommand.data.name, ChatbotCommand);
 commandMap.set(SubscribeCommand.data.name, SubscribeCommand);
 commandMap.set(UnsubscribeCommand.data.name, UnsubscribeCommand);
 commandMap.set(HeartboardCommand.data.name, HeartboardCommand);
 commandMap.set(VoicePingCommand.data.name, VoicePingCommand);
 commandMap.set(ResponseCommand.data.name, ResponseCommand);
+commandMap.set(ReminderCommand.data.name, ReminderCommand);
 
-export { commandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, HeartboardCommand, VoicePingCommand };
+export { commandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, HeartboardCommand, VoicePingCommand };

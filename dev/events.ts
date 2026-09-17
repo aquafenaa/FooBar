@@ -1,10 +1,12 @@
 import { BaseMessageOptions, Channel, Client, EmbedBuilder, Events, GuildMember, Message, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, User } from 'discord.js';
+import cron from 'node-cron';
 
 import { commandMap } from './commands';
 import { generateMessage } from './chatbot';
 
 import { Command } from './types/bot';
-import { addResponseMessage, deleteChatbotShortTermMemory, deleteHeartBoardMessage, deleteResponseMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotShortTermMemory, isChatbotSubscriber, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, syncDatabase, updateHeartBoardMessage } from './data';
+import { addResponseMessage, deleteChatbotShortTermMemory, deleteHeartBoardMessage, deleteResponseMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotShortTermMemory, isChatbotSubscriber, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, syncDatabase, updateHeartBoardMessage } from './data';
+import { sendReminder } from './utils';
 
 const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boolean> | PartialMessage<boolean>, reaction: MessageReaction): BaseMessageOptions => {
   const authorName = author?.nickname ?? author?.displayName;
@@ -42,7 +44,8 @@ function clientEvents(discordClient: Client) {
 
     const guilds = await discordClient.guilds.fetch();
     guilds.forEach(async (guild) => {
-      const server = await discordClient.guilds.fetch(guild.id);
+      const guildID = guild.id;
+      const server = await discordClient.guilds.fetch(guildID);
       if (!server) return;
 
       // load all heartboard messages to cache
@@ -57,6 +60,17 @@ function clientEvents(discordClient: Client) {
         } catch {
           deleteHeartBoardMessage(server.id, heartboardMessage.board_name, heartboardMessage.message_id);
         }
+      });
+
+      // load reminders into cron scheduling
+      const reminders = getRemindersByServer(guildID);
+      reminders.forEach(async (reminder) => {
+        const outputChannel = await server.channels.fetch(reminder.channel_id);
+        if (!outputChannel) return;
+
+        cron.schedule(reminder.cron_schedule, () => sendReminder(outputChannel, guildID, reminder.reminder_name), {
+          name: `${reminder.server_id}${reminder.reminder_name}`,
+        });
       });
     });
   });
@@ -98,7 +112,7 @@ function clientEvents(discordClient: Client) {
     }
   });
 
-  const allowedServers = ['917588427959058462', '1064698336185172010', '708642778300547142', '1148069131711680633'];
+  const allowedServers = ['917588427959058462', '1064698336185172010', '708642778300547142', '1148069131711680633', '1547088936256671866'];
 
   // grok functionality, when message was sent
   discordClient.on(Events.MessageCreate, async (message) => {
@@ -238,7 +252,7 @@ function clientEvents(discordClient: Client) {
     });
   });
 
-  const acceptedEmojis = ['🩷', '❤️', '💛', '🧡', '💚', '🤍', '🩵', '💙'];
+  const acceptedEmojis = ['🩷', '❤️', '💛', '🧡', '💚', '🤍', '🩵', '💙', '💜'];
   // Heartboard reaction function
   const handleReaction = async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     const { message } = reaction;
@@ -251,7 +265,7 @@ function clientEvents(discordClient: Client) {
     const emojiString = reaction.emoji.toString();
     const totalReactions = reaction.count ?? 0;
 
-    if (emojiString === '🗑️' && user.id !== discordClient.user?.id && isResponseMessage(serverID, messageID)) {
+    if (emojiString === '🗑️' && !user.bot && isResponseMessage(serverID, messageID)) {
       try {
         deleteResponseMessage(serverID, messageID);
         message.delete();
