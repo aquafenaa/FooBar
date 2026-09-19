@@ -44,7 +44,7 @@ async function summarizeMemory(server_id: Snowflake, longTermMemory: ChatbotLong
   const longtermMemoryStr = longTermMemory.map((ltm) => `[${new Date(ltm.timestamp)}]: ${ltm.message_content}`).join('\n');
 
   const { text } = await generateText({
-    model: xai.responses('grok-4.6'),
+    model: xai.responses('grok-4.3'),
     prompt: longtermMemoryStr,
     system: `${summarizingPrompt}\n\n# PERSONALITY\n${chatbotData.chatbot_prompt}\n# CURRENT CORE MEMORY\n${chatbotData.chatbot_core_memory}`,
     headers: {
@@ -68,7 +68,7 @@ async function cullMemory(server_id: Snowflake, shortTermMemory: ChatbotShortTer
   }));
 
   const { text } = await generateText({
-    model: xai.responses('grok-4.6'),
+    model: xai.responses('grok-4.3'),
     system: cullingPrompt,
     prompt: grokInput,
     headers: {
@@ -172,7 +172,7 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
 
   try {
     const { text } = await generateText({
-      model: xai.responses('grok-4.5'),
+      model: xai.responses('grok-4.3'),
       system: `${basePrompt}\nCore Memory: ${coreMemory}\n}`,
       prompt: agentInput,
       reasoning: 'medium',
@@ -196,6 +196,9 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
       const thinkEndIndex = responseContent.indexOf('</think>') + '</think>'.length;
       responseContent = responseContent.substring(0, thinkStartIndex) + responseContent.substring(thinkEndIndex);
     }
+
+    // replace mass pings with invisible character to not have them actuated
+    responseContent = responseContent.replace('@everyone', '@​everyone').replace('@here', '@​here');
 
     testMemoryEncoding(serverID, longTermMemory, shortTermMemory);
     clearInterval(typingIndicator);
