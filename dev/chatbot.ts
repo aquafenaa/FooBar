@@ -11,15 +11,21 @@ import { ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable } from './types
 const promptPath = path.join(__dirname, '../data/SYSTEM.md');
 const { DISCORD_ID } = process.env;
 
-const longMemoryLength = 5; // number of messages allowed before being summarized to core memory
-const shortMemoryLength = 30; // number of messages allowed in short-term memory
+const longMemoryLength = 3; // number of messages allowed before being summarized to core memory
+const shortMemoryLength = 15; // number of messages allowed in short-term memory
 
-// prompt for summarizing long-term memory
-const summarizingPrompt = `You're foo, a chatbot on a Discord server. The following messages are summarizations of your experience on the server, stored in your long-term memory.
-Summarize these messages into a single message to act as your permanent/core memories. Format at as you'd like, however keep it concise, while still very meaningful.
-Make sure to keep information about your personality, and how you talk including what words you like to use and their meanings. Keep track of other members' personalities within the server, and your relationship with them.`;
+// prompt for summarizing long-term memory to core memory
+const summarizingPrompt = `The following messages are summarizations of your experience on the server, stored in your long-term memory.
+Summarize these messages into a single message to act as your permanent/core memories.
+Ensure token-dense, but meaningful. Drop anything minor, unrelevant, or incidental. Do not repeat anything in system prompt.
+Relevant information includes: 
+  - Your formed personality
+  - Your non-typical vocab
+  - Other members' personalities, and your relationship with them
+  - Other information you deem absolutely relevant.
+Keep under 4,000 characters absolute max.`;
 
-// prompt for summarizing short-term memory
+// prompt for summarizing short-term memory to long-term memory
 const cullingPrompt = `You're foo, a chatbot on a Discord server. The following messages are your short term memory. Summarize them to form your long-term memory.
 Only include the summarization, no preamble. Be as concise as possible, while still keeping important information. This will go into your long-term memory, and we wish to minimize tokens. Use bullet points to keep information concise.
 Please summarize the important information, and information that will most likely be relevant later. If you have information to add to a member's personality, then add it.
@@ -44,9 +50,10 @@ async function summarizeMemory(server_id: Snowflake, longTermMemory: ChatbotLong
   const longtermMemoryStr = longTermMemory.map((ltm) => `[${new Date(ltm.timestamp)}]: ${ltm.message_content}`).join('\n');
 
   const { text } = await generateText({
-    model: xai.responses('grok-4.3'),
+    model: xai.responses('grok-4.5'),
     prompt: longtermMemoryStr,
-    system: `${summarizingPrompt}\n\n# PERSONALITY\n${chatbotData.chatbot_prompt}\n# CURRENT CORE MEMORY\n${chatbotData.chatbot_core_memory}`,
+    reasoning: 'high',
+    system: `${summarizingPrompt}\n\n# SYSTEM PROMPT\n${chatbotData.chatbot_prompt}\n# CURRENT CORE MEMORY\n${chatbotData.chatbot_core_memory}`,
     headers: {
       'x-grok-conv-id': '917594803481489429',
     },
@@ -68,8 +75,9 @@ async function cullMemory(server_id: Snowflake, shortTermMemory: ChatbotShortTer
   }));
 
   const { text } = await generateText({
-    model: xai.responses('grok-4.3'),
+    model: xai.responses('grok-4.5'),
     system: cullingPrompt,
+    reasoning: 'medium',
     prompt: grokInput,
     headers: {
       'x-grok-conv-id': '917594803481489429',
