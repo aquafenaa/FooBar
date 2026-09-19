@@ -32,12 +32,13 @@ function getChatbot(server_id: Snowflake): ChatbotTable | undefined {
 }
 function upsertChatbot(chatbot: ChatbotTable): void {
   db.prepare(`
-    INSERT INTO Chatbot (server_id, chatbot_enabled, chatbot_core_memory)
-    VALUES (?, ?, ?)
+    INSERT INTO Chatbot (server_id, chatbot_enabled, chatbot_prompt, chatbot_core_memory)
+    VALUES (?, ?, ?, ?)
     ON CONFLICT(server_id) DO UPDATE SET
       chatbot_enabled = excluded.chatbot_enabled,
+      chatbot_prompt = excluded.chatbot_prompt,
       chatbot_core_memory = excluded.chatbot_core_memory
-  `).run(chatbot.server_id, chatbot.chatbot_enabled ? 1 : 0, chatbot.chatbot_core_memory);
+  `).run(chatbot.server_id, chatbot.chatbot_enabled ? 1 : 0, chatbot.chatbot_prompt, chatbot.chatbot_core_memory);
 }
 function deleteChatbot(server_id: Snowflake) {
   db.prepare('DELETE FROM Chatbot WHERE server_id = ?').run(server_id);

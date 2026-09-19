@@ -1,4 +1,4 @@
-import { AutocompleteInteraction, CommandInteraction, EmbedBuilder, ModalSubmitInteraction, SlashCommandBuilder, Snowflake } from 'discord.js';
+import { AutocompleteInteraction, CommandInteraction, EmbedBuilder, SlashCommandBuilder, Snowflake } from 'discord.js';
 
 // Configs--permanent data for various commands and features. stored in ./data/config.json
 
@@ -66,7 +66,6 @@ interface Command {
   // usage: string,
   data: SlashCommandBuilder | any, // any is for catching SlashCommandBuilders that omit certain, unused variables
   execute(interaction: CommandInteraction, serverID: Snowflake): Promise<void>,
-  handleModalSubmit?(interaction: ModalSubmitInteraction, serverID: Snowflake): Promise<void>,
   autocomplete?(interaction: AutocompleteInteraction, serverID: Snowflake): Promise<void>;
 }
 

@@ -24,6 +24,9 @@ If you would like to add this bot to your own server, feel free! If you encounte
     - [ ] Reminder / Message scheduler
     - [ ] Get profile / bio (?)
     - [ ] Play sounds in voice chat (?)
+  - [ ] Limit money hemorrhaging
+    - [ ] Allow ability to enable or disable tool calls per server
+    - [ ] Perhaps paid tiers for greater limits
 
 - [ ] Show ratings
   - Calculates average score of a show via user's reactions / interations

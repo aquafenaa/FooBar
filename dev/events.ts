@@ -88,10 +88,9 @@ function clientEvents(discordClient: Client) {
     const serverID: string = interaction.guild.id;
 
     if (interaction.isModalSubmit()) {
-      const command: Command = commandMap.get(interaction.customId)!;
-      if (!command.handleModalSubmit) return;
+      const parsedID = Array.from(interaction.customId.matchAll(/([a-z\-A-Z]+)_([a-z\-A-Z]+)/gm))[0];
+      if (!parsedID) return;
 
-      command.handleModalSubmit(interaction, serverID);
       return;
     }
 

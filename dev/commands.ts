@@ -2,7 +2,6 @@ import {
   ChatInputCommandInteraction,
   Snowflake, AutocompleteInteraction,
   EmbedBuilder, MessageFlags, SlashCommandBuilder,
-  ModalSubmitInteraction,
   ChannelType,
   PermissionFlagsBits,
   ModalBuilder,
@@ -42,10 +41,7 @@ const ChatbotCommand: ConfigCommand = {
     .addSubcommandGroup((coreMemoryGroup) => coreMemoryGroup.setName('core-memory')
       .setDescription('View, edit, and delete the longterm memory for the chatbot.')
       .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
-        .setDescription('Edit the core memory for the chatbot')
-        .addStringOption((textOption) => textOption.setName('memory-text')
-          .setDescription('The new content of the core memory.')
-          .setRequired(true)))
+        .setDescription('Edit the core memory for the chatbot'))
       .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View the current core memory.')))
     .addSubcommandGroup((longtermMemoryGroup) => longtermMemoryGroup.setName('longterm-memory')
       .setDescription('View, and delete the longterm memory for the chatbot.')
@@ -95,12 +91,31 @@ const ChatbotCommand: ConfigCommand = {
       }
 
       if (subcommand === 'edit') {
-        const memoryText = interaction.options.getString('memory-text');
+        const modalID = `core-memory:${interaction.id}`;
+        const coreMemoryModal = new ModalBuilder().setCustomId(modalID).setTitle('Set Core Memory');
 
-        chatbot.chatbot_core_memory = memoryText ?? '';
+        const paragraphID = `core-memory:paragraph:${interaction.id}`;
+        const coreMemoryParagraph = new TextInputBuilder()
+          .setCustomId(paragraphID)
+          .setStyle(TextInputStyle.Paragraph)
+          .setValue(chatbot.chatbot_core_memory ?? '')
+          .setMaxLength(4_000);
+        const coreMemoryLabel = new LabelBuilder().setLabel('Set the core memory for the bot.').setTextInputComponent(coreMemoryParagraph);
+
+        coreMemoryModal.addLabelComponents(coreMemoryLabel);
+
+        await interaction.showModal(coreMemoryModal);
+
+        const submitModal = await interaction.awaitModalSubmit({
+          time: 60_000 * 10, // 10 minutes
+          filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
+        });
+
+        const newCoreMemory = submitModal.fields.getTextInputValue(paragraphID);
+        chatbot.chatbot_core_memory = newCoreMemory;
         upsertChatbot(chatbot);
 
-        interaction.reply({ content: 'Successfully updated core memory', flags: MessageFlags.Ephemeral });
+        submitModal.reply({ content: 'Successfully updated server prompt!', flags: MessageFlags.Ephemeral });
         return;
       }
     }
@@ -195,10 +210,12 @@ const ChatbotCommand: ConfigCommand = {
           return;
         }
 
-        const promptModal = new ModalBuilder().setCustomId(ChatbotCommand.data.name).setTitle('Set System Prompt');
+        const modalID = `prompt:${interaction.id}`;
+        const promptModal = new ModalBuilder().setCustomId(modalID).setTitle('Set System Prompt');
 
+        const paragraphID = `prompt:paragraph:${interaction.id}`;
         const promptParagraph = new TextInputBuilder()
-          .setCustomId('chatbot-prompt')
+          .setCustomId(paragraphID)
           .setStyle(TextInputStyle.Paragraph)
           .setValue(chatbot.chatbot_prompt ?? '')
           .setMaxLength(4_000);
@@ -206,7 +223,19 @@ const ChatbotCommand: ConfigCommand = {
 
         promptModal.addLabelComponents(promptLabel);
 
-        interaction.showModal(promptModal);
+        await interaction.showModal(promptModal);
+
+        const submitModal = await interaction.awaitModalSubmit({
+          time: 60_000 * 10, // 10 minutes
+          filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
+        });
+
+        const newPrompt = submitModal.fields.getTextInputValue(paragraphID);
+
+        chatbot.chatbot_prompt = newPrompt;
+        upsertChatbot(chatbot);
+
+        submitModal.reply({ content: 'Successfully updated server prompt!', flags: MessageFlags.Ephemeral });
         return;
       }
       if (subcommand === 'delete') {
@@ -269,23 +298,31 @@ const ChatbotCommand: ConfigCommand = {
       interaction.reply({ content: 'Successfully deleted chatbot!', flags: MessageFlags.Ephemeral });
     }
   },
-  async handleModalSubmit(interaction: ModalSubmitInteraction, serverID: Snowflake) {
-    const chatbot = getChatbot(serverID);
-    if (!chatbot) {
-      interaction.reply({ content: 'There is no chatbot in the server! Please add one with /chatbot create', flags: MessageFlags.Ephemeral });
-      return;
-    }
+  // async handleModalSubmit(interaction: ModalSubmitInteraction, subcommandName: string | undefined, serverID: Snowflake) {
+  //   const chatbot = getChatbot(serverID);
+  //   if (!chatbot) {
+  //     interaction.reply({ content: 'There is no chatbot in the server! Please add one with /chatbot create', flags: MessageFlags.Ephemeral });
+  //     return;
+  //   }
 
-    const newPrompt = interaction.fields.getTextInputValue('chatbot-prompt');
+  //   if (subcommandName === 'core-memory') {
+  //     const newMemory = interaction.fields.getTextInputValue(`chatbot-corememory-${serverID}`);
+  //     console.log(newMemory);
 
-    if (newPrompt === '') {
-      interaction.reply({ content: 'You must add some text to the new prompt!', flags: MessageFlags.Ephemeral });
-      return;
-    }
+  //     setChatbotPrompt(serverID, newMemory);
+  //     interaction.reply({ content: 'Successfully updated core memory!', flags: MessageFlags.Ephemeral });
+  //   } else if (subcommandName === 'prompt') {
+  //     const newPrompt = interaction.fields.getTextInputValue(`chatbot-prompt-${serverID}`);
 
-    setChatbotPrompt(serverID, newPrompt);
-    interaction.reply({ content: 'Successfully updated prompt!', flags: MessageFlags.Ephemeral });
-  },
+  //     if (newPrompt === '') {
+  //       interaction.reply({ content: 'You must add some text to the new prompt!', flags: MessageFlags.Ephemeral });
+  //       return;
+  //     }
+
+  //     setChatbotPrompt(serverID, newPrompt);
+  //     interaction.reply({ content: 'Successfully updated prompt!', flags: MessageFlags.Ephemeral });
+  //   }
+  // },
   configEmbedBuilder(serverID: Snowflake, chatbot: ChatbotTable) {
     if (!chatbot) {
       return new EmbedBuilder()
@@ -1003,7 +1040,7 @@ const ResponseCommand: ConfigCommand = {
         { name: 'Status', value: automaticResponse.enabled ? 'Enabled' : 'Disabled' },
         { name: 'Activation Phrase', value: automaticResponse.activation_regex },
         { name: 'Capture Regex', value: automaticResponse.capture_regex },
-        { name: 'Output Channel', value: automaticResponse.output_template.replace('https://', 'https​://') }, // invsible character to stop {1} displaying as %7B1%7D in link
+        { name: 'Output Channel', value: automaticResponse.output_template.replace('https://', 'https​://') }, // invisible character to stop "{1}" displaying as "%7B1%7D" in link
       ]);
   },
 };
