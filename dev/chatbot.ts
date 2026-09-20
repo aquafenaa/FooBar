@@ -42,6 +42,7 @@ async function summarizeMemory(server_id: Snowflake, longTermMemory: ChatbotLong
     chatbotData = {
       server_id,
       chatbot_enabled: false,
+      tools_enabled: false,
       chatbot_prompt: await getDefaultSystemPrompt(),
       chatbot_core_memory: '',
     };
@@ -184,13 +185,14 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
       system: `${basePrompt}\nCore Memory: ${coreMemory}\n}`,
       prompt: agentInput,
       reasoning: 'medium',
-      temperature: 1.2,
-      tools: {
+      temperature: 1.1,
+      tools: chatbot.tools_enabled ? {
+        // web_search: xai.tools.webSearch(),
         web_search: xai.tools.webSearch(),
         x_search: xai.tools.xSearch(),
         code_execution: xai.tools.codeExecution(),
         // view_image: xai.tools.viewImage(),
-      },
+      } : undefined,
       headers: {
         'x-grok-conv-id': '917594803481489429',
       },

@@ -59,6 +59,7 @@ interface ChatbotTable {
   server_id: Snowflake,
 
   chatbot_enabled: boolean,
+  tools_enabled: boolean,
   chatbot_prompt: string,
   chatbot_core_memory: string;
 }

@@ -32,13 +32,14 @@ function getChatbot(server_id: Snowflake): ChatbotTable | undefined {
 }
 function upsertChatbot(chatbot: ChatbotTable): void {
   db.prepare(`
-    INSERT INTO Chatbot (server_id, chatbot_enabled, chatbot_prompt, chatbot_core_memory)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, chatbot_prompt, chatbot_core_memory)
+    VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(server_id) DO UPDATE SET
       chatbot_enabled = excluded.chatbot_enabled,
+      tools_enabled = excluded.tools_enabled,
       chatbot_prompt = excluded.chatbot_prompt,
       chatbot_core_memory = excluded.chatbot_core_memory
-  `).run(chatbot.server_id, chatbot.chatbot_enabled ? 1 : 0, chatbot.chatbot_prompt, chatbot.chatbot_core_memory);
+  `).run(chatbot.server_id, chatbot.chatbot_enabled ? 1 : 0, chatbot.chatbot_prompt, chatbot.tools_enabled ? 1 : 0, chatbot.chatbot_core_memory);
 }
 function deleteChatbot(server_id: Snowflake) {
   db.prepare('DELETE FROM Chatbot WHERE server_id = ?').run(server_id);
@@ -395,7 +396,11 @@ const syncDatabase = db.transaction(() => {
     db.pragma('user_version = 2');
   }
   if (currentVersion < 3) {
-    db.exec(schema);
+    // TODO: ADD tools_enabled (& prompt) TO ALL CHATBOT FUNCTIONS
+    db.prepare('ALTER TABLE Chatbot ADD COLUMN tools_enabled BOOLEAN;').run();
+    db.prepare('UPDATE Chatbot SET tools_enabled = 0').run();
+
+    db.pragma('user_version = 3');
   }
 });
 

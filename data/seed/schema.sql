@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS Chatbot(
   server_id VARCHAR(20) PRIMARY KEY REFERENCES Server(server_id) ON DELETE CASCADE,
 
   chatbot_enabled BOOLEAN,
+  tools_enabled BOOLEAN,
   chatbot_prompt TEXT,
   chatbot_core_memory TEXT
 );

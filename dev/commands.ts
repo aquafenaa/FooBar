@@ -30,6 +30,9 @@ const ChatbotCommand: ConfigCommand = {
       .setDescription('Create the chatbot for a server that doesn\'t currently have one.'))
     .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete')
       .setDescription('Remove the chatbot for a server that already has one.'))
+    .addSubcommand((toolSubcommand) => toolSubcommand.setName('tools').setDescription('Whether the bot is able to use tools or not')
+      .addBooleanOption((enabledOption) => enabledOption.setName('enable').setDescription('Enable or disable tool use. True = Enable, False = Disable')
+        .setRequired(true)))
     .addSubcommandGroup((promptSubcommandGroup) => promptSubcommandGroup.setName('prompt')
       .setDescription('Set or delete the system prompt for the chatbot.')
       .addSubcommand((setPromptSubcommand) => setPromptSubcommand.setName('set')
@@ -269,6 +272,29 @@ const ChatbotCommand: ConfigCommand = {
       interaction.reply({ content: 'Successfully deleted all short term memories!', flags: MessageFlags.Ephemeral });
       return;
     }
+    if (subcommand === 'tools') {
+      const enabledOption = interaction.options.getBoolean('enable')!;
+      const chatbot = getChatbot(serverID);
+
+      if (!chatbot) {
+        interaction.reply({ content: 'There is no chatbot in this server! Try making one with /chatbot create', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (enabledOption && chatbot.tools_enabled) {
+        interaction.reply({ content: 'Tools are already enabled in this server!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (!enabledOption && !chatbot.tools_enabled) {
+        interaction.reply({ content: 'Tools are already disabled in this server!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      chatbot.tools_enabled = enabledOption;
+      upsertChatbot(chatbot);
+      interaction.reply({ content: 'Successfully updated the chatbot!', flags: MessageFlags.Ephemeral });
+      return;
+    }
     if (subcommand === 'create') {
       const chatbot = getChatbot(serverID);
       if (chatbot) {
@@ -279,6 +305,7 @@ const ChatbotCommand: ConfigCommand = {
       upsertChatbot({
         server_id: serverID,
         chatbot_enabled: false,
+        tools_enabled: false,
         chatbot_prompt: await getDefaultSystemPrompt(),
         chatbot_core_memory: '',
       });
@@ -298,31 +325,6 @@ const ChatbotCommand: ConfigCommand = {
       interaction.reply({ content: 'Successfully deleted chatbot!', flags: MessageFlags.Ephemeral });
     }
   },
-  // async handleModalSubmit(interaction: ModalSubmitInteraction, subcommandName: string | undefined, serverID: Snowflake) {
-  //   const chatbot = getChatbot(serverID);
-  //   if (!chatbot) {
-  //     interaction.reply({ content: 'There is no chatbot in the server! Please add one with /chatbot create', flags: MessageFlags.Ephemeral });
-  //     return;
-  //   }
-
-  //   if (subcommandName === 'core-memory') {
-  //     const newMemory = interaction.fields.getTextInputValue(`chatbot-corememory-${serverID}`);
-  //     console.log(newMemory);
-
-  //     setChatbotPrompt(serverID, newMemory);
-  //     interaction.reply({ content: 'Successfully updated core memory!', flags: MessageFlags.Ephemeral });
-  //   } else if (subcommandName === 'prompt') {
-  //     const newPrompt = interaction.fields.getTextInputValue(`chatbot-prompt-${serverID}`);
-
-  //     if (newPrompt === '') {
-  //       interaction.reply({ content: 'You must add some text to the new prompt!', flags: MessageFlags.Ephemeral });
-  //       return;
-  //     }
-
-  //     setChatbotPrompt(serverID, newPrompt);
-  //     interaction.reply({ content: 'Successfully updated prompt!', flags: MessageFlags.Ephemeral });
-  //   }
-  // },
   configEmbedBuilder(serverID: Snowflake, chatbot: ChatbotTable) {
     if (!chatbot) {
       return new EmbedBuilder()
@@ -333,6 +335,7 @@ const ChatbotCommand: ConfigCommand = {
       .setTitle('Chatbot settings')
       .addFields(
         { name: 'Enabled', value: (chatbot?.chatbot_enabled ? 'Yes' : 'No') },
+        { name: 'Tools Enabled', value: (chatbot?.tools_enabled ? 'Yes' : 'No') },
       );
   },
 };
