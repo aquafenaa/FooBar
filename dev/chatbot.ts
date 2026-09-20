@@ -187,11 +187,9 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
       reasoning: 'medium',
       temperature: 1.1,
       tools: chatbot.tools_enabled ? {
-        // web_search: xai.tools.webSearch(),
         web_search: xai.tools.webSearch(),
         x_search: xai.tools.xSearch(),
         code_execution: xai.tools.codeExecution(),
-        // view_image: xai.tools.viewImage(),
       } : undefined,
       headers: {
         'x-grok-conv-id': '917594803481489429',

@@ -118,7 +118,7 @@ const ChatbotCommand: ConfigCommand = {
         chatbot.chatbot_core_memory = newCoreMemory;
         upsertChatbot(chatbot);
 
-        submitModal.reply({ content: 'Successfully updated server prompt!', flags: MessageFlags.Ephemeral });
+        submitModal.reply({ content: 'Successfully updated core memory!', flags: MessageFlags.Ephemeral });
         return;
       }
     }
