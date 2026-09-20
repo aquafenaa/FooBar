@@ -26,7 +26,9 @@ If you would like to add this bot to your own server, feel free! If you encounte
     - [ ] Play sounds in voice chat (?)
   - [ ] Limit money hemorrhaging
     - [ ] Allow ability to enable or disable tool calls per server
+    - [ ] Check "relevancy" via top-k embedding similarity
     - [ ] Perhaps paid tiers for greater limits
+    - [ ] Give k characters as context, not simply n messages
 
 - [ ] Show ratings
   - Calculates average score of a show via user's reactions / interations
