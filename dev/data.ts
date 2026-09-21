@@ -7,6 +7,7 @@ import { readFileSync } from 'fs';
 import { AutomaticResponseTable, ReminderTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable } from './types/schema';
 import { ConfigData, ServerConfig, ServerData } from './types/bot';
 import { getDefaultSystemPrompt } from './chatbot';
+import { fromBlob, toBlob } from './utils';
 
 const schemaPath = path.join(__dirname, '../data/seed/schema.sql');
 const schema = readFileSync(schemaPath, 'utf-8');
@@ -87,14 +88,36 @@ function deleteNOldestLongTermMemories(server_id: Snowflake, n: number): void {
 function getChatbotShortTermMemoriesByServer(server_id: Snowflake): ChatbotShortTermMemoryTable[] {
   // NOTE: Ordered by timestamp for prompt feeding
   return db.prepare('SELECT * FROM ChatbotShortTermMemory WHERE server_id = ? ORDER BY timestamp ASC')
-    .all(server_id) as ChatbotShortTermMemoryTable[];
+    .all(server_id).map((s: any) => ({
+      server_id: s.server_id,
+      message_id: s.message_id,
+      reference_id: s.reference_id,
+      embedding: fromBlob(s.embedding),
+      author_name: s.author_name,
+      author_id: s.author_id,
+      role: s.role,
+      message_content: s.message_content,
+      timestamp: s.timestamp,
+    })) as ChatbotShortTermMemoryTable[];
 }
 function isChatbotShortTermMemory(server_id: Snowflake, message_id: Snowflake): boolean {
   return db.prepare('SELECT * FROM ChatbotShortTermMemory WHERE server_id = ? AND message_id = ?').get(server_id, message_id) !== undefined;
 }
 function insertChatbotShortTermMemory(memory: ChatbotShortTermMemoryTable): void {
-  db.prepare('INSERT OR IGNORE INTO ChatbotShortTermMemory (server_id, message_id, reference_id, author_name, author_id, role, message_content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(memory.server_id, memory.message_id, memory.reference_id, memory.author_name, memory.author_id, memory.role, memory.message_content, memory.timestamp);
+  db.prepare(`INSERT OR IGNORE INTO ChatbotShortTermMemory 
+    (server_id, message_id, reference_id, author_name, author_id, role, message_content, timestamp, embedding) 
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      memory.server_id,
+      memory.message_id,
+      memory.reference_id,
+      memory.author_name,
+      memory.author_id,
+      memory.role,
+      memory.message_content,
+      memory.timestamp,
+      toBlob(memory.embedding) ?? null,
+    );
 }
 function deleteChatbotShortTermMemory(server_id: Snowflake, message_id: Snowflake): void {
   db.prepare('DELETE FROM ChatbotShortTermMemory WHERE server_id = ? AND message_id = ?').run(server_id, message_id);
@@ -375,8 +398,8 @@ const syncDatabase = db.transaction(() => {
     });
   }
   if (currentVersion < 2) {
-    db.prepare('ALTER TABLE Chatbot ADD COLUMN chatbot_prompt TEXT;').run();
-    db.prepare('DROP TABLE ChatbotShortTermMemory;').run();
+    db.prepare('ALTER TABLE Chatbot ADD COLUMN chatbot_prompt TEXT').run();
+    db.prepare('DROP TABLE ChatbotShortTermMemory').run();
     db.exec(schema);
 
     const servers = getAllServers();
@@ -396,11 +419,14 @@ const syncDatabase = db.transaction(() => {
     db.pragma('user_version = 2');
   }
   if (currentVersion < 3) {
-    // TODO: ADD tools_enabled (& prompt) TO ALL CHATBOT FUNCTIONS
-    db.prepare('ALTER TABLE Chatbot ADD COLUMN tools_enabled BOOLEAN;').run();
+    db.prepare('ALTER TABLE Chatbot ADD COLUMN tools_enabled BOOLEAN').run();
     db.prepare('UPDATE Chatbot SET tools_enabled = 0').run();
 
     db.pragma('user_version = 3');
+  }
+  if (currentVersion < 4) {
+    db.prepare('ALTER TABLE ChatbotShortTermMemory ADD COLUMN embedding BLOB').run();
+    db.pragma('user_version = 4');
   }
 });
 

@@ -3,6 +3,7 @@ import {
 } from 'discord.js';
 import path from 'node:path';
 
+import { OpenAI } from 'openai';
 import { commandMap } from './commands';
 import clientEvents from './events';
 
@@ -29,7 +30,11 @@ const discordClient = new Client({
   ],
 });
 
+const openAIClient = new OpenAI();
+
 discordClient.login(DISCORD_TOKEN);
 
 clientEvents(discordClient);
 startup();
+
+export { discordClient, openAIClient };
