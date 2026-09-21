@@ -55,6 +55,17 @@ CREATE TABLE IF NOT EXISTS HeartBoardMessage(
   PRIMARY KEY (server_id, board_name, message_id)
 );
 
+-- CREATE TABLE IF NOT EXISTS VectorEmbedding(
+--   server_id VARCHAR(20) NOT NULL,
+--   stm_id VARCHAR(20) NOT NULL,
+
+--   embedding BLOB NOT NULL,
+
+--   PRIMARY KEY (server_id, stm_id),
+--   FOREIGN KEY (server_id) REFERENCES Server(server_id) ON DELETE CASCADE,
+--   FOREIGN KEY (server_id, stm_id) REFERENCES ChatbotShortTermMemory(server_id, stm_id) ON DELETE CASCADE,
+-- );
+
 CREATE TABLE IF NOT EXISTS VoicePing(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
   voiceping_name TEXT NOT NULL,
@@ -103,6 +114,7 @@ CREATE TABLE IF NOT EXISTS ChatbotShortTermMemory(
 
   author_name VARCHAR(40) NOT NULL,
   author_id VARCHAR(20) NOT NULL,
+  embedding BLOB,
   
   role VARCHAR (9),
   message_content VARCHAR(2000),

@@ -38,4 +38,26 @@ function sendReminder(outputChannel: Channel, serverID: string, reminderName: st
   }
 }
 
-export { discordToDate, dateToCron, inputToSchedule, sendReminder };
+function dotProduct(vecA: number[], vecB: number[]) {
+  let sum = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    sum += vecA[i] * vecB[i];
+  }
+
+  return sum;
+}
+
+function toBlob(vector: number[] | undefined) {
+  if (!vector) return undefined;
+
+  const f32 = Float32Array.from(vector);
+  return Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength);
+}
+function fromBlob(blob: Buffer | undefined) {
+  if (!blob) return undefined;
+  // slice() copies into a fresh ArrayBuffer, which guarantees 4-byte alignment
+  const f32 = new Float32Array(blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength));
+  return Array.from(f32);
+}
+
+export { discordToDate, dateToCron, inputToSchedule, sendReminder, dotProduct, toBlob, fromBlob };

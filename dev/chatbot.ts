@@ -7,12 +7,14 @@ import { readFile } from 'fs/promises';
 
 import { deleteNOldestLongTermMemories, deleteNOldestShortTermMemory, getChatbot, getChatbotLongTermMemoriesByServer, getChatbotShortTermMemoriesByServer, insertChatbotLongTermMemory, insertChatbotShortTermMemory, upsertChatbot } from './data';
 import { ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable } from './types/schema';
+import { openAIClient } from '.';
+import { dotProduct } from './utils';
 
 const promptPath = path.join(__dirname, '../data/SYSTEM.md');
 const { DISCORD_ID } = process.env;
 
 const longMemoryLength = 3; // number of messages allowed before being summarized to core memory
-const shortMemoryLength = 15; // number of messages allowed in short-term memory
+const shortMemoryLength = 30; // number of messages allowed in short-term memory
 
 // prompt for summarizing long-term memory to core memory
 const summarizingPrompt = `The following messages are summarizations of your experience on the server, stored in your long-term memory.
@@ -109,6 +111,39 @@ async function testMemoryEncoding(server_id: Snowflake, longTermMemory: ChatbotL
   }
 }
 
+async function getEmbedding(shortTermMemory: string | ChatbotShortTermMemoryTable): Promise<number[]> {
+  const inputText = typeof shortTermMemory === 'string'
+    ? shortTermMemory
+    : shortTermMemory.message_content;
+
+  const embedding = await openAIClient.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: inputText,
+    encoding_format: 'float',
+  });
+
+  return embedding.data[0].embedding;
+}
+
+// get k messages in shortTermMemory that are most similar to the target messages
+async function getTopMatches(targetMessage: ChatbotShortTermMemoryTable, shortTermMemory: ChatbotShortTermMemoryTable[], k: number = 8): Promise<ChatbotShortTermMemoryTable[]> {
+  // creates a list of each STMs dot product with targetMessage, in ascending order, then gets top k results
+  const topScoredMessages = (await Promise.all(shortTermMemory.map(async (stm) => (
+    {
+      id: stm.message_id,
+      dot: dotProduct(
+        stm.embedding !== undefined ? stm.embedding : await getEmbedding(stm.message_content),
+        targetMessage.embedding!,
+      ),
+    }
+  ))))
+    .sort((a, b) => b.dot - a.dot) // ascending order
+    .slice(0, k)                   // top k results
+    .map((stm) => stm.id);         // map back to only ids
+
+  return shortTermMemory.filter((stm) => topScoredMessages.includes(stm.message_id));
+}
+
 async function generateMessage(discordClient: Client<boolean>, serverID: Snowflake, typingIndicator: NodeJS.Timeout, userMessage: Message<boolean>, authorNick: string | null, userContent: string, messageReference: Message<boolean> | undefined, context: Message<boolean>[]): Promise<string> {
   const chatbot = getChatbot(serverID)!;
   const basePrompt = chatbot.chatbot_prompt;
@@ -121,50 +156,60 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
 
     // add messages to short term memory
     shortTermMemory.push(
-      ...context
-        .map((m) => ({
+      ...(await Promise.all(
+        context.map(async (m) => ({
+          server_id: serverID,
           role: m.author.id === discordClient.user!.id ? 'assistant' : 'user',
           author_name: m.author.displayName,
           author_id: m.author.id,
           message_id: m.id,
+          embedding: await getEmbedding(m.content),
           message_content: m.content,
           timestamp: m.createdTimestamp,
         } as ChatbotShortTermMemoryTable)),
+      )),
     );
   }
 
-  if (messageReference) {
-    if (!shortTermMemory.find((stm) => messageReference.id === stm.message_id)) {
-      // add referenced message to beginning to local STM array for reference
-      shortTermMemory.unshift({
-        role: messageReference.author.id === discordClient.user?.id ? 'assistant' : 'user',
-        server_id: serverID,
-        timestamp: messageReference.createdTimestamp,
-
-        author_id: messageReference.author.id,
-        author_name: messageReference.author.displayName,
-
-        message_content: messageReference.content,
-        message_id: messageReference.id,
-      });
-    }
-  }
-
-  // add most recent message to end
-  shortTermMemory.push({
+  const userSTM: ChatbotShortTermMemoryTable = {
     server_id: serverID,
     role: 'user',
     author_name: userMessage.author.displayName,
     author_id: userMessage.author.id,
     message_id: userMessage.id,
+    embedding: await getEmbedding(userContent),
     reference_id: messageReference?.id ?? undefined,
     timestamp: userMessage.createdTimestamp,
     message_content: userContent,
-  });
+  };
+
+  const relevantMessages = await getTopMatches(userSTM, shortTermMemory, 8);
+
+  shortTermMemory.push(userSTM);
+  relevantMessages.push(userSTM);
+
+  if (messageReference) {
+    if (!shortTermMemory.find((stm) => messageReference.id === stm.message_id)) {
+      // add referenced message to beginning to local STM array for reference
+      const referenceSTM: ChatbotShortTermMemoryTable = {
+        role: messageReference.author.id === discordClient.user?.id ? 'assistant' : 'user',
+        server_id: serverID,
+        timestamp: messageReference.createdTimestamp,
+        author_id: messageReference.author.id,
+        author_name: messageReference.author.displayName,
+        embedding: await getEmbedding(messageReference.content),
+        message_content: messageReference.content,
+        message_id: messageReference.id,
+      };
+
+      shortTermMemory.unshift(referenceSTM);
+      relevantMessages.unshift(referenceSTM);
+    }
+  }
 
   const agentInput: ModelMessage[] = [
     // Rest of messages at end, reformatted
-    ...shortTermMemory.map((msg) => ({
+    ...relevantMessages.map((msg) => ({
       role: msg.role,
       content: `<msg user_id="${msg.author_id}" name="${msg.author_name}"${authorNick ? ` nick="${authorNick}"` : ''} id="${msg.message_id}"${msg.reference_id ? ` references="${msg.reference_id}"` : ''} time="${new Date(msg.timestamp).toLocaleString()}">${msg.message_content}</msg>`,
     })),
@@ -181,10 +226,10 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
 
   try {
     const { text } = await generateText({
-      model: xai.responses('grok-4.3'),
+      model: xai.responses('grok-4.5'),
       system: `${basePrompt}\nCore Memory: ${coreMemory}\n}`,
       prompt: agentInput,
-      reasoning: 'medium',
+      reasoning: 'low',
       temperature: 1.1,
       tools: chatbot.tools_enabled ? {
         web_search: xai.tools.webSearch(),

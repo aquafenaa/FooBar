@@ -78,6 +78,8 @@ interface ChatbotShortTermMemoryTable {
   message_id: Snowflake,
   reference_id?: Snowflake,
 
+  embedding: number[] | undefined,
+
   author_name: string,
   author_id: Snowflake,
   role: 'system' | 'user' | 'assistant',
