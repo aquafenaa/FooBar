@@ -6,7 +6,7 @@ import { xai } from '@ai-sdk/xai';
 import { readFile } from 'fs/promises';
 
 import { deleteNOldestLongTermMemories, deleteNOldestShortTermMemory, getChatbot, getChatbotLongTermMemoriesByServer, getChatbotShortTermMemoriesByServer, insertChatbotLongTermMemory, insertChatbotShortTermMemory, upsertChatbot } from './data';
-import { ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable } from './types/schema';
+import { ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, ChatbotTable } from './types/schema';
 import { openAIClient } from '.';
 import { dotProduct } from './utils';
 
@@ -14,18 +14,51 @@ const promptPath = path.join(__dirname, '../data/SYSTEM.md');
 const { DISCORD_ID } = process.env;
 
 const longMemoryLength = 3; // number of messages allowed before being summarized to core memory
-const shortMemoryLength = 30; // number of messages allowed in short-term memory
+const shortMemoryLength = 60; // number of messages allowed in short-term memory
 
 // prompt for summarizing long-term memory to core memory
-const summarizingPrompt = `The following messages are summarizations of your experience on the server, stored in your long-term memory.
-Summarize these messages into a single message to act as your permanent/core memories.
-Ensure token-dense, but meaningful. Drop anything minor, unrelevant, or incidental. Do not repeat anything in system prompt.
-Relevant information includes: 
-  - Your formed personality
-  - Your non-typical vocab
-  - Other members' personalities, and your relationship with them
-  - Other information you deem absolutely relevant.
-Keep under 4,000 characters absolute max.`;
+const summarizingPrompt = `You maintain your own long-term memory of a Discord server. You'll receive your CURRENT CORE MEMORY (possibly empty) and NEW MEMORIES since the last update. Produce the UPDATED CORE MEMORY: a small, curated set of facts that will most improve how you talk to these people in the future. It is not an archive. Forgetting is expected and good.
+
+THE TEST for every line: "If I forgot this, would my future replies be noticeably worse?" If not, drop it.
+
+KEEP, in priority order:
+1. Stable facts about people: names/nicknames, things they told you about themselves, standing preferences, running jokes with them, and how you relate to them (close, teasing, wary...).
+2. Your established voice: recurring phrases, slang, quirks, and opinions you've committed to. Only those that recur or clearly define you.
+3. Open threads: promises, planned events, and ongoing situations that are still unresolved.
+4. Server norms or in-jokes that people actually reference more than once.
+
+DROP:
+- One-off events and small talk with no lasting consequence.
+- Anything resolved, or events whose date has passed.
+- Details mentioned once and never reinforced.
+- Anything restating the PERSONA below.
+- Exact quotes, unless the phrase itself is the memory.
+- Duplicates: merge them and keep the most specific, most recent version.
+
+MERGING:
+- Start from CURRENT CORE MEMORY and update it using NEW MEMORIES. If new info contradicts an old entry, keep only the new one.
+- Do not keep an entry just because it was already there. Old entries that nothing reinforces and that are low value should be removed.
+
+FORMAT (plain text, terse fragments, no filler words):
+VOICE: max 6 short items.
+PEOPLE: one line per person: "name: traits; relationship; key facts". Max 12 people, ~200 chars each. If there are more, keep those who interact with you most.
+OPEN THREADS: max 5.
+SERVER: max 5.
+
+Example of a bad line: "Sam said on Tuesday he had pizza and was tired."
+Example of a good line: "Sam: night owl, dev; loves puns, you tease each other about them."
+
+LENGTH: aim for about 1,800 characters. Never exceed 3,000. If you're over, cut lowest-value lines first: SERVER, then details on less active people, then VOICE items, and OPEN THREADS last.
+
+Output only the updated core memory, with no preamble.
+
+PERSONA (do not restate): {{persona}}
+
+CURRENT CORE MEMORY:
+{{core_memory}}
+
+NEW MEMORIES:
+{{new_memories}}`;
 
 // prompt for summarizing short-term memory to long-term memory
 const cullingPrompt = `You're foo, a chatbot on a Discord server. The following messages are your short term memory. Summarize them to form your long-term memory.
@@ -33,15 +66,24 @@ Only include the summarization, no preamble. Be as concise as possible, while st
 Please summarize the important information, and information that will most likely be relevant later. If you have information to add to a member's personality, then add it.
 Do not restate any information. It will stay as a list for you to read in the future. Keep it to 200 words or less.`;
 
+function getSummarizationPrompt(chatbot: ChatbotTable, longTermMemory: ChatbotLongTermMemoryTable[]): string {
+  const longtermMemoryStr = longTermMemory.map((ltm) => `[${new Date(ltm.timestamp)}]: ${ltm.message_content}`).join('\n');
+
+  return summarizingPrompt
+    .replace('{{persona}}', chatbot.chatbot_prompt)
+    .replace('{{core_memory}}', chatbot.chatbot_core_memory)
+    .replace('{{new_memories}}', longtermMemoryStr);
+}
+
 async function getDefaultSystemPrompt(): Promise<string> {
   return (await readFile(promptPath, 'utf-8')).replace('<discord-id>', DISCORD_ID ?? 'undefined');
 }
 
 async function summarizeMemory(server_id: Snowflake, longTermMemory: ChatbotLongTermMemoryTable[]) {
-  let chatbotData = getChatbot(server_id);
+  let chatbot = getChatbot(server_id);
 
-  if (!chatbotData) {
-    chatbotData = {
+  if (!chatbot) {
+    chatbot = {
       server_id,
       chatbot_enabled: false,
       tools_enabled: false,
@@ -53,21 +95,22 @@ async function summarizeMemory(server_id: Snowflake, longTermMemory: ChatbotLong
   const longtermMemoryStr = longTermMemory.map((ltm) => `[${new Date(ltm.timestamp)}]: ${ltm.message_content}`).join('\n');
 
   const { text } = await generateText({
-    model: xai.responses('grok-4.5'),
+    model: xai.responses('grok-4.3'),
     prompt: longtermMemoryStr,
     reasoning: 'high',
-    system: `${summarizingPrompt}\n\n# SYSTEM PROMPT\n${chatbotData.chatbot_prompt}\n# CURRENT CORE MEMORY\n${chatbotData.chatbot_core_memory}`,
+    temperature: 0.3,
+    system: getSummarizationPrompt(chatbot, longTermMemory),
     headers: {
       'x-grok-conv-id': '917594803481489429',
     },
   });
 
-  deleteNOldestLongTermMemories(server_id, longTermMemory.length - 2); // clear long-term memory, leaving 2 most recent entries
+  deleteNOldestLongTermMemories(server_id, longTermMemory.length - 1); // clear long-term memory, leaving 1 most recent entries
 
   const updatedCoreMemory = text ?? '';
-  chatbotData.chatbot_core_memory = updatedCoreMemory;
+  chatbot.chatbot_core_memory = updatedCoreMemory;
 
-  upsertChatbot(chatbotData);
+  upsertChatbot(chatbot);
 }
 
 // asks grok to summarize short-term memory to become long-term memory, and then long-term memory to bco
@@ -78,9 +121,10 @@ async function cullMemory(server_id: Snowflake, shortTermMemory: ChatbotShortTer
   }));
 
   const { text } = await generateText({
-    model: xai.responses('grok-4.5'),
+    model: xai.responses('grok-4.3'),
     system: cullingPrompt,
     reasoning: 'medium',
+    temperature: 0.3,
     prompt: grokInput,
     headers: {
       'x-grok-conv-id': '917594803481489429',
@@ -151,26 +195,6 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
   const longTermMemory = getChatbotLongTermMemoriesByServer(serverID);
   const shortTermMemory = getChatbotShortTermMemoriesByServer(serverID);
 
-  if (context) {
-    context = context.filter((m1) => (shortTermMemory.findIndex((m2) => m1.createdTimestamp === m2.timestamp)) === -1).sort((m) => m.createdTimestamp).reverse(); // filter out duplicate context messages
-
-    // add messages to short term memory
-    shortTermMemory.push(
-      ...(await Promise.all(
-        context.map(async (m) => ({
-          server_id: serverID,
-          role: m.author.id === discordClient.user!.id ? 'assistant' : 'user',
-          author_name: m.author.displayName,
-          author_id: m.author.id,
-          message_id: m.id,
-          embedding: await getEmbedding(m.content),
-          message_content: m.content,
-          timestamp: m.createdTimestamp,
-        } as ChatbotShortTermMemoryTable)),
-      )),
-    );
-  }
-
   const userSTM: ChatbotShortTermMemoryTable = {
     server_id: serverID,
     role: 'user',
@@ -183,10 +207,35 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
     message_content: userContent,
   };
 
-  const relevantMessages = await getTopMatches(userSTM, shortTermMemory, 8);
+  // find messages most related to our user message
+  const relevantMessages = await getTopMatches(userSTM, shortTermMemory, 3);
 
   shortTermMemory.push(userSTM);
   relevantMessages.push(userSTM);
+
+  // get 5 most recent messages from current channel, and add them to both arrays
+  if (context) {
+    context = context.filter((m1) => (shortTermMemory.findIndex((m2) => m1.createdTimestamp === m2.timestamp)) === -1).sort((m) => m.createdTimestamp).reverse(); // filter out duplicate context messages
+
+    // add messages to short term memory
+    const referenceSTMs: ChatbotShortTermMemoryTable[] = (
+      await Promise.all(
+        context.map(async (m) => ({
+          server_id: serverID,
+          role: m.author.id === discordClient.user!.id ? 'assistant' : 'user',
+          author_name: m.author.displayName,
+          author_id: m.author.id,
+          message_id: m.id,
+          embedding: await getEmbedding(m.content),
+          message_content: m.content,
+          timestamp: m.createdTimestamp,
+        } as ChatbotShortTermMemoryTable)),
+      )
+    );
+
+    shortTermMemory.push(...referenceSTMs);
+    relevantMessages.push(...referenceSTMs);
+  }
 
   if (messageReference) {
     if (!shortTermMemory.find((stm) => messageReference.id === stm.message_id)) {
@@ -207,6 +256,9 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
     }
   }
 
+  // sort by timestamp
+  relevantMessages.sort((msg1, msg2) => msg1.timestamp - msg2.timestamp);
+
   const agentInput: ModelMessage[] = [
     // Rest of messages at end, reformatted
     ...relevantMessages.map((msg) => ({
@@ -225,12 +277,12 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
   shortTermMemory.forEach((stm) => insertChatbotShortTermMemory(stm));
 
   try {
-    const { text } = await generateText({
+    const grokResponse = await generateText({
       model: xai.responses('grok-4.5'),
       system: `${basePrompt}\nCore Memory: ${coreMemory}\n}`,
       prompt: agentInput,
-      reasoning: 'low',
-      temperature: 1.1,
+      reasoning: 'medium',
+      temperature: 1.2,
       tools: chatbot.tools_enabled ? {
         web_search: xai.tools.webSearch(),
         x_search: xai.tools.xSearch(),
@@ -241,7 +293,7 @@ async function generateMessage(discordClient: Client<boolean>, serverID: Snowfla
       },
     });
 
-    let responseContent = text ?? 'idk bruh 💀';
+    let responseContent = grokResponse.text ?? 'idk bruh 💀';
 
     // remove thinking tokens from final message (xAI has a history of not automatically removing them)
     const thinkStartIndex = responseContent.indexOf('<think>');
