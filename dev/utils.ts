@@ -6,7 +6,6 @@ function discordToDate(date: number): Date {
   return new Date(date * 1000);
 }
 function dateToCron(date: Date): string {
-  console.log(date);
   return `${date.getSeconds()} ${date.getMinutes()} ${date.getHours()} ${date.getDate()} ${date.getMonth() + 1} *`;
 }
 
@@ -21,7 +20,6 @@ function inputToSchedule(scheduleStr: string): string | undefined {
 }
 
 function sendReminder(outputChannel: Channel, serverID: string, reminderName: string) {
-  console.log('tried to send');
   const reminder = getReminder(serverID, reminderName);
   if (!reminder) return;
 
@@ -60,4 +58,36 @@ function fromBlob(blob: Buffer | undefined) {
   return Array.from(f32);
 }
 
-export { discordToDate, dateToCron, inputToSchedule, sendReminder, dotProduct, toBlob, fromBlob };
+const safeFetch = async <T>(fetcher: () => Promise<T>): Promise<T | undefined> => {
+  try {
+    return await fetcher();
+  } catch {
+    return undefined; // e.g. DiscordAPIError "Unknown Member"
+  }
+};
+
+function trackFence(piece: string, open: string | null): string | null {
+  for (const m of piece.matchAll(/^(`{3,})(.*)$/gm)) {
+    if (open) {
+      const openTicks = /^`+/.exec(open)![0].length;
+      // A closing fence: only backticks, at least as long as the opener
+      if (m[2].trim() === '' && m[1].length >= openTicks) open = null;
+    } else {
+      const [match] = m;
+      open = match;
+    }
+  }
+  return open;
+}
+
+/** Best index to cut `window` at. Inside code, only cut on line boundaries. */
+function splitPoint(window: string, inCode: boolean): number {
+  const seps = inCode ? ['\n'] : ['\n\n', '\n', ' '];
+  for (const sep of seps) {
+    const idx = window.lastIndexOf(sep);
+    if (idx > window.length * 0.4) return idx; // avoid uselessly tiny chunks
+  }
+  return window.length; // hard cut as a last resort
+}
+
+export { discordToDate, dateToCron, inputToSchedule, sendReminder, dotProduct, toBlob, fromBlob, safeFetch, trackFence, splitPoint };

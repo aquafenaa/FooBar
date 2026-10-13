@@ -101,7 +101,7 @@ const ChatbotCommand: ConfigCommand = {
         const coreMemoryParagraph = new TextInputBuilder()
           .setCustomId(paragraphID)
           .setStyle(TextInputStyle.Paragraph)
-          .setValue(chatbot.chatbot_core_memory ?? '')
+          .setValue(chatbot.chatbot_core_memory?.substring(0, 4000) ?? '')
           .setMaxLength(4_000);
         const coreMemoryLabel = new LabelBuilder().setLabel('Set the core memory for the bot.').setTextInputComponent(coreMemoryParagraph);
 
@@ -109,17 +109,21 @@ const ChatbotCommand: ConfigCommand = {
 
         await interaction.showModal(coreMemoryModal);
 
-        const submitModal = await interaction.awaitModalSubmit({
-          time: 60_000 * 10, // 10 minutes
-          filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
-        });
+        try {
+          const submitModal = await interaction.awaitModalSubmit({
+            time: 60_000 * 10, // 10 minutes
+            filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
+          });
+          const newCoreMemory = submitModal.fields.getTextInputValue(paragraphID);
+          chatbot.chatbot_core_memory = newCoreMemory;
+          upsertChatbot(chatbot);
 
-        const newCoreMemory = submitModal.fields.getTextInputValue(paragraphID);
-        chatbot.chatbot_core_memory = newCoreMemory;
-        upsertChatbot(chatbot);
-
-        submitModal.reply({ content: 'Successfully updated core memory!', flags: MessageFlags.Ephemeral });
-        return;
+          submitModal.reply({ content: 'Successfully updated core memory!', flags: MessageFlags.Ephemeral });
+          return;
+        } catch (error) {
+          console.error(error);
+          return;
+        }
       }
     }
     if (subcommandGroup === 'longterm-memory') {
@@ -201,7 +205,7 @@ const ChatbotCommand: ConfigCommand = {
       }
 
       if (subcommand === 'view') {
-        interaction.reply({ embeds: [ChatbotCommand.configEmbedBuilder('Chatbot Settings', serverID)], flags: MessageFlags.Ephemeral });
+        interaction.reply({ embeds: [ChatbotCommand.configEmbedBuilder('Chatbot Settings', chatbot)], flags: MessageFlags.Ephemeral });
         return;
       }
     }
@@ -228,18 +232,23 @@ const ChatbotCommand: ConfigCommand = {
 
         await interaction.showModal(promptModal);
 
-        const submitModal = await interaction.awaitModalSubmit({
-          time: 60_000 * 10, // 10 minutes
-          filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
-        });
+        try {
+          const submitModal = await interaction.awaitModalSubmit({
+            time: 60_000 * 10, // 10 minutes
+            filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
+          });
 
-        const newPrompt = submitModal.fields.getTextInputValue(paragraphID);
+          const newPrompt = submitModal.fields.getTextInputValue(paragraphID);
 
-        chatbot.chatbot_prompt = newPrompt;
-        upsertChatbot(chatbot);
+          chatbot.chatbot_prompt = newPrompt;
+          upsertChatbot(chatbot);
 
-        submitModal.reply({ content: 'Successfully updated server prompt!', flags: MessageFlags.Ephemeral });
-        return;
+          submitModal.reply({ content: 'Successfully updated server prompt!', flags: MessageFlags.Ephemeral });
+          return;
+        } catch (error) {
+          console.error(error);
+          return;
+        }
       }
       if (subcommand === 'delete') {
         const chatbot = getChatbot(serverID);
