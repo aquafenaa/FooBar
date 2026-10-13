@@ -10,7 +10,7 @@ If you would like to add this bot to your own server, feel free! If you encounte
 - [x] Automatic Responses
   - Given a capture regex, input regex, and output template, the bot automatically responds to certain key phrases. (e.g. https://x.com/ -> https://vxtwitter.com/)
   - [x] Add 🗑️ react that automatically deletes the response
-- [ ] Reminder Command
+- [x] Reminder Command
   - Gives a reminder given a chron schedule
 
 - [x] Grok AI
@@ -18,15 +18,18 @@ If you would like to add this bot to your own server, feel free! If you encounte
   - /subscribe to Opt-In
   - [x] Command to reset AI memory
   - [x] Ability to change prompt between servers
-  - [ ] Publicize thinking and tool uses, but non-intrusive, closable
+  - [x] Publicize thinking and tool uses, but non-intrusive, closable
+    - [ ] Not closable, and doesn't show context, but definitely non-intrusive
+  - [x] Resolve user pings for less model confusion
+  - [x] Reformat entire chat for better model understanding
   - [ ] Skills
     - [ ] Change nickname
     - [ ] Reminder / Message scheduler
     - [ ] Get profile / bio (?)
     - [ ] Play sounds in voice chat (?)
   - [ ] Limit money hemorrhaging
-    - [ ] Allow ability to enable or disable tool calls per server
-    - [ ] Check "relevancy" via top-k embedding similarity
+    - [x] Allow ability to enable or disable tool calls per server
+    - [x] Check "relevancy" via top-k embedding similarity
     - [ ] Perhaps paid tiers for greater limits
     - [ ] Give k characters as context, not simply n messages
 

@@ -14,6 +14,7 @@
     "project": "./tsconfig.json"
   },
   "rules": {
+    "no-continue": 0,
     "consistent-return": 0,
     "no-param-reassign": 0,
     "max-len": 0,
@@ -21,6 +22,8 @@
     "object-curly-newline": 0,
     "import/no-cycle": 0,
     "no-plusplus": 0,
-    "no-multi-spaces": 0
+    "no-multi-spaces": 0,
+    "no-restricted-syntax": 0, // i should be able to use for of if i want to idc
+    "no-await-in-loop": 0
   }
 }

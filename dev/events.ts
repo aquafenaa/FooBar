@@ -2,7 +2,7 @@ import { BaseMessageOptions, Channel, Client, EmbedBuilder, Events, GuildMember,
 import cron from 'node-cron';
 
 import { commandMap } from './commands';
-import { generateMessage } from './chatbot';
+import { handleChatbotReply } from './chatbot';
 
 import { Command } from './types/bot';
 import { addResponseMessage, deleteChatbotShortTermMemory, deleteHeartBoardMessage, deleteResponseMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotShortTermMemory, isChatbotSubscriber, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, syncDatabase, updateHeartBoardMessage } from './data';
@@ -176,35 +176,10 @@ function clientEvents(discordClient: Client) {
 
     setTimeout(() => {
       clearInterval(typingExtension);
-    }, 60000); // cancel interval after 60 seconds, if it's still somehow going
-
-    const authorNick = (await message.guild!.members.fetch(message.author.id)).nickname;
+    }, 300000); // cancel interval after 5 minutes, if it's still somehow going
 
     // get response from LLM, and reply
-    const agentReply = await generateMessage(discordClient, serverID, typingExtension, message, authorNick, userContent, messageReference, context ?? []);
-    try {
-      if (!agentReply || agentReply === '') return;
-      clearInterval(typingExtension); // disables typing
-
-      if (agentReply.length < 2000) {
-        await message.reply(agentReply);
-      } else {
-        const replyArray = agentReply.match(/[\s\S]{1,2000}/g)!; // split message into chunks of 2000
-
-        await message.reply(replyArray.shift()!);
-
-        // there is no simple way to send consecutive messages, without ignoring my linter, sorry 💔
-        // eslint-disable-next-line no-restricted-syntax
-        for (const reply of replyArray) {
-          // eslint-disable-next-line no-await-in-loop
-          await message.channel.send(reply);
-        }
-      }
-    } catch (error) {
-      clearInterval(typingExtension); // disables typing
-      message.reply('I wasn\'t able to connect to the server... Please try again laer.');
-      console.error(error);
-    }
+    await handleChatbotReply(serverID, typingExtension, message, userContent, messageReference, context ?? []);
   });
 
   discordClient.on(Events.MessageDelete, async (message) => {
@@ -279,7 +254,7 @@ function clientEvents(discordClient: Client) {
     const refMessage = message.reference ? await message.fetchReference() : undefined;
 
     // if in acceptedEmojis, save anonymized chat
-    if (acceptedEmojis.includes(emojiString) && message.content) {
+    if (!user.bot && acceptedEmojis.includes(emojiString) && message.content) {
       saveAnonymizedMessage({
         server_id: serverID,
         message_id: messageID,
@@ -358,7 +333,7 @@ function clientEvents(discordClient: Client) {
 
         insertHeartBoardMessage(heartboardMessage);
       } catch (error) {
-        console.log(error);
+        console.error(error);
       }
     });
   };
@@ -367,14 +342,14 @@ function clientEvents(discordClient: Client) {
     try {
       await handleReaction(reaction, user);
     } catch (error) {
-      console.log(error);
+      console.error(error);
     }
   });
   discordClient.on(Events.MessageReactionRemove, async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     try {
       await handleReaction(reaction, user);
     } catch (error) {
-      console.log(error);
+      console.error(error);
     }
   });
 }

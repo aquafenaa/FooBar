@@ -28,8 +28,13 @@ function getAllServers(): Snowflake[] {
 }
 
 // ==================== Chatbot ====================
-function getChatbot(server_id: Snowflake): ChatbotTable | undefined {
-  return db.prepare('SELECT * FROM Chatbot WHERE server_id = ?').get(server_id ?? '') as ChatbotTable | undefined;
+function getChatbot(server_id: Snowflake): ChatbotTable | null {
+  const chatbot = db.prepare('SELECT * FROM Chatbot WHERE server_id = ?').get(server_id ?? '') as ChatbotTable | null;
+  if (!chatbot) return null;
+
+  chatbot.chatbot_enabled = Boolean(chatbot.chatbot_enabled);
+  chatbot.tools_enabled = Boolean(chatbot.tools_enabled);
+  return chatbot;
 }
 function upsertChatbot(chatbot: ChatbotTable): void {
   db.prepare(`
