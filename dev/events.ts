@@ -5,8 +5,8 @@ import { commandMap } from './commands';
 import { handleChatbotReply, markMessageDeleted } from './chatbot/chatbot';
 
 import { Command } from './types/bot';
-import { addResponseMessage, deleteConversationMessageByID, deleteHeartBoardMessage, deleteResponseMessage, getAllConversations, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotSubscriber, isConversationMessage, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, updateDatabase, updateHeartBoardMessage } from './data';
-import { sendReminder } from './utils';
+import { addResponseMessage, deleteConversationMessageByID, deleteHeartBoardMessage, deleteResponseMessage, getAllConversations, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, updateReminder, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotSubscriber, isConversationMessage, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, updateDatabase, updateHeartBoardMessage } from './data';
+import { inputToSchedule, safeFetch, sendReminder } from './utils';
 import { scheduleExpireTask } from './chatbot/conversation';
 import { loadModels } from './chatbot/models';
 
@@ -69,10 +69,23 @@ function clientEvents(discordClient: Client) {
       // load reminders into cron scheduling
       const reminders = getRemindersByServer(guildID);
       reminders.forEach(async (reminder) => {
-        const outputChannel = await server.channels.fetch(reminder.channel_id);
-        if (!outputChannel) return;
+        const outputChannel = await safeFetch(() => server.channels.fetch(reminder.channel_id));
+        if (!outputChannel) {
+          console.error(`Reminder "${reminder.reminder_name}" (server ${guildID}): channel ${reminder.channel_id} not found`);
+          return;
+        }
 
-        cron.schedule(reminder.cron_schedule, () => sendReminder(outputChannel, guildID, reminder.reminder_name), {
+        // older /reminder add saved the raw Discord @time tag instead of the cron schedule
+        const cronSchedule = inputToSchedule(reminder.cron_schedule);
+        if (!cronSchedule) {
+          console.error(`Reminder "${reminder.reminder_name}" (server ${guildID}): invalid schedule "${reminder.cron_schedule}"`);
+          return;
+        }
+        if (cronSchedule !== reminder.cron_schedule) {
+          updateReminder({ ...reminder, cron_schedule: cronSchedule });
+        }
+
+        cron.schedule(cronSchedule, () => sendReminder(outputChannel, guildID, reminder.reminder_name), {
           name: `${reminder.server_id}${reminder.reminder_name}`,
         });
       });

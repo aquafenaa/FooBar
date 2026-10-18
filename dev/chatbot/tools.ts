@@ -121,7 +121,7 @@ const createReminder = tool({
     channel_id: zod.string().describe('ID of the channel the reminder should be sent to'),
     reminder_name: zod.string().describe('Name of the reminder. Must be unique with server'),
 
-    cron_schedule: zod.string().describe('Cron schedule the reminder should be sent at'),
+    cron_schedule: zod.string().describe('Cron schedule the reminder should be sent at. Hour is 0-23'),
     repeats: zod.boolean().describe('Whether to repeat the schedule (true), or just delete it after a single use (false)'),
     message_content: zod.string().describe('Content of the reminder to send'),
   }),
