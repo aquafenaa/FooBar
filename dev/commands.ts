@@ -12,16 +12,34 @@ import {
 import cron from 'node-cron';
 import { Command, ConfigCommand } from './types/bot';
 import { addChatbotSubscriber, addReminder, deleteAllHeartBoardEmojis, deleteAllVoicePingInputs, deleteAutomaticResponse, deleteChatbot,
-  deleteChatbotLongTermMemory, deleteHeartBoard, deleteNOldestShortTermMemory, deleteReminder, deleteVoicePing, getAutomaticResponse, getAutomaticResponsesByServer, getChatbot,
-  getChatbotLongTermMemoriesByServer, getChatbotLongTermMemory, getChatbotShortTermMemoriesByServer, getHeartBoard, getHeartBoardEmojis, getHeartBoardsByServer, getReminder, getRemindersByServer, getVoicePing,
-  getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertChatbotLongTermMemory, insertHeartBoard, insertHeartBoardEmoji,
-  insertVoicePing, insertVoicePingInput, isChatbotSubscriber, removeChatbotSubscriber, setChatbotPrompt, updateAutomaticResponse, updateChatbotLongTermMemory,
-  updateHeartBoard, updateReminder, updateVoicePing, upsertChatbot } from './data';
-import { AutomaticResponseTable, ChatbotTable, ReminderTable, HeartBoardTable, VoicePingTable } from './types/schema';
-import { getDefaultSystemPrompt } from './chatbot';
+  deleteConversationSummary, deleteHeartBoard, deleteConversation, deleteReminder, deleteVoicePing, getConversationsBySource, getAutomaticResponse, getAutomaticResponsesByServer, getChatbot,
+  deleteCounter, deleteMemory, getConversationByChannel, getCounter, getCountersByServer, incrementCounter, insertCounter, setCounterValue, getConversationSummariesBySource, getHeartBoard, upsertMemory, getHeartBoardEmojis, getHeartBoardsByServer, getReminder, getRemindersByServer, getVoicePing,
+  getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertHeartBoard, insertHeartBoardEmoji,
+  insertVoicePing, insertVoicePingInput, isChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, removeChatbotSubscriber, updateAutomaticResponse,
+  updateHeartBoard, updateReminder, updateVoicePing, upsertChatbot, upsertConversationSummary } from './data';
+import { AutomaticResponseTable, ChatbotTable, ConversationSummaryTable, ReminderTable, HeartBoardTable, VoicePingTable } from './types/schema';
+import { getEmbedding, getSystemPrompt } from './chatbot/chatbot';
+import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
+import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
+import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, findModel, formatPricing, getModels, getSupportedEfforts, supportsTools } from './chatbot/models';
 import { inputToSchedule, sendReminder } from './utils';
 
 const commandMap: Map<string, Command> = new Map();
+
+// a server's own summaries: its local ones, and the copies it shared with other servers. oldest first
+function getServerSummaries(serverID: Snowflake): ConversationSummaryTable[] {
+  return [
+    ...getConversationSummariesBySource(serverID),
+    ...getConversationSummariesBySource(`${MAIN_SOURCE}${SOURCE_SEPARATOR}${serverID}`),
+  ].sort((a, b) => a.timestamp - b.timestamp);
+}
+// identifies one summary, since a conversation can have both a local and a shared one
+function summaryKey(summary: ConversationSummaryTable): string {
+  return `${summary.conversation_id}|${summary.source_id}`;
+}
+function summaryScopeLabel(summary: ConversationSummaryTable): string {
+  return fromSummarySource(summary.source_id).shared ? 'shared' : 'local';
+}
 
 const ChatbotCommand: ConfigCommand = {
   data: new SlashCommandBuilder()
@@ -33,40 +51,75 @@ const ChatbotCommand: ConfigCommand = {
     .addSubcommand((toolSubcommand) => toolSubcommand.setName('tools').setDescription('Whether the bot is able to use tools or not')
       .addBooleanOption((enabledOption) => enabledOption.setName('enable').setDescription('Enable or disable tool use. True = Enable, False = Disable')
         .setRequired(true)))
-    .addSubcommandGroup((promptSubcommandGroup) => promptSubcommandGroup.setName('prompt')
-      .setDescription('Set or delete the system prompt for the chatbot.')
-      .addSubcommand((setPromptSubcommand) => setPromptSubcommand.setName('set')
-        .setDescription('Set the system prompt.'))
-      .addSubcommand((deletePromptSubcommand) => deletePromptSubcommand.setName('delete')
-        .setDescription('Delete the system prompt.')))
-    .addSubcommand((clearMemoryCommand) => clearMemoryCommand.setName('clear-memory').setDescription('Clears the memory of the bot')
+    .addSubcommand((modelSubcommand) => modelSubcommand.setName('model')
+      .setDescription('Change the AI model the chatbot uses, from any model on OpenRouter')
+      .addStringOption((queryOption) => queryOption.setName('query')
+        .setDescription('Search for a model by name or ID, e.g. "glm" or "anthropic/"')
+        .setRequired(true)
+        .setAutocomplete(true)))
+    .addSubcommand((reasoningSubcommand) => reasoningSubcommand.setName('reasoning-effort')
+      .setDescription('Change how much the chatbot thinks before replying. Options depend on the current model')
+      .addStringOption((queryOption) => queryOption.setName('query')
+        .setDescription('The effort level, e.g. "low" or "high"')
+        .setRequired(true)
+        .setAutocomplete(true)))
+    .addSubcommand((detachSubcommand) => detachSubcommand.setName('detach')
+      .setDescription('Whether the bot keeps its own memories, instead of sharing them with other servers')
+      .addBooleanOption((detachOption) => detachOption.setName('enable').setDescription('True = Separate from other servers, False = Joins the hivemind')
+        .setRequired(true)))
+    .addSubcommandGroup((personaSubcommandGroup) => personaSubcommandGroup.setName('persona')
+      .setDescription('Set or delete the persona for the chatbot, which is added on top of the system prompt.')
+      .addSubcommand((setPersonaSubcommand) => setPersonaSubcommand.setName('set')
+        .setDescription('Set the persona.'))
+      .addSubcommand((deletePersonaSubcommand) => deletePersonaSubcommand.setName('delete')
+        .setDescription('Delete the persona.')))
+    .addSubcommandGroup((systemPromptSubcommandGroup) => systemPromptSubcommandGroup.setName('system-prompt')
+      .setDescription('Override the base system prompt for this server.')
+      .addSubcommand((setSystemPromptSubcommand) => setSystemPromptSubcommand.setName('set')
+        .setDescription('Set the system prompt override.'))
+      .addSubcommand((deleteSystemPromptSubcommand) => deleteSystemPromptSubcommand.setName('delete')
+        .setDescription('Delete the override, going back to the base system prompt.')))
+    .addSubcommand((clearMemoryCommand) => clearMemoryCommand.setName('clear-memory').setDescription('Clears this server\'s conversations and summaries. Memories are kept')
       .addBooleanOption((confirmationOption) => confirmationOption.setName('confirmation').setDescription('Are you sure you wish to clear the memory? True = Yes, False = No.')))
-    .addSubcommandGroup((coreMemoryGroup) => coreMemoryGroup.setName('core-memory')
-      .setDescription('View, edit, and delete the longterm memory for the chatbot.')
-      .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
-        .setDescription('Edit the core memory for the chatbot'))
-      .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View the current core memory.')))
-    .addSubcommandGroup((longtermMemoryGroup) => longtermMemoryGroup.setName('longterm-memory')
-      .setDescription('View, and delete the longterm memory for the chatbot.')
-      .addSubcommand((addSubcommand) => addSubcommand.setName('add')
-        .setDescription('Add a longterm memory for the bot to use.')
-        .addStringOption((textOption) => textOption.setName('text')
-          .setDescription('Text of the longterm memory.')
-          .setRequired(true)))
+    .addSubcommandGroup((summariesGroup) => summariesGroup.setName('summaries')
+      .setDescription('View, edit, and delete the conversation summaries for the chatbot.')
+      .addSubcommand((createSubcommand) => createSubcommand.setName('create')
+        .setDescription('Summarize the current conversation, and delete context'))
       .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
-        .setDescription('View the current longterm memory of the bot'))
+        .setDescription('View the conversation summaries in this server.'))
       .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
-        .setDescription('Edit a current longterm memory.')
-        .addNumberOption((idOption) => idOption.setName('ltm-id')
-          .setDescription('ID of the longterm memory to edit.')
-          .setRequired(true))
-        .addStringOption((textOption) => textOption.setName('memory-text')
-          .setDescription('The new content of the core memory.')
-          .setRequired(true)))
+        .setDescription('Edit a conversation summary.')
+        .addStringOption((summaryOption) => summaryOption.setName('summary')
+          .setDescription('The summary to edit.')
+          .setRequired(true)
+          .setAutocomplete(true)))
       .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete')
-        .setDescription('Delete a current longterm memory of the bot')
-        .addNumberOption((ltmIDOption) => ltmIDOption.setName('ltm-id')
-          .setDescription('ID of the longterm memory. Leave blank to delete all'))))
+        .setDescription('Delete a conversation summary.')
+        .addStringOption((summaryOption) => summaryOption.setName('summary')
+          .setDescription('The summary to delete. Leave blank to delete all of this server\'s summaries')
+          .setAutocomplete(true))))
+    .addSubcommandGroup((memoriesGroup) => memoriesGroup.setName('memories')
+      .setDescription('View, set, and delete the memories for the chatbot.')
+      .addSubcommand((viewSubcommand) => viewSubcommand.setName('view')
+        .setDescription('View a memory, or every memory in this server.')
+        .addStringOption((nameOption) => nameOption.setName('name')
+          .setDescription('Name of the memory to view. Leave blank to view all')
+          .setAutocomplete(true)))
+      .addSubcommand((setSubcommand) => setSubcommand.setName('set')
+        .setDescription('Create a memory, or edit an existing one.')
+        .addStringOption((nameOption) => nameOption.setName('name')
+          .setDescription('Name of the memory. Not case-sensitive')
+          .setRequired(true)
+          .setMaxLength(100)
+          .setAutocomplete(true))
+        .addBooleanOption((sharedOption) => sharedOption.setName('shared')
+          .setDescription('For new memories: share with other servers. Defaults to False')))
+      .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete')
+        .setDescription('Delete a memory.')
+        .addStringOption((nameOption) => nameOption.setName('name')
+          .setDescription('Name of the memory to delete.')
+          .setRequired(true)
+          .setAutocomplete(true))))
     .addSubcommandGroup((statusGroup) => statusGroup.setName('status')
       .setDescription('Whether the chatbot is enabled or disabled.')
       .addSubcommand((setSubcommand) => setSubcommand.setName('set')
@@ -79,108 +132,221 @@ const ChatbotCommand: ConfigCommand = {
     const subcommandGroup = interaction.options.getSubcommandGroup();
     const subcommand = interaction.options.getSubcommand();
 
-    if (subcommandGroup === 'core-memory') {
-      const chatbot = getChatbot(serverID);
-      if (!chatbot) {
-        interaction.reply({ content: 'No current chatbot in the server! Try /chatbot create', flags: MessageFlags.Ephemeral });
-        return;
-      }
+    if (subcommandGroup === 'memories') {
+      const name = interaction.options.getString('name');
+
+      // attached servers also see the memories shared between servers. their own come first, when names clash
+      const scopeLabel = (source_id: string) => (source_id === MAIN_SOURCE ? 'shared' : 'this server');
 
       if (subcommand === 'view') {
-        const coreMemory = chatbot.chatbot_core_memory;
+        if (name) {
+          const memory = findMemory(serverID, name);
+          if (!memory) {
+            interaction.reply({ content: 'There is no memory with that name!', flags: MessageFlags.Ephemeral });
+            return;
+          }
 
-        interaction.reply({ content: coreMemory, flags: MessageFlags.Ephemeral });
+          const memoryEmbed = new EmbedBuilder().setTitle(memory.name).setDescription(memory.content)
+            .setFooter({ text: scopeLabel(memory.source_id) });
+          interaction.reply({ embeds: [memoryEmbed], flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        const memories = getVisibleMemories(serverID);
+        if (memories.length === 0) {
+          interaction.reply({ content: 'There are no memories in this server!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        // embeds cap at 25 fields, 1024 chars per field, and 6000 chars total, so show the memories that fit
+        const fields: { name: string, value: string }[] = [];
+        let totalLength = 0;
+        for (const memory of memories) {
+          const field = {
+            name: `${memory.name} (${scopeLabel(memory.source_id)})`.substring(0, 256),
+            value: memory.content.length > 200 ? `${memory.content.substring(0, 197)}...` : memory.content,
+          };
+          if (fields.length === 25 || totalLength + field.name.length + field.value.length > 5_800) break;
+
+          fields.push(field);
+          totalLength += field.name.length + field.value.length;
+        }
+
+        const memoriesEmbed = new EmbedBuilder().setTitle('Memories')
+          .addFields(...fields)
+          .setFooter({ text: `Showing ${fields.length} of ${memories.length} memories. View one by name to see all of it` });
+        interaction.reply({ embeds: [memoriesEmbed], flags: MessageFlags.Ephemeral });
         return;
       }
+      if (subcommand === 'set') {
+        const existingMemory = findMemory(serverID, name!);
+        const shared = interaction.options.getBoolean('shared') ?? false;
+        if (!existingMemory && shared && !isAttached(serverID)) {
+          interaction.reply({ content: 'This server is detached, so it can\'t share memories! Try /chatbot detach enable:False first', flags: MessageFlags.Ephemeral });
+          return;
+        }
 
-      if (subcommand === 'edit') {
-        const modalID = `core-memory:${interaction.id}`;
-        const coreMemoryModal = new ModalBuilder().setCustomId(modalID).setTitle('Set Core Memory');
+        const modalID = `memory:${interaction.id}`;
+        const memoryModal = new ModalBuilder().setCustomId(modalID).setTitle(existingMemory ? 'Edit Memory' : 'Create Memory');
 
-        const paragraphID = `core-memory:paragraph:${interaction.id}`;
-        const coreMemoryParagraph = new TextInputBuilder()
+        const paragraphID = `memory:paragraph:${interaction.id}`;
+        const memoryParagraph = new TextInputBuilder()
           .setCustomId(paragraphID)
           .setStyle(TextInputStyle.Paragraph)
-          .setValue(chatbot.chatbot_core_memory?.substring(0, 4000) ?? '')
+          .setValue(existingMemory?.content.substring(0, 4000) ?? '')
           .setMaxLength(4_000);
-        const coreMemoryLabel = new LabelBuilder().setLabel('Set the core memory for the bot.').setTextInputComponent(coreMemoryParagraph);
+        const memoryLabel = new LabelBuilder().setLabel(`Content of "${name}"`.substring(0, 45)).setTextInputComponent(memoryParagraph);
 
-        coreMemoryModal.addLabelComponents(coreMemoryLabel);
+        memoryModal.addLabelComponents(memoryLabel);
 
-        await interaction.showModal(coreMemoryModal);
+        await interaction.showModal(memoryModal);
 
         try {
           const submitModal = await interaction.awaitModalSubmit({
             time: 60_000 * 10, // 10 minutes
             filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
           });
-          const newCoreMemory = submitModal.fields.getTextInputValue(paragraphID);
-          chatbot.chatbot_core_memory = newCoreMemory;
-          upsertChatbot(chatbot);
+          const content = submitModal.fields.getTextInputValue(paragraphID);
 
-          submitModal.reply({ content: 'Successfully updated core memory!', flags: MessageFlags.Ephemeral });
+          // an existing memory stays where it is, and keeps its casing, since names aren't case-sensitive
+          upsertMemory({
+            source_id: existingMemory?.source_id ?? (shared ? MAIN_SOURCE : serverID),
+            name: existingMemory?.name ?? name!,
+            content,
+          });
+
+          submitModal.reply({ content: `Successfully ${existingMemory ? 'updated' : 'created'} memory!`, flags: MessageFlags.Ephemeral });
           return;
         } catch (error) {
           console.error(error);
           return;
         }
       }
-    }
-    if (subcommandGroup === 'longterm-memory') {
-      const longtermMemories = getChatbotLongTermMemoriesByServer(serverID);
-      if (subcommand === 'add') {
-        const textOption = interaction.options.getString('text')!;
-        if (textOption === '') {
-          interaction.reply({ content: 'You must enter some text for the memory!', flags: MessageFlags.Ephemeral });
+      if (subcommand === 'delete') {
+        const memory = findMemory(serverID, name!);
+        if (!memory) {
+          interaction.reply({ content: 'There is no memory with that name!', flags: MessageFlags.Ephemeral });
           return;
         }
 
-        insertChatbotLongTermMemory({
-          server_id: serverID,
-          timestamp: Date.now(),
-          message_content: textOption,
-        });
+        deleteMemory(memory.source_id, memory.name);
+        interaction.reply({ content: `Successfully deleted ${memory.source_id === MAIN_SOURCE ? 'shared ' : ''}memory!`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
+    if (subcommandGroup === 'summaries') {
+      const summaries = getServerSummaries(serverID);
+      // autocomplete gives `{conversation_id}|{source_id}`. a bare conversation id picks the local summary first
+      const summaryOption = interaction.options.getString('summary');
+      const selectedSummary = summaryOption
+        ? summaries.find((s) => summaryKey(s) === summaryOption)
+          ?? summaries.find((s) => s.conversation_id === summaryOption && !fromSummarySource(s.source_id).shared)
+          ?? summaries.find((s) => s.conversation_id === summaryOption)
+        : undefined;
 
-        interaction.reply({ content: 'Successfully added longterm memory!', flags: MessageFlags.Ephemeral });
+      if (subcommand === 'create') {
+        const conversation = getConversationByChannel(interaction.channelId);
+        if (!conversation) {
+          interaction.reply({ content: 'There is no active conversation in this channel!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // summarizing can take longer than discord's 3 second reply window
+
+        try {
+          const summary = await endConversation(conversation);
+          if (!summary) {
+            interaction.editReply({ content: 'There was nothing to summarize in this conversation!' });
+            return;
+          }
+
+          interaction.editReply({ content: `Successfully summarized conversation!\n${summary}`.substring(0, 2000) });
+        } catch (error) {
+          console.error(error);
+          interaction.editReply({ content: 'Failed to summarize the conversation.' });
+        }
         return;
       }
       if (subcommand === 'view') {
-        if (!longtermMemories || longtermMemories.length === 0) {
-          interaction.reply({ content: 'There are no longterm memories in this server!', flags: MessageFlags.Ephemeral });
+        if (summaries.length === 0) {
+          interaction.reply({ content: 'There are no conversation summaries in this server!', flags: MessageFlags.Ephemeral });
           return;
         }
 
-        const longtermMemoryEmbed = new EmbedBuilder().setTitle('Long Term Memories')
-          .addFields(...longtermMemories.map((ltm) => ({ name: `${ltm.memory_id}`, value: ltm.message_content })));
-        interaction.reply({ embeds: [longtermMemoryEmbed], flags: MessageFlags.Ephemeral });
+        // embeds cap at 25 fields, 1024 chars per field, and 6000 chars total, so show the newest summaries that fit
+        const fields: { name: string, value: string }[] = [];
+        let totalLength = 0;
+        for (const summary of [...summaries].reverse()) {
+          const field = {
+            name: `${summary.conversation_id} (${summaryScopeLabel(summary)}, ${new Date(summary.timestamp).toLocaleString()})`,
+            value: summary.summary.substring(0, 1024),
+          };
+          if (fields.length === 25 || totalLength + field.name.length + field.value.length > 5_800) break;
+
+          fields.push(field);
+          totalLength += field.name.length + field.value.length;
+        }
+
+        const summariesEmbed = new EmbedBuilder().setTitle('Conversation Summaries')
+          .addFields(...fields)
+          .setFooter({ text: `Showing ${fields.length} of ${summaries.length} summaries` });
+        interaction.reply({ embeds: [summariesEmbed], flags: MessageFlags.Ephemeral });
         return;
       }
       if (subcommand === 'edit') {
-        const ltmID = interaction.options.getNumber('ltm-id')!;
-        const longtermMemory = getChatbotLongTermMemory(serverID, ltmID);
-        const newContent = interaction.options.getString('memory-text') ?? '';
-
-        if (!longtermMemory) {
-          interaction.reply({ content: 'There is no message with that ID!', flags: MessageFlags.Ephemeral });
+        const summary = selectedSummary;
+        if (!summary) {
+          interaction.reply({ content: 'There is no summary with that ID!', flags: MessageFlags.Ephemeral });
           return;
         }
 
-        updateChatbotLongTermMemory(serverID, ltmID, newContent);
+        const modalID = `summary:${interaction.id}`;
+        const summaryModal = new ModalBuilder().setCustomId(modalID).setTitle('Edit Summary');
 
-        interaction.reply({ content: 'Successfully updated memory!', flags: MessageFlags.Ephemeral });
-        return;
+        const paragraphID = `summary:paragraph:${interaction.id}`;
+        const summaryParagraph = new TextInputBuilder()
+          .setCustomId(paragraphID)
+          .setStyle(TextInputStyle.Paragraph)
+          .setValue(summary.summary.substring(0, 4000))
+          .setMaxLength(4_000);
+        const summaryLabel = new LabelBuilder().setLabel('Edit the conversation summary.').setTextInputComponent(summaryParagraph);
+
+        summaryModal.addLabelComponents(summaryLabel);
+
+        await interaction.showModal(summaryModal);
+
+        try {
+          const submitModal = await interaction.awaitModalSubmit({
+            time: 60_000 * 10, // 10 minutes
+            filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
+          });
+          const newSummary = submitModal.fields.getTextInputValue(paragraphID);
+
+          // re-embed, so relevant summary lookup matches the new text
+          upsertConversationSummary({ ...summary, summary: newSummary, embedding: await getEmbedding(newSummary) });
+
+          submitModal.reply({ content: 'Successfully updated summary!', flags: MessageFlags.Ephemeral });
+          return;
+        } catch (error) {
+          console.error(error);
+          return;
+        }
       }
       if (subcommand === 'delete') {
-        const ltmID = interaction.options.getNumber('ltm-id')!;
-        const longtermMemory = getChatbotLongTermMemory(serverID, ltmID);
-
-        if (!longtermMemory) {
-          interaction.reply({ content: 'There is no memory with that ID!', flags: MessageFlags.Ephemeral });
+        // deletes both the local and shared copies of every conversation from this server
+        if (!summaryOption) {
+          summaries.forEach((s) => deleteConversationSummary(s.conversation_id, s.source_id));
+          interaction.reply({ content: `Successfully deleted ${summaries.length} summaries!`, flags: MessageFlags.Ephemeral });
           return;
         }
 
-        deleteChatbotLongTermMemory(serverID, ltmID);
-        interaction.reply({ content: 'Successfully deleted memory!', flags: MessageFlags.Ephemeral });
+        if (!selectedSummary) {
+          interaction.reply({ content: 'There is no summary with that ID!', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        deleteConversationSummary(selectedSummary.conversation_id, selectedSummary.source_id);
+        interaction.reply({ content: `Successfully deleted ${summaryScopeLabel(selectedSummary)} summary!`, flags: MessageFlags.Ephemeral });
         return;
       }
     }
@@ -209,24 +375,32 @@ const ChatbotCommand: ConfigCommand = {
         return;
       }
     }
-    if (subcommandGroup === 'prompt') {
+    // the persona is layered on top of the system prompt. the system prompt is SYSTEM.md, unless this server overrides it
+    if (subcommandGroup === 'persona' || subcommandGroup === 'system-prompt') {
+      const chatbot = getChatbot(serverID);
+      if (!chatbot) {
+        interaction.reply({ content: 'There is no chatbot! Try making one first with /chatbot create', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const isPersona = subcommandGroup === 'persona';
+      const promptName = isPersona ? 'persona' : 'system prompt override';
+
       if (subcommand === 'set') {
-        const chatbot = getChatbot(serverID);
-        if (!chatbot) {
-          interaction.reply({ content: 'There is no chatbot! Try making one first with /chatbot create', flags: MessageFlags.Ephemeral });
-          return;
-        }
+        const modalID = `${subcommandGroup}:${interaction.id}`;
+        const promptModal = new ModalBuilder().setCustomId(modalID).setTitle(isPersona ? 'Set Persona' : 'Override System Prompt');
 
-        const modalID = `prompt:${interaction.id}`;
-        const promptModal = new ModalBuilder().setCustomId(modalID).setTitle('Set System Prompt');
-
-        const paragraphID = `prompt:paragraph:${interaction.id}`;
+        // an override starts from the current system prompt, so it can be tweaked rather than written from scratch
+        const currentPrompt = isPersona ? chatbot.chatbot_prompt : getSystemPrompt(chatbot);
+        const paragraphID = `${subcommandGroup}:paragraph:${interaction.id}`;
         const promptParagraph = new TextInputBuilder()
           .setCustomId(paragraphID)
           .setStyle(TextInputStyle.Paragraph)
-          .setValue(chatbot.chatbot_prompt ?? '')
+          .setValue((currentPrompt ?? '').substring(0, 4000))
           .setMaxLength(4_000);
-        const promptLabel = new LabelBuilder().setLabel('Set the system prompt for the bot.').setTextInputComponent(promptParagraph);
+        const promptLabel = new LabelBuilder()
+          .setLabel(isPersona ? 'Persona, added on top of the system prompt.' : 'Replaces the system prompt for this server.')
+          .setTextInputComponent(promptParagraph);
 
         promptModal.addLabelComponents(promptLabel);
 
@@ -239,11 +413,11 @@ const ChatbotCommand: ConfigCommand = {
           });
 
           const newPrompt = submitModal.fields.getTextInputValue(paragraphID);
-
-          chatbot.chatbot_prompt = newPrompt;
+          if (isPersona) chatbot.chatbot_prompt = newPrompt;
+          else chatbot.system_prompt_override = newPrompt || undefined;
           upsertChatbot(chatbot);
 
-          submitModal.reply({ content: 'Successfully updated server prompt!', flags: MessageFlags.Ephemeral });
+          submitModal.reply({ content: `Successfully updated ${promptName}!`, flags: MessageFlags.Ephemeral });
           return;
         } catch (error) {
           console.error(error);
@@ -251,16 +425,94 @@ const ChatbotCommand: ConfigCommand = {
         }
       }
       if (subcommand === 'delete') {
-        const chatbot = getChatbot(serverID);
-        if (!chatbot) {
-          interaction.reply({ content: 'There is no chatbot! Try making one first with /chatbot create', flags: MessageFlags.Ephemeral });
-          return;
-        }
+        if (isPersona) chatbot.chatbot_prompt = '';
+        else chatbot.system_prompt_override = undefined;
+        upsertChatbot(chatbot);
 
-        setChatbotPrompt(serverID, await getDefaultSystemPrompt());
-        interaction.reply({ content: 'Successfully updated system prompt!', flags: MessageFlags.Ephemeral });
+        interaction.reply({ content: `Successfully deleted ${promptName}!`, flags: MessageFlags.Ephemeral });
         return;
       }
+    }
+    if (subcommand === 'model') {
+      const chatbot = getChatbot(serverID);
+      if (!chatbot) {
+        interaction.reply({ content: 'There is no chatbot in this server! Try making one with /chatbot create', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      // autocomplete fills in the exact id. checked against OpenRouter, so a typo can't leave the bot on a model that doesn't exist
+      const query = interaction.options.getString('query')!;
+      const model = findModel(query);
+      if (!model) {
+        interaction.reply({ content: `There's no model with the ID \`${query}\` on OpenRouter. Pick one from the suggestions as you type!`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      chatbot.model = model.id === DEFAULT_MODEL ? undefined : model.id; // the default is stored as empty, so it follows DEFAULT_MODEL if that changes
+      upsertChatbot(chatbot);
+
+      const hasTools = supportsTools(model.id);
+      // efforts differ between models, so say if the current one won't do anything here
+      const effort = chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT;
+      const efforts = getSupportedEfforts(model.id);
+      const effortNote = efforts.length === 0 ? 'This model doesn\'t reason, so the reasoning effort is ignored.'
+        : !efforts.includes(effort) ? `This model doesn't support the current \`${effort}\` reasoning effort. Try /chatbot reasoning-effort: it supports ${efforts.join(', ')}.`
+          : '';
+
+      interaction.reply({
+        content: `Switched to **${model.name}** (\`${model.id}\`)\n`
+          + `-# ${formatPricing(model)} tokens · ${model.context_length.toLocaleString()} token context · tools ${hasTools ? 'supported' : 'not supported, so they\'ll be off while this model is in use'}`
+          + (effortNote ? `\n${effortNote}` : ''),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (subcommand === 'reasoning-effort') {
+      const chatbot = getChatbot(serverID);
+      if (!chatbot) {
+        interaction.reply({ content: 'There is no chatbot in this server! Try making one with /chatbot create', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const effort = interaction.options.getString('query')!.toLowerCase();
+      const modelID = chatbot.model ?? DEFAULT_MODEL;
+      const efforts = getSupportedEfforts(modelID);
+      if (efforts.length === 0) {
+        interaction.reply({ content: `\`${modelID}\` doesn't reason, so there's no effort to set. Try a different model with /chatbot model!`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (!efforts.includes(effort)) {
+        interaction.reply({ content: `\`${modelID}\` doesn't support \`${effort}\`. It supports: ${efforts.join(', ')}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      chatbot.reasoning_effort = effort === DEFAULT_REASONING_EFFORT ? undefined : effort; // the default is stored as empty, like the model
+      upsertChatbot(chatbot);
+      interaction.reply({ content: `Reasoning effort set to **${effort}**!`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'detach') {
+      const detachOption = interaction.options.getBoolean('enable')!;
+      const chatbot = getChatbot(serverID);
+
+      if (!chatbot) {
+        interaction.reply({ content: 'There is no chatbot in this server! Try making one with /chatbot create', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (detachOption === chatbot.detached) {
+        interaction.reply({ content: `The chatbot is already ${detachOption ? 'detached' : 'sharing with other servers'}!`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      chatbot.detached = detachOption;
+      upsertChatbot(chatbot);
+      interaction.reply({
+        content: detachOption
+          ? 'Detached! The chatbot will only use this server\'s memories and summaries. Ones already shared stay shared.'
+          : 'Attached! The chatbot now shares memories and summaries with other servers, for users who opt in with /subscribe.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
     }
     if (subcommand === 'clear-memory') {
       const confirmation = interaction.options.getBoolean('confirmation')!;
@@ -270,15 +522,22 @@ const ChatbotCommand: ConfigCommand = {
         return;
       }
 
-      const shortTermMemories = getChatbotShortTermMemoriesByServer(serverID);
+      // only this server's conversations. deleting them also deletes their messages, summaries, tool results, and index
+      const conversations = getConversationsBySource(serverID);
 
-      if (!shortTermMemories || shortTermMemories.length === 0) {
-        interaction.reply({ content: 'There are no short term memories on the server!', flags: MessageFlags.Ephemeral });
+      if (conversations.length === 0) {
+        interaction.reply({ content: 'There are no conversations to clear in this server!', flags: MessageFlags.Ephemeral });
         return;
       }
 
-      deleteNOldestShortTermMemory(serverID, shortTermMemories.length);
-      interaction.reply({ content: 'Successfully deleted all short term memories!', flags: MessageFlags.Ephemeral });
+      // cancel their pending summaries, since there'll be nothing left to summarize
+      const conversationIDs = new Set(conversations.map((conversation) => conversation.conversation_id));
+      cron.getTasks().forEach((task) => {
+        if (task.name && conversationIDs.has(task.name)) task.destroy();
+      });
+      conversations.forEach((conversation) => deleteConversation(conversation.conversation_id));
+
+      interaction.reply({ content: `Successfully cleared ${conversations.length} conversation${conversations.length === 1 ? '' : 's'} and their summaries!`, flags: MessageFlags.Ephemeral });
       return;
     }
     if (subcommand === 'tools') {
@@ -315,8 +574,8 @@ const ChatbotCommand: ConfigCommand = {
         server_id: serverID,
         chatbot_enabled: false,
         tools_enabled: false,
-        chatbot_prompt: await getDefaultSystemPrompt(),
-        chatbot_core_memory: '',
+        detached: false,
+        chatbot_prompt: '', // SYSTEM.md is used as the base, so a persona is optional
       });
 
       interaction.reply({ content: 'Successfully created chatbot!', flags: MessageFlags.Ephemeral });
@@ -345,24 +604,94 @@ const ChatbotCommand: ConfigCommand = {
       .addFields(
         { name: 'Enabled', value: (chatbot?.chatbot_enabled ? 'Yes' : 'No') },
         { name: 'Tools Enabled', value: (chatbot?.tools_enabled ? 'Yes' : 'No') },
+        { name: 'Context', value: (chatbot?.detached ? 'Detached (this server only)' : 'Shared with other servers (for opted-in users)') },
+        { name: 'System Prompt', value: (chatbot?.system_prompt_override ? 'Overridden for this server' : 'Default (SYSTEM.md)') },
+        { name: 'Persona', value: (chatbot?.chatbot_prompt ? 'Set' : 'None') },
+        { name: 'Model', value: chatbot?.model ?? `${DEFAULT_MODEL} (default)` },
+        { name: 'Reasoning Effort', value: chatbot?.reasoning_effort ?? `${DEFAULT_REASONING_EFFORT} (default)` },
       );
+  },
+  async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
+    const focusedValue = interaction.options.getFocused().toLowerCase();
+
+    if (interaction.options.getSubcommand() === 'model') {
+      // matches on the id or name. ids starting with the query come first, e.g. "anthropic/" lists anthropic's models
+      const matches = getModels()
+        .filter((model) => model.id.toLowerCase().includes(focusedValue) || model.name.toLowerCase().includes(focusedValue))
+        .sort((a, b) => Number(b.id.toLowerCase().startsWith(focusedValue)) - Number(a.id.toLowerCase().startsWith(focusedValue)))
+        .slice(0, 25);
+
+      await interaction.respond(matches.map((model) => ({
+        name: `${model.name} · tools ${supportsTools(model.id) ? '✓' : '✗'} · ${formatPricing(model)}`.substring(0, 100),
+        value: model.id.substring(0, 100),
+      })));
+      return;
+    }
+    if (interaction.options.getSubcommand() === 'reasoning-effort') {
+      // only the levels the current model supports, marking its own default
+      const modelID = getChatbot(serverID)?.model ?? DEFAULT_MODEL;
+      const modelDefault = findModel(modelID)?.reasoning?.default_effort;
+
+      await interaction.respond(getSupportedEfforts(modelID)
+        .filter((effort) => effort.includes(focusedValue))
+        .map((effort) => ({ name: effort === modelDefault ? `${effort} (model's default)` : effort, value: effort })));
+      return;
+    }
+
+    if (interaction.options.getSubcommandGroup() === 'memories') {
+      const filtered = getVisibleMemories(serverID)
+        .filter((m) => m.name.toLowerCase().includes(focusedValue))
+        .slice(0, 25);
+
+      await interaction.respond(filtered.map((m) => ({ name: m.name, value: m.name })));
+      return;
+    }
+
+    // newest first, matching on either the id or the summary text
+    const summaries = getServerSummaries(serverID).reverse();
+    const filtered = summaries
+      .filter((s) => s.conversation_id.startsWith(focusedValue) || s.summary.toLowerCase().includes(focusedValue))
+      .slice(0, 25);
+
+    await interaction.respond(filtered.map((s) => ({
+      name: `[${summaryScopeLabel(s)}] ${new Date(s.timestamp).toLocaleDateString()}: ${s.summary.replace(/\s+/g, ' ')}`.substring(0, 100),
+      value: summaryKey(s),
+    })));
   },
 };
 
 // have to have these commands separate from Chatbot, as anyone may use this command, and i cannot change perms between subcommands.
 const SubscribeCommand: Command = {
-  data: new SlashCommandBuilder().setName('subscribe').setDescription('Subscribe to the chatbot, allowing it to reply and talk to you.'),
+  data: new SlashCommandBuilder().setName('subscribe').setDescription('Subscribe to the chatbot, allowing it to reply and talk to you.')
+    .addBooleanOption((shareOption) => shareOption.setName('share-across-servers')
+      .setDescription('Let the chatbot remember your conversations here in other servers too. Defaults to False')),
   async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake) {
     const userID = interaction.user.id;
-    const isSubscriber = isChatbotSubscriber(serverID, userID);
+    const shareOption = interaction.options.getBoolean('share-across-servers');
+    const subscriber = getChatbotSubscriber(serverID, userID);
 
-    if (isSubscriber) {
-      interaction.reply({ content: 'You are already subscribed!', flags: MessageFlags.Ephemeral });
+    // already subscribed, so the only thing to do is change whether they share
+    if (subscriber) {
+      if (shareOption === null || shareOption === subscriber.cross_server) {
+        interaction.reply({
+          content: `You are already subscribed${subscriber.cross_server ? ', and sharing across servers' : ''}!`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      setChatbotSubscriberCrossServer(serverID, userID, shareOption);
+      interaction.reply({
+        content: shareOption
+          ? 'You\'re now sharing across servers! Your future conversations here can be remembered in other servers.'
+          : 'You\'ve stopped sharing across servers. Your future conversations here will stay in this server.',
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
 
-    addChatbotSubscriber(serverID, userID);
-    interaction.reply({ content: 'Successfully subscribed you!', flags: MessageFlags.Ephemeral });
+    addChatbotSubscriber(serverID, userID, shareOption ?? false);
+    interaction.reply({ content: `Successfully subscribed you${shareOption ? ', and shared across servers' : ''}!`, flags: MessageFlags.Ephemeral });
   },
 };
 const UnsubscribeCommand: Command = {
@@ -616,8 +945,8 @@ const HeartboardCommand: ConfigCommand = {
     const heartBoards = getHeartBoardsByServer(serverID);
     const choices = heartBoards.map((heartBoard) => heartBoard.board_name);
 
-    const filtered = choices.filter((choice) => choice.startsWith(focusedValue));
-    interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
+    const filtered = choices.filter((choice) => choice.startsWith(focusedValue)).slice(0, 25);
+    await interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
   },
 };
 
@@ -848,8 +1177,8 @@ const VoicePingCommand: ConfigCommand = {
     const voicePings = getVoicePingsByServer(serverID);
     const choices = voicePings.map((voicePing) => voicePing.voiceping_name);
 
-    const filtered = choices.filter((choice) => choice.startsWith(focusedValue));
-    interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
+    const filtered = choices.filter((choice) => choice.startsWith(focusedValue)).slice(0, 25);
+    await interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
   },
 };
 
@@ -1043,8 +1372,8 @@ const ResponseCommand: ConfigCommand = {
     const responses = getAutomaticResponsesByServer(serverID);
     const choices = responses.map((response) => response.name);
 
-    const filtered = choices.filter((choice) => choice.startsWith(focusedValue));
-    interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
+    const filtered = choices.filter((choice) => choice.startsWith(focusedValue)).slice(0, 25);
+    await interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
   },
   configEmbedBuilder(serverID: Snowflake, automaticResponse: AutomaticResponseTable) {
     return new EmbedBuilder().setTitle(automaticResponse.name)
@@ -1206,8 +1535,8 @@ const ReminderCommand: ConfigCommand = {
     const reminders = getRemindersByServer(serverID);
     const choices = reminders.map((response) => response.reminder_name);
 
-    const filtered = choices.filter((choice) => choice.startsWith(focusedValue));
-    interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
+    const filtered = choices.filter((choice) => choice.startsWith(focusedValue)).slice(0, 25);
+    await interaction.respond(filtered.map((choice) => ({ name: choice, value: choice })));
   },
   configEmbedBuilder(serverID: Snowflake, reminder: ReminderTable) {
     return new EmbedBuilder().setTitle('Reminder Settings')
@@ -1221,6 +1550,98 @@ const ReminderCommand: ConfigCommand = {
   },
 };
 
+const CounterCommand: Command = {
+  data: new SlashCommandBuilder().setName('counter').setDescription('Create counters to keep track of numbers')
+    .addSubcommand((createSubcommand) => createSubcommand.setName('create').setDescription('Create a counter')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the counter. Not case-sensitive')
+        .setRequired(true).setMaxLength(40))
+      .addIntegerOption((startOption) => startOption.setName('start').setDescription('Starting value of the counter. Defaults to 0')))
+    .addSubcommand((addSubcommand) => addSubcommand.setName('add').setDescription('Add to a counter. Use a negative amount to subtract')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the counter')
+        .setRequired(true).setAutocomplete(true))
+      .addIntegerOption((amountOption) => amountOption.setName('amount').setDescription('Amount to add. Defaults to 1')))
+    .addSubcommand((setSubcommand) => setSubcommand.setName('set').setDescription('Set a counter to a specific value')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the counter')
+        .setRequired(true).setAutocomplete(true))
+      .addIntegerOption((valueOption) => valueOption.setName('value').setDescription('New value of the counter')
+        .setRequired(true)))
+    .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View a counter, or every counter in this server')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the counter. Leave blank to view all')
+        .setAutocomplete(true)))
+    .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete').setDescription('Delete a counter')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the counter')
+        .setRequired(true).setAutocomplete(true))),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+    const subcommand = interaction.options.getSubcommand();
+    const nameOption = interaction.options.getString('name');
+
+    if (subcommand === 'create') {
+      if (getCounter(serverID, nameOption!)) {
+        interaction.reply({ content: 'There is already a counter with this name! Please try a different name!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const value = interaction.options.getInteger('start') ?? 0;
+      insertCounter({ server_id: serverID, counter_name: nameOption!, value });
+
+      interaction.reply({ content: `Created counter **${nameOption}**, starting at ${value}!`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'view' && !nameOption) {
+      const counters = getCountersByServer(serverID);
+      if (counters.length === 0) {
+        interaction.reply({ content: 'There are no counters in this server! Try making one with /counter create', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      // one line per counter, since embed descriptions fit far more than the 25 field limit
+      const counterEmbed = new EmbedBuilder().setTitle('Counters')
+        .setDescription(counters.map((counter) => `**${counter.counter_name}**: ${counter.value}`).join('\n').substring(0, 4096));
+      interaction.reply({ embeds: [counterEmbed], flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    // every other subcommand works on an existing counter
+    const counter = getCounter(serverID, nameOption!);
+    if (!counter) {
+      interaction.reply({ content: 'There is no counter by this name, ensure you\'ve spelled it correctly', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (subcommand === 'add') {
+      const amount = interaction.options.getInteger('amount') ?? 1;
+      const newValue = incrementCounter(serverID, counter.counter_name, amount);
+
+      // public, so everyone sees the count go up
+      interaction.reply({ content: `**${counter.counter_name}**: ${newValue} (${amount >= 0 ? '+' : ''}${amount})` });
+      return;
+    }
+    if (subcommand === 'set') {
+      const value = interaction.options.getInteger('value')!;
+      setCounterValue(serverID, counter.counter_name, value);
+
+      interaction.reply({ content: `**${counter.counter_name}** set to ${value} (was ${counter.value})` });
+      return;
+    }
+    if (subcommand === 'view') {
+      interaction.reply({ content: `**${counter.counter_name}**: ${counter.value}`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'delete') {
+      deleteCounter(serverID, counter.counter_name);
+      interaction.reply({ content: `Successfully deleted counter **${counter.counter_name}**! It was at ${counter.value}`, flags: MessageFlags.Ephemeral });
+    }
+  },
+  async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
+    const focusedValue = interaction.options.getFocused().toLowerCase();
+
+    const filtered = getCountersByServer(serverID)
+      .filter((counter) => counter.counter_name.toLowerCase().includes(focusedValue))
+      .slice(0, 25);
+    await interaction.respond(filtered.map((counter) => ({ name: `${counter.counter_name} (${counter.value})`.substring(0, 100), value: counter.counter_name })));
+  },
+};
+
 commandMap.set(ChatbotCommand.data.name, ChatbotCommand);
 commandMap.set(SubscribeCommand.data.name, SubscribeCommand);
 commandMap.set(UnsubscribeCommand.data.name, UnsubscribeCommand);
@@ -1228,5 +1649,6 @@ commandMap.set(HeartboardCommand.data.name, HeartboardCommand);
 commandMap.set(VoicePingCommand.data.name, VoicePingCommand);
 commandMap.set(ResponseCommand.data.name, ResponseCommand);
 commandMap.set(ReminderCommand.data.name, ReminderCommand);
+commandMap.set(CounterCommand.data.name, CounterCommand);
 
-export { commandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, HeartboardCommand, VoicePingCommand };
+export { commandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, CounterCommand, HeartboardCommand, VoicePingCommand };

@@ -2,11 +2,13 @@ import { BaseMessageOptions, Channel, Client, EmbedBuilder, Events, GuildMember,
 import cron from 'node-cron';
 
 import { commandMap } from './commands';
-import { handleChatbotReply } from './chatbot';
+import { handleChatbotReply, markMessageDeleted } from './chatbot/chatbot';
 
 import { Command } from './types/bot';
-import { addResponseMessage, deleteChatbotShortTermMemory, deleteHeartBoardMessage, deleteResponseMessage, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotShortTermMemory, isChatbotSubscriber, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, syncDatabase, updateHeartBoardMessage } from './data';
+import { addResponseMessage, deleteConversationMessageByID, deleteHeartBoardMessage, deleteResponseMessage, getAllConversations, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotSubscriber, isConversationMessage, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, updateDatabase, updateHeartBoardMessage } from './data';
 import { sendReminder } from './utils';
+import { scheduleExpireTask } from './chatbot/conversation';
+import { loadModels } from './chatbot/models';
 
 const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boolean> | PartialMessage<boolean>, reaction: MessageReaction): BaseMessageOptions => {
   const authorName = author?.nickname ?? author?.displayName;
@@ -39,8 +41,10 @@ function clientEvents(discordClient: Client) {
   discordClient.on(Events.ClientReady, async () => {
     console.log(`Client logged in as ${discordClient.user?.tag}!`);
 
+    loadModels(); // so /chatbot model autocomplete is fast from the first use
+
     // verify all server data
-    syncDatabase();
+    updateDatabase();
 
     const guilds = await discordClient.guilds.fetch();
     guilds.forEach(async (guild) => {
@@ -73,6 +77,11 @@ function clientEvents(discordClient: Client) {
         });
       });
     });
+
+    const conversations = getAllConversations();
+    conversations.forEach((conversation) => {
+      scheduleExpireTask(conversation);
+    });
   });
 
   // Add server to data when bot joins
@@ -99,7 +108,11 @@ function clientEvents(discordClient: Client) {
     if (!command) { console.error(`No command found! Command Name: ${interaction.commandName}`); return; }
 
     if (interaction.isAutocomplete()) {
-      command.autocomplete!(interaction, serverID);
+      try {
+        await command.autocomplete?.(interaction, serverID);
+      } catch (error) {
+        console.error(error); // discord just shows "loading options failed", so this is the only place the cause shows up
+      }
       return;
     }
 
@@ -182,18 +195,29 @@ function clientEvents(discordClient: Client) {
     await handleChatbotReply(serverID, typingExtension, message, userContent, messageReference, context ?? []);
   });
 
-  discordClient.on(Events.MessageDelete, async (message) => {
-    const serverID = message.guild?.id;
+  const handleMessageDelete = (serverID: string, messageID: string) => {
+    // a reply may still be generating, with this message waiting to be saved once it's done. make sure it isn't
+    markMessageDeleted(messageID);
 
-    if (!serverID) return; // only care if it's in a server
-
-    const messageID = message.id;
-    if (isChatbotShortTermMemory(serverID, messageID)) {
-      deleteChatbotShortTermMemory(serverID, messageID);
+    if (isConversationMessage(messageID)) {
+      deleteConversationMessageByID(messageID);
     }
     if (isResponseMessage(serverID, messageID)) {
       deleteResponseMessage(serverID, messageID);
     }
+  };
+
+  // NOTE: messages may be partial (only id, channel, and guild), if they weren't cached
+  discordClient.on(Events.MessageDelete, async (message) => {
+    const serverID = message.guildId;
+    if (!serverID) return; // only care if it's in a server
+
+    handleMessageDelete(serverID, message.id);
+  });
+  // e.g. a moderator purging messages
+  discordClient.on(Events.MessageBulkDelete, async (messages, channel) => {
+    const serverID = channel.guildId;
+    messages.forEach((message) => handleMessageDelete(serverID, message.id));
   });
 
   // On user joining/leaving voice call
@@ -232,6 +256,9 @@ function clientEvents(discordClient: Client) {
     const { message } = reaction;
 
     if (!message.guild) return;
+    // uncached messages arrive partial, with no reaction count, which would read as 0 and remove heartboard posts.
+    // these never reached here before partials were enabled, so skip them, as before
+    if (message.partial) return;
 
     const { guild, id: messageID } = message;
 

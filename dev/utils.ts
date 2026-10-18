@@ -1,12 +1,18 @@
 import { Channel } from 'discord.js';
 import cron from 'node-cron';
 import { deleteReminder, getReminder } from './data';
+import { localEncoder } from '.';
 
 function discordToDate(date: number): Date {
   return new Date(date * 1000);
 }
 function dateToCron(date: Date): string {
   return `${date.getSeconds()} ${date.getMinutes()} ${date.getHours()} ${date.getDate()} ${date.getMonth() + 1} *`;
+}
+
+// same as dateToCron, but also takes a date in millis (e.g. a conversation's expires_at)
+function millisToCronSchedule(date: Date | number): string {
+  return dateToCron(new Date(date));
 }
 
 function inputToSchedule(scheduleStr: string): string | undefined {
@@ -37,6 +43,8 @@ function sendReminder(outputChannel: Channel, serverID: string, reminderName: st
 }
 
 function dotProduct(vecA: number[], vecB: number[]) {
+  if (vecA.length === 0 || vecB.length === 0) return 0;
+
   let sum = 0;
   for (let i = 0; i < vecA.length; i++) {
     sum += vecA[i] * vecB[i];
@@ -45,17 +53,8 @@ function dotProduct(vecA: number[], vecB: number[]) {
   return sum;
 }
 
-function toBlob(vector: number[] | undefined) {
-  if (!vector) return undefined;
-
-  const f32 = Float32Array.from(vector);
-  return Buffer.from(f32.buffer, f32.byteOffset, f32.byteLength);
-}
-function fromBlob(blob: Buffer | undefined) {
-  if (!blob) return undefined;
-  // slice() copies into a fresh ArrayBuffer, which guarantees 4-byte alignment
-  const f32 = new Float32Array(blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength));
-  return Array.from(f32);
+function estimateTokens(text: string): number {
+  return localEncoder.encode(text).length;
 }
 
 const safeFetch = async <T>(fetcher: () => Promise<T>): Promise<T | undefined> => {
@@ -90,4 +89,4 @@ function splitPoint(window: string, inCode: boolean): number {
   return window.length; // hard cut as a last resort
 }
 
-export { discordToDate, dateToCron, inputToSchedule, sendReminder, dotProduct, toBlob, fromBlob, safeFetch, trackFence, splitPoint };
+export { discordToDate, dateToCron, millisToCronSchedule, inputToSchedule, sendReminder, dotProduct, estimateTokens, safeFetch, trackFence, splitPoint };

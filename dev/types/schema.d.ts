@@ -60,32 +60,79 @@ interface ChatbotTable {
 
   chatbot_enabled: boolean,
   tools_enabled: boolean,
-  chatbot_prompt: string,
-  chatbot_core_memory: string;
+  detached: boolean, // true = keeps its own context, instead of sharing the 'main' context with other servers
+  model?: string, // openrouter model id, e.g. z-ai/glm-5.3. the default model if unset
+  reasoning_effort?: string, // e.g. low, high, max. which ones work depends on the model. the default effort if unset
+  system_prompt_override?: string, // replaces SYSTEM.md for this server, if set
+  chatbot_prompt: string, // the server's persona, layered on top of the system prompt. Empty for none
 }
-interface ChatbotSubscriberTable {
-  server_id: Snowflake,
-  user_id: Snowflake;
+interface MemoryTable {
+  name: string,
+  source_id: string, // where the memory belongs: the server id on discord, the post path on bluesky, or 'main' if shared between servers
+  content: string,
 }
-interface ChatbotLongTermMemoryTable {
-  server_id: Snowflake,
-  memory_id: number,
-  message_content: string,
-  timestamp: number;
+interface ConversationTable {
+  conversation_id: string,
+  platform: 'discord' | 'bluesky',
+  channel_id?: string, // channel the conversation takes place in, if the platform has them
+  source_id?: string, // where the conversation came from: the server id on discord, or the post path on bluesky
+  expires_at: number; // date in millis
 }
-interface ChatbotShortTermMemoryTable {
-  server_id: Snowflake,
-  message_id: Snowflake,
-  reference_id?: Snowflake,
+interface ConversationMessageTable {
+  conversation_id: string,
+  message_id: string,
+  reference_id?: string,
 
-  embedding: number[] | undefined,
+  token_count?: number,
 
   author_name: string,
-  author_id: Snowflake,
+  author_id: string,
   role: 'system' | 'user' | 'assistant',
 
   message_content: string,
   timestamp: number;
+}
+interface ConversationSummaryTable {
+  conversation_id: string,
+  // where the conversation took place: `{server_id}#{channel_id}` on discord, or the post path on bluesky.
+  // prefixed with `main#` for the copy shared between servers. See toSummarySource/fromSummarySource
+  source_id: string,
+  summary: string,
+  timestamp: number,
+  embedding: number[] | undefined;
+}
+interface ConversationToolResultTable {
+  conversation_id: string,
+  tool_name: string,
+  tool_call_id: string,
+  timestamp: number,
+  output: string;
+}
+interface IndexUserTable {
+  conversation_id: string,
+  user_id: string,
+  shorthand: string;
+}
+interface IndexMessageTable {
+  conversation_id: string,
+  message_id: string,
+  shorthand: string;
+}
+interface IndexChannelTable {
+  conversation_id: string,
+  channel_id: string,
+  shorthand: string;
+}
+interface IndexRoleTable {
+  conversation_id: string,
+  role_id: string,
+  shorthand: string;
+}
+
+interface ChatbotSubscriberTable {
+  server_id: Snowflake,
+  user_id: Snowflake,
+  cross_server: boolean; // whether the user's messages from this server may be shared with other servers
 }
 interface SavedAnonymizedChat {
   server_id: Snowflake,
@@ -109,11 +156,16 @@ interface ResponseMessageTable {
   message_id: Snowflake;
 }
 
+interface CounterTable {
+  server_id: Snowflake,
+  counter_name: string, // not case-sensitive
+  value: number;
+}
 interface ReminderTable {
   server_id: Snowflake,
   reminder_name: string,
-
   channel_id: Snowflake,
+
   repeats: boolean,
   cron_schedule: string,
   message_content: string;
@@ -121,6 +173,6 @@ interface ReminderTable {
 
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
-  AutomaticResponseTable, ResponseMessageTable, ReminderTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
-  ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, ChatbotLongTermMemoryTable, ChatbotShortTermMemoryTable, /* AI-related structures */
+  AutomaticResponseTable, ResponseMessageTable, ReminderTable, CounterTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
+  ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable, /* AI-related structures */
 };
