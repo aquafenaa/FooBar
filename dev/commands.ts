@@ -1445,7 +1445,7 @@ const ReminderCommand: ConfigCommand = {
 
         channel_id: outputChannel.id,
         repeats: repeatOption ?? false,
-        cron_schedule: scheduleOption,
+        cron_schedule: cronSchedule,
         message_content: messageOption,
       };
 
@@ -1469,7 +1469,7 @@ const ReminderCommand: ConfigCommand = {
         interaction.reply({ content: 'There is no reminder with this name! Please ensure you\'ve spelled it correctly!', flags: MessageFlags.Ephemeral });
         return;
       }
-      if (!scheduleOption && !messageOption && repeatOption === null) {
+      if (!scheduleOption && !messageOption && !channelOption && repeatOption === null) {
         interaction.reply({ content: 'You must edit at least one field!', flags: MessageFlags.Ephemeral });
         return;
       }
@@ -1501,6 +1501,22 @@ const ReminderCommand: ConfigCommand = {
       }
 
       updateReminder(reminder);
+
+      // if schedule or channel has changed, recreate cron task
+      if (scheduleOption || channelOption) {
+        const taskName = `${reminder.server_id}${reminder.reminder_name}`;
+        cron.getTasks().forEach((task) => {
+          if (task.name === taskName) {
+            task.destroy();
+          }
+        });
+
+        const outputChannel = (await interaction.guild!.channels.fetch(reminder.channel_id))!;
+        cron.schedule(reminder.cron_schedule, () => sendReminder(outputChannel, serverID, reminder.reminder_name), {
+          name: taskName,
+        });
+      }
+
       interaction.reply({ content: 'Successfully updated reminder!', flags: MessageFlags.Ephemeral });
       // return;
     }

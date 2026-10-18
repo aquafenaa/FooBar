@@ -9,7 +9,7 @@ import { MessageParam, OutputConfig, ToolResultBlockParam, ToolUnion, ToolUseBlo
 
 import { existsSync, readFileSync } from 'fs';
 
-import { getChatbot, getConversationByChannel, getConversationMessages, getConversationTokenCount, getConversationToolResults, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, insertConversationMessage, insertConversationToolResult, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, upsertConversation } from '../data';
+import { getChatbot, getConversationByChannel, getConversationMessages, getConversationTokenCount, getConversationToolResults, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, insertConversationMessage, insertConversationToolResult, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
 import { ChatbotTable, ConversationMessageTable, ConversationTable, ConversationToolResultTable } from '../types/schema';
 import { estimateTokens, millisToCronSchedule, safeFetch, splitPoint, trackFence } from '../utils';
 import { anthropicClient, discordClient, openAIClient } from '..';
@@ -253,9 +253,14 @@ async function formatInput(guild: Guild, currentChannel: SendableChannels, conve
  * Splits a finished LLM response into Discord-safe message chunks (<= 2000 chars),
  * preserving open code fences across the split.
 */
-async function formatResponse(agentResponse: string): Promise<string[]> {
+async function formatResponse(conversationID: string, agentResponse: string): Promise<string[]> {
   const chunks: string[] = [];
-  let rest = agentResponse.replace(/(?<!")\[\$\d+\]|\[\$\d+\](?!")/g, ''); // replace local message numbers from output
+  let rest = agentResponse
+    // turn user, channel, & role shorthands back into Discord mentions. unknown ones are left as written
+    .replace(/\[@\d+\]/g, (ref) => { const id = resolveUserRef(conversationID, ref); return id ? `<@${id}>` : ref; })
+    .replace(/\[#\d+\]/g, (ref) => { const id = resolveChannelRef(conversationID, ref); return id ? `<#${id}>` : ref; })
+    .replace(/\[&\d+\]/g, (ref) => { const id = resolveRoleRef(conversationID, ref); return id ? `<@&${id}>` : ref; })
+    .replace(/(?<!")\[\$\d+\]|\[\$\d+\](?!")/g, ''); // replace local message numbers from output
   let open: string | null = null; // fence line still open at the start of `rest`
 
   while (rest.length > 0) {
@@ -574,7 +579,7 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
       insertConversationToolResult(tool);
       return `> -# used ${tool.tool_name}`;
     }).join('\n');
-    const replyArr = await formatResponse(`${toolStr}\n\n${streamStr}`);
+    const replyArr = await formatResponse(conversation.conversation_id, `${toolStr}\n\n${streamStr}`);
 
     toolMessage.delete();
 

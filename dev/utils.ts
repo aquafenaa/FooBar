@@ -25,16 +25,18 @@ function inputToSchedule(scheduleStr: string): string | undefined {
     : dateToCron(discordToDate(Number(scheduleStr.match(/<t:(\d+):\w>/)?.[1])));
 }
 
-function sendReminder(outputChannel: Channel, serverID: string, reminderName: string) {
+async function sendReminder(outputChannel: Channel, serverID: string, reminderName: string) {
   const reminder = getReminder(serverID, reminderName);
   if (!reminder) return;
 
   try {
-    if (outputChannel.isSendable()) {
-      outputChannel.send(reminder.message_content);
+    if (!outputChannel.isSendable()) {
+      console.error(`Reminder "${reminderName}" (server ${serverID}): channel ${outputChannel.id} is not sendable`);
+    } else {
+      await outputChannel.send(reminder.message_content);
     }
   } catch (error) {
-    console.error(error);
+    console.error(`Reminder "${reminderName}" (server ${serverID}) failed to send:`, error);
   }
 
   if (!reminder.repeats) {
