@@ -24,13 +24,15 @@ If you would like to add this bot to your own server, feel free! If you encounte
   - [x] Reformat entire chat for better model understanding
   - [ ] Skills
     - [ ] Change nickname
-    - [ ] Reminder / Message scheduler
+    - [x] Reminder / Message scheduler
     - [ ] Get profile / bio (?)
     - [ ] Play sounds in voice chat (?)
-  - [ ] Limit money hemorrhaging
+  - [ ] "Retry response" button
+    - [ ] ◀️▶️ for switching between responses
+  - [x] Limit money hemorrhaging
     - [x] Allow ability to enable or disable tool calls per server
     - [x] Check "relevancy" via top-k embedding similarity
-    - [ ] Perhaps paid tiers for greater limits
+    - [ ] ~~Perhaps paid tiers for greater limits~~
     - [ ] Give k characters as context, not simply n messages
 
 - [ ] Show ratings
@@ -38,7 +40,8 @@ If you would like to add this bot to your own server, feel free! If you encounte
 - [ ] Position Tracker
   - Command to keep track of position in shows
   - Includes season, episode, and possible time
-
+- [x] Counter
+  - Create counters to store numbers
 
 - [ ] Woke Meter
   - [ ] You can upvote or downvote a message there's the woker of the month

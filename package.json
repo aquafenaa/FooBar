@@ -1,17 +1,19 @@
 {
   "dependencies": {
     "@ai-sdk/xai": "^4.0.30",
+    "@anthropic-ai/sdk": "^0.134.0",
     "@discord-player/extractor": "^4.4.0",
     "@discord-player/utils": "^0.2.2",
     "@discordjs/opus": "github:discordjs/opus",
     "ai": "^7.0.55",
     "better-sqlite3": "^12.5.0",
-    "discord.js": "^14.11.0",
+    "discord.js": "^14.27.0",
     "dotenv": "^16.3.1",
-    "express": "^5.2.1",
+    "js-tiktoken": "^1.0.21",
     "node-cron": "^4.6.0",
-    "openai": "^5.1.1",
-    "postgres": "^3.4.7"
+    "openai": "^7.32.0",
+    "postgres": "^3.4.7",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
@@ -21,7 +23,7 @@
     "eslint-config-airbnb-typescript": "^17.0.0",
     "eslint-plugin-import": "^2.27.5",
     "eslint-plugin-jsx-a11y": "^6.7.1",
-    "typescript": "^4.9.5"
+    "typescript": "^7.0.2"
   },
   "name": "foobar",
   "version": "1.0.0",
@@ -32,5 +34,9 @@
   },
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "",
+  "allowScripts": {
+    "better-sqlite3@12.5.0": true,
+    "github:discordjs/opus#3f4a3d4cc3997107435a59ae86bc044d6c3be73e": true
+  }
 }

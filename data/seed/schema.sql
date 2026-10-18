@@ -55,17 +55,6 @@ CREATE TABLE IF NOT EXISTS HeartBoardMessage(
   PRIMARY KEY (server_id, board_name, message_id)
 );
 
--- CREATE TABLE IF NOT EXISTS VectorEmbedding(
---   server_id VARCHAR(20) NOT NULL,
---   stm_id VARCHAR(20) NOT NULL,
-
---   embedding BLOB NOT NULL,
-
---   PRIMARY KEY (server_id, stm_id),
---   FOREIGN KEY (server_id) REFERENCES Server(server_id) ON DELETE CASCADE,
---   FOREIGN KEY (server_id, stm_id) REFERENCES ChatbotShortTermMemory(server_id, stm_id) ON DELETE CASCADE,
--- );
-
 CREATE TABLE IF NOT EXISTS VoicePing(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
   voiceping_name TEXT NOT NULL,
@@ -90,37 +79,18 @@ CREATE TABLE IF NOT EXISTS Chatbot(
 
   chatbot_enabled BOOLEAN,
   tools_enabled BOOLEAN,
-  chatbot_prompt TEXT,
-  chatbot_core_memory TEXT
+  detached BOOLEAN,
+  model TEXT,
+  reasoning_effort TEXT,
+  system_prompt_override TEXT,
+  chatbot_prompt TEXT
 );
 CREATE TABLE IF NOT EXISTS ChatbotSubscriber(
   server_id VARCHAR(20) REFERENCES Server(server_id) ON DELETE CASCADE,
   user_id VARCHAR(20),
+  cross_server BOOLEAN,
 
   PRIMARY KEY(server_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS ChatbotLongTermMemory(
-  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
-  memory_id INTEGER NOT NULL,
-  message_content VARCHAR(2000),
-
-  timestamp INTEGER,
-  PRIMARY KEY (server_id, memory_id)
-);
-CREATE TABLE IF NOT EXISTS ChatbotShortTermMemory(
-  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
-  message_id VARCHAR(20) NOT NULL,
-  reference_id VARCHAR(20),
-
-  author_name VARCHAR(40) NOT NULL,
-  author_id VARCHAR(20) NOT NULL,
-  embedding BLOB,
-  
-  role VARCHAR (9),
-  message_content VARCHAR(2000),
-  timestamp INTEGER,
-  
-  PRIMARY KEY (server_id, message_id)
 );
 CREATE TABLE IF NOT EXISTS SavedAnonymizedChats(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
@@ -130,6 +100,84 @@ CREATE TABLE IF NOT EXISTS SavedAnonymizedChats(
   message_content VARCHAR(2000) NOT NULL,
 
   PRIMARY KEY (server_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS Memory(
+  source_id VARCHAR(50) NOT NULL,
+  name VARCHAR(100) NOT NULL COLLATE NOCASE,
+  content TEXT NOT NULL,
+
+  PRIMARY KEY (source_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS Conversation(
+  conversation_id VARCHAR(50) PRIMARY KEY,
+  platform VARCHAR(50) NOT NULL,
+  channel_id VARCHAR(50),
+  source_id VARCHAR(50),
+  expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ConversationMessage(
+  conversation_id VARCHAR(50) NOT NULL REFERENCES Conversation(conversation_id) ON DELETE CASCADE,
+  message_id VARCHAR(50) NOT NULL,
+  reference_id VARCHAR(50),
+
+  token_count INTEGER NOT NULL,
+
+  author_name VARCHAR(40) NOT NULL,
+  author_id VARCHAR(50) NOT NULL,
+
+  role VARCHAR (9),
+  message_content TEXT,
+  timestamp INTEGER,
+
+  PRIMARY KEY (conversation_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS ConversationToolResult(
+  conversation_id VARCHAR(50) NOT NULL REFERENCES Conversation(conversation_id) ON DELETE CASCADE,
+  tool_name VARCHAR(50) NOT NULL,
+  tool_call_id VARCHAR(100) NOT NULL,
+  timestamp INTEGER,
+  output TEXT,
+
+  PRIMARY KEY (conversation_id, tool_call_id)
+);
+CREATE TABLE IF NOT EXISTS ConversationSummary(
+  conversation_id VARCHAR(50) NOT NULL REFERENCES Conversation(conversation_id) ON DELETE CASCADE,
+  source_id VARCHAR(100) NOT NULL,
+  summary TEXT,
+  timestamp INTEGER,
+  embedding BLOB,
+
+  PRIMARY KEY (conversation_id, source_id)
+);
+CREATE TABLE IF NOT EXISTS IndexUser(
+  conversation_id VARCHAR(50) NOT NULL REFERENCES Conversation(conversation_id) ON DELETE CASCADE,
+  user_id VARCHAR(20) NOT NULL,
+  shorthand VARCHAR(20) NOT NULL,
+
+  PRIMARY KEY (conversation_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS IndexMessage(
+  conversation_id VARCHAR(50) NOT NULL REFERENCES Conversation(conversation_id) ON DELETE CASCADE,
+  message_id VARCHAR(20) NOT NULL,
+  shorthand VARCHAR(20) NOT NULL,
+
+  PRIMARY KEY (conversation_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS IndexChannel(
+  conversation_id VARCHAR(50) NOT NULL REFERENCES Conversation(conversation_id) ON DELETE CASCADE,
+  channel_id VARCHAR(20) NOT NULL,
+  shorthand VARCHAR(20) NOT NULL,
+
+  PRIMARY KEY (conversation_id, channel_id)
+);
+CREATE TABLE IF NOT EXISTS IndexRole(
+  conversation_id VARCHAR(50) NOT NULL REFERENCES Conversation(conversation_id) ON DELETE CASCADE,
+  role_id VARCHAR(20) NOT NULL,
+  shorthand VARCHAR(20) NOT NULL,
+
+  PRIMARY KEY (conversation_id, role_id)
 );
 
 CREATE TABLE IF NOT EXISTS AutomaticResponse(
@@ -160,4 +208,12 @@ CREATE TABLE IF NOT EXISTS Reminder(
   message_content TEXT,
 
   PRIMARY KEY (server_id, reminder_name)
+);
+
+CREATE TABLE IF NOT EXISTS Counter(
+  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
+  counter_name VARCHAR(40) NOT NULL COLLATE NOCASE,
+  value INTEGER NOT NULL DEFAULT 0,
+
+  PRIMARY KEY (server_id, counter_name)
 );
