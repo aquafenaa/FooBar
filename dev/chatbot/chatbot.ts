@@ -23,6 +23,7 @@ const { DISCORD_ID } = process.env;
 
 const MAX_MESSAGE_LENGTH = 2000;
 const PADDING_LENGTH = 8;
+const ALLOWED_QUANTIZATIONS = ['fp8', 'fp16', 'bf16', 'fp32'];
 const MAX_TOOL_STEPS = 5; // number of model calls allowed per reply, when it keeps asking for tools
 const DELETED_MEMORY_DURATION = 10 * 60_000; // 10 minutes, far longer than a reply takes to generate
 const MAX_PROMPT_TOOL_RESULTS = 10; // most recent tool results given back to the model each reply
@@ -423,7 +424,7 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
     <memory_list>
       ${memories.map((memory) => memory.name).join('\n')}
     </memory_list>
-    <conversation conversation_id="${conversation.conversation_id}" server_id="${serverID}" date="${new Date().toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'long' })}" />
+    <conversation conversation_id="${conversation.conversation_id}" server_id="${serverID}" current_date="${new Date().toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'long' })}" />
     <index>
       ${indexMsg.content}
     </index>`;
@@ -501,7 +502,10 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
         output_config: { effort: (chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT) as OutputConfig['effort'] },
         messages,
         tools,
-      });
+        // openrouter-only, so the sdk's type doesn't list it. skips providers serving heavily quantized (int4/int8/fp4/fp6) weights.
+        // 'unknown' stays allowed, since closed models' providers (anthropic, xai, etc.) don't report a quantization
+        provider: { quantizations: ALLOWED_QUANTIZATIONS },
+      } as Parameters<typeof anthropicClient.messages.stream>[0]);
 
       let stepText = ''; // text from this round only, so a "let me check" before a tool call doesn't get posted alongside the real answer
       let afterToolUse = false; // server tools (web search, shell) run mid-response, so text can continue right after one
