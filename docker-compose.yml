@@ -5,7 +5,6 @@ services:
     restart: unless-stopped
     volumes:
       - workspace:/workspace
-    network_mode: none
     read_only: true
     tmpfs:
       - /tmp:size=256m

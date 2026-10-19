@@ -15,15 +15,16 @@ import { estimateTokens, millisToCronSchedule, safeFetch, splitPoint, trackFence
 import { anthropicClient, discordClient, openAIClient } from '..';
 import { endConversation, getRelevantSummaries, summarizeConversation } from './conversation';
 import localTools from './tools';
-import { getVisibleMemories, isShareable } from './context';
+import { getVisibleMemories, isAttached, isShareable } from './context';
 import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, supportsTools } from './models';
+import { isSandboxEnabled, readNotes } from './sandbox';
 
 const promptPath = path.join(__dirname, '../../data/SYSTEM.md'); // two levels up: this file is in dev/chatbot/ (src/chatbot/ once built)
 const { DISCORD_ID } = process.env;
 
 const MAX_MESSAGE_LENGTH = 2000;
 const PADDING_LENGTH = 8;
-const MAX_TOOL_STEPS = 5; // number of model calls allowed per reply, when it keeps asking for tools
+const MAX_TOOL_STEPS = 10; // number of model calls allowed per reply, when it keeps asking for tools
 const DELETED_MEMORY_DURATION = 10 * 60_000; // 10 minutes, far longer than a reply takes to generate
 const MAX_PROMPT_TOOL_RESULTS = 10; // most recent tool results given back to the model each reply
 const MAX_PROMPT_TOOL_RESULT_LENGTH = 4000; // characters of each one. the full result stays in the database
@@ -399,6 +400,9 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
   const indexMsg = agentInput.shift()!;
   const summaryStr = relevantSummaries.map((summary) => `<summary>${summary.summary}</summary>`).join('\n');
   const memories = getVisibleMemories(serverID);
+  // the workspace is shared like the main memories, so detached servers don't get it
+  const useSandbox = isSandboxEnabled() && isAttached(serverID);
+  const workspaceNotes = useSandbox ? await readNotes() : '';
   // given to every tool by the bot, never by the model
   const replyContext = {
     server_id: serverID,
@@ -423,6 +427,9 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
     <memory_list>
       ${memories.map((memory) => memory.name).join('\n')}
     </memory_list>
+    ${workspaceNotes ? `<workspace_notes>
+      ${workspaceNotes}
+    </workspace_notes>` : ''}
     <conversation conversation_id="${conversation.conversation_id}" server_id="${serverID}" current_date="${new Date().toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'long' })}" />
     <index>
       ${indexMsg.content}
@@ -435,9 +442,13 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
       type: 'openrouter:web_search',
       parameters: { engine: 'native', max_results: 20 }, // "native" on Grok includes X search
     } as unknown as ToolUnion,
-    {
+    // our own persistent workspace when it's set up and the server is attached. otherwise openrouter's shell, which is a fresh container each reply
+    ...(useSandbox ? [
+      toAnthropicTool('run_command', localTools.runCommand),
+      toAnthropicTool('write_file', localTools.writeFile),
+    ] : [{
       // runs commands in a sandbox on openrouter's side (python 3.11 and node 22 are installed), never on this machine.
-      // a fresh container each reply. network is limited to package registries, so it can still pip/npm install
+      // network is limited to package registries, so it can still pip/npm install
       type: 'openrouter:shell',
       parameters: {
         engine: 'openrouter',
@@ -446,7 +457,7 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
           network_policy: { type: 'allowlist', allowed_domains: ['*'] },
         },
       },
-    } as unknown as ToolUnion,
+    } as unknown as ToolUnion]),
     toAnthropicTool('react_to_message', localTools.reactToMessage),
     toAnthropicTool('create_reminder', localTools.createReminder),
     toAnthropicTool('edit_reminder', localTools.editReminder),
@@ -483,6 +494,9 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
     fetch_url: localTools.fetchURL,
     counter: localTools.counter,
     x_search: localTools.xSearch,
+
+    run_command: localTools.runCommand,
+    write_file: localTools.writeFile,
   };
 
   const messages = agentInput as MessageParam[];

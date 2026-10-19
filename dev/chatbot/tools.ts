@@ -7,7 +7,8 @@ import { discordClient } from '..';
 import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, setCounterValue, resolveChannelRef, resolveMessageRef, updateReminder, upsertMemory } from '../data';
 import { MemoryTable, ReminderTable } from '../types/schema';
 import { sendReminder } from '../utils';
-import { MAIN_SOURCE, findMemory, getVisibleMemories } from './context';
+import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './context';
+import { MAX_TIMEOUT, sandboxExec } from './sandbox';
 
 // filled in by the bot for each reply, rather than by the model, so the model can't get it wrong (or reach another server's memories)
 const replyContextSchema = zod.object({
@@ -675,4 +676,67 @@ const counter = tool({
   },
 });
 
-export default { reactToMessage, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, xSearch, counter };
+const SANDBOX_DESCRIPTION = 'Your own persistent Linux workspace (Debian, with python3, pip, git, curl, and jq, and internet access). '
+  + 'Everything you save there is kept between replies, conversations, and every server you share memories with. '
+  + 'Keep NOTES.md up to date with what you\'re working on and anything you\'ll want later: it\'s shown to you at the start of every reply.';
+const DETACHED_MESSAGE = 'The workspace is only available in servers attached to the shared context.';
+
+const runCommand = tool({
+  description: `Run a bash command in your workspace, and get back its output. ${SANDBOX_DESCRIPTION} `
+    + `Output is cut to the last 4000 characters. Commands are stopped after the timeout (default 30 seconds, at most ${MAX_TIMEOUT}).`,
+  inputExamples: [
+    { input: { command: 'ls -la' } },
+    { input: { command: 'python3 scripts/stats.py data.csv', timeout: 60 } },
+  ],
+  inputSchema: zod.object({
+    command: zod.string().describe('Bash command to run. Can be several lines'),
+    timeout: zod.number().int().optional().describe(`Seconds before the command is stopped. Defaults to 30, at most ${MAX_TIMEOUT}`),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { command: string, timeout?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', exit_code?: number, stdout?: string, stderr?: string, truncated?: boolean, message: string }> => {
+    // only offered to attached servers, but checked here too, so a made-up tool call can't get around it
+    if (!isAttached(context.server_id)) return { result: 'failure', message: DETACHED_MESSAGE };
+
+    try {
+      const { exit_code, stdout, stderr, timed_out, truncated } = await sandboxExec(input.command, { timeout: input.timeout });
+      return {
+        result: exit_code === 0 ? 'success' : 'failure',
+        exit_code,
+        stdout,
+        stderr,
+        truncated,
+        message: timed_out ? 'The command was stopped for taking too long.' : `The command exited with code ${exit_code}.`,
+      };
+    } catch (error: any) {
+      return { result: 'failure', message: `The workspace isn't available: ${error?.message ?? error}` };
+    }
+  },
+});
+
+// separate from run_command, since writing a file through a bash heredoc breaks on quotes and special characters
+const writeFile = tool({
+  description: `Write a file in your workspace, replacing it if it exists. Folders are created as needed. ${SANDBOX_DESCRIPTION}`,
+  inputExamples: [
+    { input: { path: 'NOTES.md', content: '# Notes\n- Working on: a dice roller in dice.py\n' } },
+  ],
+  inputSchema: zod.object({
+    path: zod.string().describe('Path of the file, relative to /workspace'),
+    content: zod.string().describe('Full content of the file'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { path: string, content: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
+    if (!isAttached(context.server_id)) return { result: 'failure', message: DETACHED_MESSAGE };
+
+    try {
+      // the path goes in as a variable and the content through stdin, so neither is ever parsed as bash
+      const { exit_code, stderr } = await sandboxExec('mkdir -p -- "$(dirname -- "$FILE")" && cat > "$FILE"', { stdin: input.content, env: { FILE: input.path }, timeout: 10 });
+      return exit_code === 0
+        ? { result: 'success', message: `Wrote ${input.content.length} characters to ${input.path}.` }
+        : { result: 'failure', message: stderr || `Writing the file failed with code ${exit_code}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: `The workspace isn't available: ${error?.message ?? error}` };
+    }
+  },
+});
+
+export default { reactToMessage, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, xSearch, counter, runCommand, writeFile };
