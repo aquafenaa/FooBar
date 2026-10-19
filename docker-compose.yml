@@ -2,6 +2,7 @@ services:
   sandbox:
     build: ./sandbox
     container_name: foobar-sandbox
+    hostname: foobar-sandbox
     restart: unless-stopped
     volumes:
       - workspace:/workspace

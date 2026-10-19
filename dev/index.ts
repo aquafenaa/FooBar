@@ -2,7 +2,6 @@ import Anthropic from '@anthropic-ai/sdk';
 import {
   REST, Routes, Client, GatewayIntentBits, Partials,
 } from 'discord.js';
-import path from 'node:path';
 
 import { OpenAI } from 'openai';
 import { getEncoding } from 'js-tiktoken';
@@ -10,8 +9,7 @@ import { getEncoding } from 'js-tiktoken';
 import { commandMap } from './commands';
 import clientEvents from './events';
 
-require('dotenv').config({ path: path.join(__dirname, '../.env') });
-
+// .env is loaded by node itself (--env-file in package.json), before any import runs
 const { DISCORD_TOKEN, CLIENT_ID, OPEN_ROUTER_KEY } = process.env;
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN!);
 

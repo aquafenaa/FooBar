@@ -30,7 +30,7 @@
   "main": "index.js",
   "scripts": {
     "test": "node ./src/index.js",
-    "start": "npx tsx ./dev/index.ts"
+    "start": "npx tsx --env-file=.env ./dev/index.ts"
   },
   "author": "",
   "license": "ISC",
