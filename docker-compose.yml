@@ -1,0 +1,21 @@
+services:
+  sandbox:
+    build: ./sandbox
+    container_name: foobar-sandbox
+    restart: unless-stopped
+    volumes:
+      - workspace:/workspace
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+
+volumes:
+  workspace:
+    name: foobar-workspace

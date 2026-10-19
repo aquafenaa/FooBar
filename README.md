@@ -13,13 +13,14 @@ If you would like to add this bot to your own server, feel free! If you encounte
 - [x] Reminder Command
   - Gives a reminder given a chron schedule
 
-- [x] Grok AI
+- [x] AI Agent
   - Opt-In LLM that responds when pinged or replied to.
   - /subscribe to Opt-In
   - [x] Command to reset AI memory
   - [x] Ability to change prompt between servers
   - [x] Publicize thinking and tool uses, but non-intrusive, closable
     - [ ] Not closable, and doesn't show context, but definitely non-intrusive
+  - [ ] Heartbeat schedule
   - [x] Resolve user pings for less model confusion
   - [x] Reformat entire chat for better model understanding
   - [ ] Skills
