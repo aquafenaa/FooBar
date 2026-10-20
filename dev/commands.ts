@@ -16,8 +16,10 @@ import { addChatbotSubscriber, addReminder, deleteAllHeartBoardEmojis, deleteAll
   deleteCounter, deleteMemory, getConversationByChannel, getCounter, getCountersByServer, incrementCounter, insertCounter, setCounterValue, getConversationSummariesBySource, getHeartBoard, upsertMemory, getHeartBoardEmojis, getHeartBoardsByServer, getReminder, getRemindersByServer, getVoicePing,
   getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertHeartBoard, insertHeartBoardEmoji,
   insertVoicePing, insertVoicePingInput, isChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, removeChatbotSubscriber, updateAutomaticResponse,
-  updateHeartBoard, updateReminder, updateVoicePing, upsertChatbot, upsertConversationSummary } from './data';
-import { AutomaticResponseTable, ChatbotTable, ConversationSummaryTable, ReminderTable, HeartBoardTable, VoicePingTable } from './types/schema';
+  updateHeartBoard, updateReminder, updateVoicePing, upsertChatbot, upsertConversationSummary,
+  getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat } from './data';
+import { AutomaticResponseTable, ChatbotTable, ConversationSummaryTable, ReminderTable, HeartbeatTable, HeartBoardTable, VoicePingTable } from './types/schema';
+import { removeHeartbeat, scheduleHeartbeat } from './chatbot/heartbeat';
 import { getEmbedding, getSystemPrompt } from './chatbot/chatbot';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
@@ -1566,6 +1568,147 @@ const ReminderCommand: ConfigCommand = {
   },
 };
 
+const HEARTBEAT_CHANNEL_TYPES = [ChannelType.GuildText, ChannelType.PublicThread, ChannelType.GuildAnnouncement, ChannelType.PrivateThread, ChannelType.GuildVoice] as const;
+
+const HeartbeatCommand: ConfigCommand = {
+  data: new SlashCommandBuilder().setName('heartbeat').setDescription('Give the chatbot a prompt on a schedule, so it can post on its own')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild) // each beat is a model call that runs by itself
+    .addSubcommand((addSubcommand) => addSubcommand.setName('add').setDescription('Add a heartbeat')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat. Not case-sensitive')
+        .setRequired(true).setMaxLength(40))
+      .addStringOption((scheduleOption) => scheduleOption.setName('schedule').setDescription('Discord @time string (<t:xxxxxxxxxx:s>) or cron schedule for the heartbeat')
+        .setRequired(true).setMaxLength(40))
+      .addStringOption((promptOption) => promptOption.setName('prompt').setDescription('What the chatbot is told each time it runs')
+        .setRequired(true).setMaxLength(2000))
+      .addStringOption((contextOption) => contextOption.setName('context').setDescription('Background shown with the prompt. The chatbot doesn\'t see the channel unless it looks')
+        .setMaxLength(2000))
+      .addChannelOption((channelOption) => channelOption.setName('channel').setDescription('Channel it posts in. Defaults to this one')
+        .addChannelTypes(...HEARTBEAT_CHANNEL_TYPES))
+      .addBooleanOption((repeatsOption) => repeatsOption.setName('repeats').setDescription('Whether it keeps running on the schedule, or runs once then deletes itself. Defaults to once')))
+    .addSubcommand((editSubcommand) => editSubcommand.setName('edit').setDescription('Edit a heartbeat')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat to edit')
+        .setRequired(true).setAutocomplete(true))
+      .addStringOption((scheduleOption) => scheduleOption.setName('schedule').setDescription('New Discord @time string or cron schedule').setMaxLength(40))
+      .addStringOption((promptOption) => promptOption.setName('prompt').setDescription('New prompt').setMaxLength(2000))
+      .addStringOption((contextOption) => contextOption.setName('context').setDescription('New background shown with the prompt').setMaxLength(2000))
+      .addChannelOption((channelOption) => channelOption.setName('channel').setDescription('New channel to post in')
+        .addChannelTypes(...HEARTBEAT_CHANNEL_TYPES))
+      .addBooleanOption((repeatsOption) => repeatsOption.setName('repeats').setDescription('Whether it keeps running on the schedule, or runs once then deletes itself')))
+    .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View a heartbeat, or every heartbeat in this server')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat. Leave blank to view all')
+        .setAutocomplete(true)))
+    .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete').setDescription('Delete a heartbeat')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat')
+        .setRequired(true).setAutocomplete(true))),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+    const subcommand = interaction.options.getSubcommand();
+    const nameOption = interaction.options.getString('name');
+    const scheduleOption = interaction.options.getString('schedule');
+    const promptOption = interaction.options.getString('prompt');
+    const contextOption = interaction.options.getString('context');
+    const channelOption = interaction.options.getChannel('channel');
+    const repeatsOption = interaction.options.getBoolean('repeats');
+
+    // both cron and Discord @time tags are accepted, and stored as cron
+    const cronSchedule = scheduleOption ? inputToSchedule(scheduleOption) : undefined;
+    if (scheduleOption && !cronSchedule) {
+      interaction.reply({ content: 'The given schedule is not a valid Discord @time or cron schedule! Please ensure it follows one of these formats!', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (subcommand === 'add') {
+      if (getHeartbeat(serverID, nameOption!)) {
+        interaction.reply({ content: 'There is already a heartbeat with this name! Please try a different name!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const heartbeat: HeartbeatTable = {
+        server_id: serverID,
+        heartbeat_name: nameOption!,
+        channel_id: channelOption?.id ?? interaction.channelId,
+        created_by: interaction.user.id,
+        repeats: repeatsOption ?? false,
+        cron_schedule: cronSchedule!,
+        prompt: promptOption!,
+        context: contextOption ?? undefined,
+      };
+      insertHeartbeat(heartbeat);
+      scheduleHeartbeat(heartbeat);
+
+      interaction.reply({ embeds: [this.configEmbedBuilder(serverID, heartbeat)], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'view' && !nameOption) {
+      const heartbeats = getHeartbeatsByServer(serverID);
+      if (heartbeats.length === 0) {
+        interaction.reply({ content: 'There are no heartbeats in this server! Try making one with /heartbeat add', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const heartbeatEmbed = new EmbedBuilder().setTitle('Heartbeats')
+        .setDescription(heartbeats.map((hb) => `**${hb.heartbeat_name}**: \`${hb.cron_schedule}\` in <#${hb.channel_id}>${hb.repeats ? '' : ' (once)'}`).join('\n').substring(0, 4096));
+      interaction.reply({ embeds: [heartbeatEmbed], flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    // every other subcommand works on an existing heartbeat
+    const heartbeat = getHeartbeat(serverID, nameOption!);
+    if (!heartbeat) {
+      interaction.reply({ content: 'There is no heartbeat by this name, ensure you\'ve spelled it correctly', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (subcommand === 'edit') {
+      if (!scheduleOption && !promptOption && !contextOption && !channelOption && repeatsOption === null) {
+        interaction.reply({ content: 'You must edit at least one field!', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const edited: HeartbeatTable = {
+        ...heartbeat,
+        cron_schedule: cronSchedule ?? heartbeat.cron_schedule,
+        prompt: promptOption ?? heartbeat.prompt,
+        context: contextOption ?? heartbeat.context,
+        channel_id: channelOption?.id ?? heartbeat.channel_id,
+        repeats: repeatsOption ?? !!heartbeat.repeats,
+      };
+      updateHeartbeat(edited);
+      scheduleHeartbeat(edited);
+
+      interaction.reply({ embeds: [this.configEmbedBuilder(serverID, edited)], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'view') {
+      interaction.reply({ embeds: [this.configEmbedBuilder(serverID, heartbeat)], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'delete') {
+      removeHeartbeat(heartbeat);
+      interaction.reply({ content: `Successfully deleted heartbeat **${heartbeat.heartbeat_name}**!`, flags: MessageFlags.Ephemeral });
+    }
+  },
+  async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
+    const focusedValue = interaction.options.getFocused().toLowerCase();
+
+    const filtered = getHeartbeatsByServer(serverID)
+      .filter((hb) => hb.heartbeat_name.toLowerCase().includes(focusedValue))
+      .slice(0, 25);
+    await interaction.respond(filtered.map((hb) => ({ name: hb.heartbeat_name, value: hb.heartbeat_name })));
+  },
+  configEmbedBuilder(serverID: Snowflake, heartbeat: HeartbeatTable) {
+    return new EmbedBuilder().setTitle('Heartbeat Settings')
+      .addFields(
+        { name: 'Name', value: heartbeat.heartbeat_name },
+        { name: 'Channel', value: `<#${heartbeat.channel_id}>` },
+        { name: 'Schedule', value: `\`${heartbeat.cron_schedule}\`` },
+        { name: 'Repeats', value: heartbeat.repeats ? 'Yes' : 'No, runs once' },
+        { name: 'Made by', value: `<@${heartbeat.created_by}>` },
+        { name: 'Prompt', value: heartbeat.prompt.substring(0, 1024) },
+        { name: 'Context', value: heartbeat.context?.substring(0, 1024) || 'None' },
+      );
+  },
+};
+
 const CounterCommand: Command = {
   data: new SlashCommandBuilder().setName('counter').setDescription('Create counters to keep track of numbers')
     .addSubcommand((createSubcommand) => createSubcommand.setName('create').setDescription('Create a counter')
@@ -1665,6 +1808,7 @@ commandMap.set(HeartboardCommand.data.name, HeartboardCommand);
 commandMap.set(VoicePingCommand.data.name, VoicePingCommand);
 commandMap.set(ResponseCommand.data.name, ResponseCommand);
 commandMap.set(ReminderCommand.data.name, ReminderCommand);
+commandMap.set(HeartbeatCommand.data.name, HeartbeatCommand);
 commandMap.set(CounterCommand.data.name, CounterCommand);
 
-export { commandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, CounterCommand, HeartboardCommand, VoicePingCommand };
+export { commandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, HeartbeatCommand, CounterCommand, HeartboardCommand, VoicePingCommand };

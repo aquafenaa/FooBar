@@ -1,19 +1,23 @@
 import { tool } from 'ai';
 import { z as zod } from 'zod';
 import cron from 'node-cron';
-import { Snowflake } from 'discord.js';
+import { ChannelType, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
 
 import { discordClient } from '..';
-import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, setCounterValue, resolveChannelRef, resolveMessageRef, updateReminder, upsertMemory } from '../data';
+import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
 import { MemoryTable, ReminderTable } from '../types/schema';
-import { sendReminder } from '../utils';
+import { estimateTokens, safeFetch, sendReminder } from '../utils';
+import { formatReactions, formatResponse } from './chatbot';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './context';
+import { MAX_BOT_HEARTBEATS, removeHeartbeat, scheduleHeartbeat } from './heartbeat';
 import { MAX_TIMEOUT, sandboxExec } from './sandbox';
 import { captionImage } from './vision';
 
 // filled in by the bot for each reply, rather than by the model, so the model can't get it wrong (or reach another server's memories)
 const replyContextSchema = zod.object({
   server_id: zod.string(),
+  channel_id: zod.string(), // the channel being replied in
+  conversation_id: zod.string(), // the current conversation, whose refs ([#3], [@2]) the model uses
   shareable: zod.boolean(), // whether everyone in the conversation is fine with it reaching other servers
   reference_message_id: zod.string().optional(), // the message the user is replying to, which the model sees as [$0]
 });
@@ -108,6 +112,45 @@ const reactToMessage = tool({
         message: 'Reacted to message.',
       };
     } catch (error) {
+      return {
+        result: 'failure',
+        message: error?.toString() ?? 'unknown',
+      };
+    }
+  },
+});
+
+const MAX_NICKNAME_LENGTH = 32; // Discord's limit
+
+const changeNickname = tool({
+  description: 'Change your own nickname in the current server. Give an empty nickname to reset it to your username.',
+  inputExamples: [
+    { input: { nickname: 'Captain Foo' } },
+    { input: { nickname: '' } },
+  ],
+  inputSchema: zod.object({
+    nickname: zod.string().describe(`New nickname, at most ${MAX_NICKNAME_LENGTH} characters. Empty to reset it`),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { nickname: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
+    const nickname = input.nickname.trim();
+    if (nickname.length > MAX_NICKNAME_LENGTH) {
+      return {
+        result: 'failure',
+        message: `Nicknames can be at most ${MAX_NICKNAME_LENGTH} characters.`,
+      };
+    }
+
+    try {
+      // the server comes from the bot, so the model can only rename itself where it's replying
+      const guild = await discordClient.guilds.fetch(context.server_id);
+      const me = guild.members.me ?? await guild.members.fetchMe();
+      await me.setNickname(nickname || null);
+      return {
+        result: 'success',
+        message: nickname ? `Changed nickname to "${nickname}".` : 'Reset nickname.',
+      };
+    } catch (error: any) {
       return {
         result: 'failure',
         message: error?.toString() ?? 'unknown',
@@ -702,6 +745,283 @@ const counter = tool({
   },
 });
 
+const MAX_FETCH_MESSAGES = 50; // most messages fetch_channel gives back at once
+const SEARCH_SCAN_LIMIT = 500; // how far back search_channel looks, since bots can't use discord's own search
+const MAX_SEARCH_RESULTS = 20;
+const MAX_CHANNEL_MESSAGE_LENGTH = 1000; // characters of each message given back, so a few long ones can't fill the prompt
+
+/**
+ * A text channel in this server, from a ref like [#3], a <#id> mention, or a plain id. Defaults to the channel being replied in.
+ * Returns why not instead, worded to give to the model as-is
+ */
+async function resolveTextChannel(context: ReplyContext, channelInput?: string): Promise<GuildTextBasedChannel | string> {
+  const raw = channelInput?.trim();
+  let channelID: string | undefined = context.channel_id;
+  // [#0] is always the current channel, and isn't saved like other refs
+  if (raw && !['[#0]', '#0', '0'].includes(raw)) {
+    const idMatch = /^<?#?(\d{17,20})>?$/.exec(raw);
+    channelID = idMatch
+      ? idMatch[1]
+      : resolveChannelRef(context.conversation_id, raw) ?? resolveChannelRef(context.conversation_id, `[${raw}]`) ?? resolveChannelRef(context.conversation_id, `[#${raw}]`);
+  }
+  if (!channelID) return `There is no channel with ref ${raw}.`;
+
+  // fetched through this server, so a channel in another server is never found
+  const guild = await safeFetch(() => discordClient.guilds.fetch(context.server_id));
+  const channel = await safeFetch(() => guild!.channels.fetch(channelID));
+  if (!channel) return `There is no channel ${raw ?? channelID} in this server.`;
+  if (!channel.isTextBased()) return 'This channel is not text based!';
+
+  return channel;
+}
+
+// the current channel, or one everyone in the server can see, so a private channel's messages can't be read out to people who couldn't see them
+function isPublicOrCurrent(channel: GuildTextBasedChannel, context: ReplyContext): boolean {
+  if (channel.id === context.channel_id) return true;
+  if (channel.type === ChannelType.PrivateThread) return false; // takes its parent's permissions, even though only its members can see it
+
+  return !!channel.permissionsFor(channel.guild.roles.everyone)?.has(PermissionFlagsBits.ViewChannel);
+}
+
+const PRIVATE_CHANNEL_MESSAGE = 'This channel is private, so its messages can only be read from inside it.';
+
+function toChannelMessage(message: Message<boolean>) {
+  return {
+    id: message.id,
+    author: message.member?.displayName ?? message.author.displayName,
+    author_id: message.author.id,
+    bot: message.author.bot,
+    time: new Date(message.createdTimestamp).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }),
+    reply_to: message.reference?.messageId,
+    content: message.content.substring(0, MAX_CHANNEL_MESSAGE_LENGTH),
+    attachments: message.attachments.size > 0 ? message.attachments.map((attachment) => attachment.url) : undefined,
+    reactions: formatReactions(message) || undefined,
+  };
+}
+type ChannelMessage = ReturnType<typeof toChannelMessage>;
+
+const fetchChannel = tool({
+  description: `Read the most recent messages in a channel, oldest first. Up to ${MAX_FETCH_MESSAGES} at once. `
+    + 'Defaults to this channel. Other channels can only be read if everyone in the server can see them.',
+  inputExamples: [
+    { input: { count: 20 } },
+    { input: { channel: '[#2]', count: 10 } },
+  ],
+  inputSchema: zod.object({
+    channel: zod.string().optional().describe('Reference of the channel, e.g. [#2], or its id. Defaults to this channel'),
+    count: zod.number().int().optional().describe(`How many messages, from 1 to ${MAX_FETCH_MESSAGES}. Defaults to 20`),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { channel?: string, count?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', messages?: ChannelMessage[], message: string }> => {
+    const channel = await resolveTextChannel(context, input.channel);
+    if (typeof channel === 'string') return { result: 'failure', message: channel };
+    if (!isPublicOrCurrent(channel, context)) return { result: 'failure', message: PRIVATE_CHANNEL_MESSAGE };
+
+    try {
+      const count = Math.min(Math.max(input.count ?? 20, 1), MAX_FETCH_MESSAGES);
+      const messages = [...(await channel.messages.fetch({ limit: count })).values()].reverse().map(toChannelMessage);
+      return { result: 'success', messages, message: `Fetched ${messages.length} messages from #${channel.name}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
+const searchChannel = tool({
+  description: `Search a channel's last ${SEARCH_SCAN_LIMIT} messages for text, a user, or both, newest first. Up to ${MAX_SEARCH_RESULTS} matches. `
+    + 'Text matching isn\'t case-sensitive. Defaults to this channel. Other channels can only be searched if everyone in the server can see them.',
+  inputExamples: [
+    { input: { query: 'movie night' } },
+    { input: { channel: '[#2]', author: '[@3]' } },
+  ],
+  inputSchema: zod.object({
+    channel: zod.string().optional().describe('Reference of the channel, e.g. [#2], or its id. Defaults to this channel'),
+    query: zod.string().optional().describe('Text the message must contain'),
+    author: zod.string().optional().describe('Who sent it: a reference like [@3], a user id, or part of their name'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { channel?: string, query?: string, author?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', messages?: ChannelMessage[], scanned?: number, message: string }> => {
+    if (!input.query && !input.author) return { result: 'failure', message: 'Give a query, an author, or both to search for.' };
+
+    const channel = await resolveTextChannel(context, input.channel);
+    if (typeof channel === 'string') return { result: 'failure', message: channel };
+    if (!isPublicOrCurrent(channel, context)) return { result: 'failure', message: PRIVATE_CHANNEL_MESSAGE };
+
+    const query = input.query?.toLowerCase();
+    const author = input.author?.trim();
+    const authorID = author && (/^<?@?!?(\d{17,20})>?$/.exec(author)?.[1] ?? resolveUserRef(context.conversation_id, author) ?? resolveUserRef(context.conversation_id, `[${author}]`) ?? resolveUserRef(context.conversation_id, `[@${author}]`));
+    const authorName = author?.toLowerCase();
+
+    const matches = (message: Message<boolean>) => {
+      if (query && !message.content.toLowerCase().includes(query)) return false;
+      if (!author) return true;
+      if (authorID) return message.author.id === authorID;
+      return [message.member?.displayName, message.author.displayName, message.author.username].some((name) => name?.toLowerCase().includes(authorName!));
+    };
+
+    try {
+      const found: Message<boolean>[] = [];
+      let scanned = 0;
+      let before: string | undefined;
+      // 100 at a time, the most discord gives per request
+      while (scanned < SEARCH_SCAN_LIMIT && found.length < MAX_SEARCH_RESULTS) {
+        const page = [...(await channel.messages.fetch({ limit: 100, before })).values()];
+        if (page.length === 0) break;
+
+        scanned += page.length;
+        before = page[page.length - 1].id;
+        found.push(...page.filter(matches));
+      }
+
+      const messages = found.slice(0, MAX_SEARCH_RESULTS).map(toChannelMessage);
+      return {
+        result: 'success',
+        messages,
+        scanned,
+        message: messages.length === 0 ? `No matches in the last ${scanned} messages of #${channel.name}.` : `Found ${messages.length} matches in the last ${scanned} messages of #${channel.name}.`,
+      };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
+const MAX_SENDS_PER_REPLY = 5;
+// send_message calls so far, per reply. keyed by the reply's context object, which the bot makes once per reply and passes to every tool call
+const sendCounts = new WeakMap<ReplyContext, number>();
+
+const sendMessage = tool({
+  description: 'Send a message to a channel in this server, separate from your reply. Use it to post somewhere else, or to post more than one message. '
+    + `Refs like [@2] and [#3] work the same as in your replies. At most ${MAX_SENDS_PER_REPLY} per reply.`,
+  inputExamples: [
+    { input: { channel: '[#3]', content: 'Movie night starts in 10 minutes! 🍿' } },
+  ],
+  inputSchema: zod.object({
+    channel: zod.string().optional().describe('Reference of the channel, e.g. [#3], or its id. Defaults to this channel'),
+    content: zod.string().describe('Content of the message. Long messages are split up'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { channel?: string, content: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message_ids?: string[], message: string }> => {
+    if (!input.content.trim()) return { result: 'failure', message: 'The message is empty.' };
+
+    // counted before anything is awaited, so calls made at the same time can't all slip under the limit
+    const sends = sendCounts.get(context) ?? 0;
+    if (sends >= MAX_SENDS_PER_REPLY) return { result: 'failure', message: `You've already sent ${MAX_SENDS_PER_REPLY} messages this reply, the most allowed.` };
+    sendCounts.set(context, sends + 1);
+
+    const channel = await resolveTextChannel(context, input.channel);
+    if (typeof channel === 'string') return { result: 'failure', message: channel };
+    if (!channel.isSendable()) return { result: 'failure', message: 'I can\'t send messages in this channel.' };
+
+    try {
+      const chunks = await formatResponse(context.conversation_id, input.content);
+      const messageIDs: string[] = [];
+      for (const chunk of chunks) {
+        const sent = await channel.send({ content: chunk }); // one at a time, so they arrive in order
+        messageIDs.push(sent.id);
+        // saved as the bot's turn, so it's in the conversation's summary
+        insertConversationMessage({
+          conversation_id: context.conversation_id,
+          message_id: sent.id,
+          role: 'assistant',
+          author_id: sent.author.id,
+          author_name: sent.author.displayName,
+          timestamp: sent.createdTimestamp,
+          message_content: chunk,
+          token_count: estimateTokens(chunk),
+        });
+      }
+
+      return { result: 'success', message_ids: messageIDs, message: `Sent ${messageIDs.length} message${messageIDs.length === 1 ? '' : 's'} in #${channel.name}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
+// at most hourly: the minute (and second, if given) must be one fixed number, so a beat can't fire every minute
+function isAtMostHourly(cronSchedule: string): boolean {
+  const fields = cronSchedule.trim().split(/\s+/);
+  const timeFields = fields.length === 6 ? fields.slice(0, 2) : fields.slice(0, 1);
+  return timeFields.every((field) => /^\d+$/.test(field));
+}
+
+// one tool with an action, like counter. the bot can only change the heartbeats it scheduled itself, not ones an admin made
+const heartbeat = tool({
+  description: 'Schedule a heartbeat: a prompt you\'ll be given on a cron schedule, in this channel, so you can post on your own later (e.g. check back on something, or a daily check-in). '
+    + `Actions: "list" this server's heartbeats, "create" one, "edit" one, or "delete" one. You can only edit or delete ones you made, and have at most ${MAX_BOT_HEARTBEATS}. `
+    + 'Schedules are cron, at most hourly (the minute must be a fixed number). Set repeats to false for one that runs once, then deletes itself.',
+  inputExamples: [
+    { input: { action: 'create', name: 'Check exam results', prompt: 'Sam (user id 1087654321098765432) gets their exam results today. Ping them with <@1087654321098765432> and ask how it went.', schedule: '0 17 21 10 *', repeats: false } },
+    { input: { action: 'create', name: 'Morning check-in', prompt: 'Post a short good morning, and mention any reminders due today.', schedule: '0 9 * * *', repeats: true } },
+    { input: { action: 'list' } },
+  ],
+  inputSchema: zod.object({
+    action: zod.enum(['list', 'create', 'edit', 'delete']),
+    name: zod.string().optional().describe('Name of the heartbeat. Needed for every action except list. Not case-sensitive'),
+    prompt: zod.string().optional().describe('For create and edit: what you\'ll be told when it runs. Write it as a note to your future self, with everything you\'ll need. Refs like [@2] won\'t mean anything by then, so use names and ids'),
+    context: zod.string().optional().describe('For create and edit: background you\'ll be shown with the prompt, e.g. what was said that it\'s following up on. You won\'t see the channel unless you fetch it'),
+    schedule: zod.string().optional().describe('For create and edit: cron schedule it runs on. Hour is 0-23'),
+    repeats: zod.boolean().optional().describe('For create and edit: whether it keeps running on the schedule (true), or runs once then deletes itself (false). Defaults to false'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { action: 'list' | 'create' | 'edit' | 'delete', name?: string, prompt?: string, context?: string, schedule?: string, repeats?: boolean }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', heartbeats?: { name: string, schedule: string, repeats: boolean, channel_id: string, prompt: string, context?: string, made_by_you: boolean }[], message: string }> => {
+    const serverID = context.server_id; // from the bot, so it can only touch this server's heartbeats
+    const botID = discordClient.user!.id;
+
+    if (input.action === 'list') {
+      const heartbeats = getHeartbeatsByServer(serverID).map((hb) => ({
+        name: hb.heartbeat_name, schedule: hb.cron_schedule, repeats: !!hb.repeats, channel_id: hb.channel_id, prompt: hb.prompt, context: hb.context ?? undefined, made_by_you: hb.created_by === botID,
+      }));
+      return { result: 'success', heartbeats, message: heartbeats.length === 0 ? 'There are no heartbeats in this server.' : `Found ${heartbeats.length} heartbeats.` };
+    }
+
+    if (!input.name) return { result: 'failure', message: `A name is needed to ${input.action} a heartbeat.` };
+    const existing = getHeartbeat(serverID, input.name);
+
+    if (input.schedule !== undefined) {
+      if (!cron.validate(input.schedule)) return { result: 'failure', message: `Cron schedule is invalid: ${input.schedule}.` };
+      if (!isAtMostHourly(input.schedule)) return { result: 'failure', message: 'Heartbeats can run at most hourly: the minute must be a fixed number, not * or a range.' };
+    }
+
+    if (input.action === 'create') {
+      if (existing) return { result: 'failure', message: `There's already a heartbeat named "${existing.heartbeat_name}".` };
+      if (input.name.length > 40) return { result: 'failure', message: 'Heartbeat names can be at most 40 characters.' };
+      if (!input.prompt || !input.schedule) return { result: 'failure', message: 'A prompt and a schedule are needed to create a heartbeat.' };
+      if (getHeartbeatsByServer(serverID).filter((hb) => hb.created_by === botID).length >= MAX_BOT_HEARTBEATS) {
+        return { result: 'failure', message: `You already have ${MAX_BOT_HEARTBEATS} heartbeats in this server. Delete one first.` };
+      }
+
+      const created = { server_id: serverID, heartbeat_name: input.name, channel_id: context.channel_id, created_by: botID, repeats: input.repeats ?? false, cron_schedule: input.schedule, prompt: input.prompt, context: input.context };
+      insertHeartbeat(created);
+      scheduleHeartbeat(created);
+      return { result: 'success', message: `Scheduled heartbeat "${input.name}" (${input.schedule}${created.repeats ? ', repeating' : ', once'}).` };
+    }
+
+    // every other action needs a heartbeat this bot made
+    if (!existing) return { result: 'failure', message: `There's no heartbeat named "${input.name}". Use the list action to see them.` };
+    if (existing.created_by !== botID) return { result: 'failure', message: `"${existing.heartbeat_name}" was made by an admin, so only they can change it, with /heartbeat.` };
+
+    if (input.action === 'edit') {
+      if (input.prompt === undefined && input.context === undefined && input.schedule === undefined && input.repeats === undefined) return { result: 'failure', message: 'Give a new prompt, context, schedule, or repeats to edit.' };
+
+      const edited = {
+        ...existing,
+        prompt: input.prompt ?? existing.prompt,
+        context: input.context ?? existing.context,
+        cron_schedule: input.schedule ?? existing.cron_schedule,
+        repeats: input.repeats ?? !!existing.repeats,
+      };
+      updateHeartbeat(edited);
+      scheduleHeartbeat(edited);
+      return { result: 'success', message: `Edited heartbeat "${existing.heartbeat_name}".` };
+    }
+
+    removeHeartbeat(existing);
+    return { result: 'success', message: `Deleted heartbeat "${existing.heartbeat_name}".` };
+  },
+});
+
 const SANDBOX_DESCRIPTION = 'Your own persistent Linux workspace (Debian, with python3, pip, git, curl, and jq, and internet access). '
   + 'Everything you save there is kept between replies, conversations, and every server you share memories with. '
   + 'Keep NOTES.md up to date with what you\'re working on and anything you\'ll want later: it\'s shown to you at the start of every reply.';
@@ -765,4 +1085,4 @@ const writeFile = tool({
   },
 });
 
-export default { reactToMessage, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, captionImage: captionImageTool, xSearch, counter, runCommand, writeFile };
+export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, captionImage: captionImageTool, xSearch, counter, heartbeat, fetchChannel, searchChannel, sendMessage, runCommand, writeFile };

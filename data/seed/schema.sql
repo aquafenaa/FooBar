@@ -210,6 +210,20 @@ CREATE TABLE IF NOT EXISTS Reminder(
   PRIMARY KEY (server_id, reminder_name)
 );
 
+CREATE TABLE IF NOT EXISTS Heartbeat(
+  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
+  heartbeat_name VARCHAR(40) NOT NULL COLLATE NOCASE,
+  channel_id VARCHAR(20) NOT NULL,
+  created_by VARCHAR(20) NOT NULL,
+
+  repeats BOOLEAN,
+  cron_schedule VARCHAR(40) NOT NULL,
+  prompt TEXT NOT NULL,
+  context TEXT,
+
+  PRIMARY KEY (server_id, heartbeat_name)
+);
+
 CREATE TABLE IF NOT EXISTS Counter(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
   counter_name VARCHAR(40) NOT NULL COLLATE NOCASE,
