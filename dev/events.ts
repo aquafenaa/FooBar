@@ -191,7 +191,6 @@ function clientEvents(discordClient: Client) {
       )
     && Math.random() >= 1 / 4096) return; // ...and we don't roll a small chance to respond anyway
 
-    const userContent = message.content;
     const messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
     const context: Message<boolean>[] | undefined = Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: message.id }))).values()); // fetch 5 most recent messages as context
 
@@ -205,7 +204,7 @@ function clientEvents(discordClient: Client) {
     }, 300000); // cancel interval after 5 minutes, if it's still somehow going
 
     // get response from LLM, and reply
-    await handleChatbotReply(serverID, typingExtension, message, userContent, messageReference, context ?? []);
+    await handleChatbotReply(serverID, typingExtension, message, messageReference, context ?? []);
   });
 
   const handleMessageDelete = (serverID: string, messageID: string) => {

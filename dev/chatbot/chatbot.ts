@@ -18,6 +18,7 @@ import localTools from './tools';
 import { getVisibleMemories, isAttached, isShareable } from './context';
 import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, supportsTools } from './models';
 import { isSandboxEnabled, readNotes } from './sandbox';
+import { withCaptions } from './vision';
 
 const promptPath = path.join(__dirname, '../../data/SYSTEM.md'); // two levels up: this file is in dev/chatbot/ (src/chatbot/ once built)
 const { DISCORD_ID } = process.env;
@@ -290,9 +291,9 @@ async function formatResponse(conversationID: string, agentResponse: string): Pr
 }
 
 // wraps generateReply, so the typing indicator always stops and nothing goes unhandled, even if it fails or returns early
-async function handleChatbotReply(serverID: Snowflake, typingIndicator: NodeJS.Timeout, userMessage: Message<boolean>, userContent: string, messageReference: Message<boolean> | undefined, context: Message<boolean>[]): Promise<void> {
+async function handleChatbotReply(serverID: Snowflake, typingIndicator: NodeJS.Timeout, userMessage: Message<boolean>, messageReference: Message<boolean> | undefined, context: Message<boolean>[]): Promise<void> {
   try {
-    await generateReply(serverID, userMessage, userContent, messageReference, context);
+    await generateReply(serverID, userMessage, messageReference, context);
   } catch (error) {
     console.error(error);
   } finally {
@@ -300,7 +301,7 @@ async function handleChatbotReply(serverID: Snowflake, typingIndicator: NodeJS.T
   }
 }
 
-async function generateReply(serverID: Snowflake, userMessage: Message<boolean>, userContent: string, messageReference: Message<boolean> | undefined, context: Message<boolean>[]): Promise<void> {
+async function generateReply(serverID: Snowflake, userMessage: Message<boolean>, messageReference: Message<boolean> | undefined, context: Message<boolean>[]): Promise<void> {
   if (!userMessage?.channel.isSendable()) return;
 
   const chatbot = getChatbot(serverID)!;
@@ -310,206 +311,217 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
   const messageChannel: GuildChannel = userMessage.channel as GuildChannel;
   if (!messageChannel.isSendable()) return;
 
-  let conversation = getConversationByChannel(messageChannel.id);
-  if (!conversation) { // if no active conversations, create a new one
-    conversation = {
-      conversation_id: `${messageChannel.id}${userMessage.id}`,
-      channel_id: messageChannel.id,
-      source_id: serverID,
-      platform: 'discord',
-      expires_at: Date.now() + 3_600_000, // expires in an hour
-    };
-  } else {
-    conversation.expires_at = Date.now() + 3_600_000; // expires in an hour
-    // delete any current archival task for this conversation
-    cron.getTasks().forEach((task) => {
-      if (task.name === conversation?.conversation_id) {
-        task.destroy();
-      }
-    });
-  }
-
-  // save the conversation (or its new expiry), so its index and messages have something to reference
-  upsertConversation(conversation);
-
-  // schedule new archive task
-  cron.schedule(millisToCronSchedule(conversation.expires_at)!, () => summarizeConversation(conversation.conversation_id), {
-    name: conversation.conversation_id,
-  });
-
-  const conversationContext = getConversationMessages(conversation.conversation_id);
-  const uniqueContext: ConversationMessageTable[] = context.filter((txt) => !conversationContext.find((convoTxt) => convoTxt.message_id === txt.id))
-    .map((ctx) => ({
-      conversation_id: conversation.conversation_id,
-      message_id: ctx.id,
-      // context includes the bot's own earlier replies. as 'user', they'd count as someone who hasn't opted in to sharing
-      role: ctx.author.id === discordClient.user?.id ? 'assistant' : 'user',
-
-      author_id: ctx.author.id,
-      author_name: ctx.author.displayName,
-      timestamp: ctx.createdTimestamp,
-
-      reference_id: ctx.reference?.messageId ?? undefined,
-      message_content: ctx.content,
-      token_count: estimateTokens(ctx.content),
-    }));
-  const userConvoMessage: ConversationMessageTable = {
-    conversation_id: conversation.conversation_id,
-    role: 'user',
-    author_name: userMessage.author.displayName,
-    author_id: userMessage.author.id,
-    message_id: userMessage.id,
-    reference_id: messageReference?.id ?? undefined,
-    timestamp: userMessage.createdTimestamp,
-    message_content: userContent,
-    token_count: estimateTokens(userContent),
-  };
-
-  conversationContext.push(...uniqueContext);
-  conversationContext.push(userConvoMessage);
-
-  // summaries are a nice-to-have, so a failed embedding call shouldn't stop the reply
-  const relevantSummaries = await getRelevantSummaries(conversation, userConvoMessage).catch((error) => {
-    console.error(error);
-    return [];
-  });
-
-  // add the referenced message to beginning of context if it isn't already included
-  let referenceMessage: ConversationMessageTable | undefined;
-
-  if (messageReference) {
-    if (!conversationContext.find((stm) => messageReference.id === stm.message_id)) {
-      referenceMessage = {
-        role: messageReference.author.id === discordClient.user?.id ? 'assistant' : 'user',
-        conversation_id: conversation.conversation_id,
-        timestamp: messageReference.createdTimestamp,
-        author_id: messageReference.author.id,
-        author_name: messageReference.author.displayName,
-        message_content: messageReference.content,
-        message_id: messageReference.id,
-      };
-    }
-  }
-
-  // sort by chronological order
-  conversationContext.sort((msg1, msg2) => msg1.timestamp - msg2.timestamp);
-
-  // only the latest results, so a long conversation's prompt doesn't keep growing. all of them are still kept for the summary
-  const toolContext = getConversationToolResults(conversation.conversation_id).slice(-MAX_PROMPT_TOOL_RESULTS);
-  const agentInput = await formatInput(guild, messageChannel, conversation, referenceMessage, toolContext, conversationContext);
-  const indexMsg = agentInput.shift()!;
-  const summaryStr = relevantSummaries.map((summary) => `<summary>${summary.summary}</summary>`).join('\n');
-  const memories = getVisibleMemories(serverID);
-  // the workspace is shared like the main memories, so detached servers don't get it
-  const useSandbox = isSandboxEnabled() && isAttached(serverID);
-  const workspaceNotes = useSandbox ? await readNotes() : '';
-  // given to every tool by the bot, never by the model
-  const replyContext = {
-    server_id: serverID,
-    // memory tools only save to the shared context when everyone in this conversation has opted in
-    shareable: isShareable(serverID, conversationContext.filter((msg) => msg.role === 'user').map((msg) => msg.author_id)),
-    reference_message_id: messageReference?.id, // the message the user is replying to, shown to the model as [$0]
-  };
-
+  // sent first, so captioning and setup never leave the user waiting without any sign of a reply
   let status = '-# thinking...';
   const toolMessage = await messageChannel.send(status);
 
-  // SYSTEM.md (or the server's override), with the server's persona layered on top
-  const systemPrompt = `<system>
-      ${getSystemPrompt(chatbot)}
-    </system>
-    ${chatbot.chatbot_prompt ? `<persona>
-      ${chatbot.chatbot_prompt}
-    </persona>` : ''}
-    <relevant_summaries>
-      ${summaryStr}
-    </relevant_summaries>
-    <memory_list>
-      ${memories.map((memory) => memory.name).join('\n')}
-    </memory_list>
-    ${workspaceNotes ? `<workspace_notes>
-      ${workspaceNotes}
-    </workspace_notes>` : ''}
-    <conversation conversation_id="${conversation.conversation_id}" server_id="${serverID}" current_date="${new Date().toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'long' })}" />
-    <index>
-      ${indexMsg.content}
-    </index>`;
-
-  const model = chatbot.model ?? DEFAULT_MODEL;
-  // models without tool support get none, rather than an error
-  const tools: ToolUnion[] | undefined = chatbot.tools_enabled && supportsTools(model) ? [
-    {
-      type: 'openrouter:web_search',
-      parameters: { engine: 'native', max_results: 20 }, // "native" on Grok includes X search
-    } as unknown as ToolUnion,
-    // our own persistent workspace when it's set up and the server is attached. otherwise openrouter's shell, which is a fresh container each reply
-    ...(useSandbox ? [
-      toAnthropicTool('run_command', localTools.runCommand),
-      toAnthropicTool('write_file', localTools.writeFile),
-    ] : [{
-      // runs commands in a sandbox on openrouter's side (python 3.11 and node 22 are installed), never on this machine.
-      // network is limited to package registries, so it can still pip/npm install
-      type: 'openrouter:shell',
-      parameters: {
-        engine: 'openrouter',
-        environment: {
-          type: 'container_auto',
-          network_policy: { type: 'allowlist', allowed_domains: ['*'] },
-        },
-      },
-    } as unknown as ToolUnion]),
-    toAnthropicTool('react_to_message', localTools.reactToMessage),
-    toAnthropicTool('create_reminder', localTools.createReminder),
-    toAnthropicTool('edit_reminder', localTools.editReminder),
-    toAnthropicTool('list_reminders', localTools.listReminders),
-    toAnthropicTool('view_reminder', localTools.viewReminder),
-    toAnthropicTool('remove_reminder', localTools.removeReminder),
-    toAnthropicTool('create_memory', localTools.createMemory),
-    toAnthropicTool('edit_memory', localTools.editMemory),
-    toAnthropicTool('list_memories', localTools.listMemories),
-    toAnthropicTool('view_memory', localTools.viewMemory),
-    toAnthropicTool('remove_memory', localTools.removeMemory),
-    toAnthropicTool('fetch_url', localTools.fetchURL),
-    toAnthropicTool('counter', localTools.counter),
-    // only offered once the key is in .env, so the model doesn't reach for a tool that can't work
-    ...(process.env.TWITTER_API_KEY ? [toAnthropicTool('x_search', localTools.xSearch)] : []),
-  ] : undefined;
-
-  // tools we execute ourselves. web search runs on OpenRouter's side
-  const localToolMap: Record<string, Tool<any, any>> = {
-    react_to_message: localTools.reactToMessage,
-
-    create_reminder: localTools.createReminder,
-    edit_reminder: localTools.editReminder,
-    list_reminders: localTools.listReminders,
-    view_reminder: localTools.viewReminder,
-    remove_reminder: localTools.removeReminder,
-
-    create_memory: localTools.createMemory,
-    edit_memory: localTools.editMemory,
-    list_memories: localTools.listMemories,
-    view_memory: localTools.viewMemory,
-    remove_memory: localTools.removeMemory,
-
-    fetch_url: localTools.fetchURL,
-    counter: localTools.counter,
-    x_search: localTools.xSearch,
-
-    run_command: localTools.runCommand,
-    write_file: localTools.writeFile,
-  };
-
-  const messages = agentInput as MessageParam[];
-  let streamStr = '';
-  const toolList: ConversationToolResultTable[] = [];
-
   try {
+    const userContent = await withCaptions(userMessage);
+
+    let conversation = getConversationByChannel(messageChannel.id);
+    if (!conversation) { // if no active conversations, create a new one
+      conversation = {
+        conversation_id: `${messageChannel.id}${userMessage.id}`,
+        channel_id: messageChannel.id,
+        source_id: serverID,
+        platform: 'discord',
+        expires_at: Date.now() + 3_600_000, // expires in an hour
+      };
+    } else {
+      conversation.expires_at = Date.now() + 3_600_000; // expires in an hour
+      // delete any current archival task for this conversation
+      cron.getTasks().forEach((task) => {
+        if (task.name === conversation?.conversation_id) {
+          task.destroy();
+        }
+      });
+    }
+
+    // save the conversation (or its new expiry), so its index and messages have something to reference
+    upsertConversation(conversation);
+
+    // schedule new archive task
+    cron.schedule(millisToCronSchedule(conversation.expires_at)!, () => summarizeConversation(conversation.conversation_id), {
+      name: conversation.conversation_id,
+    });
+
+    const conversationContext = getConversationMessages(conversation.conversation_id);
+    // filtered before captioning, so messages already saved (with their captions) aren't captioned again
+    const uniqueContext: ConversationMessageTable[] = await Promise.all(context.filter((txt) => !conversationContext.find((convoTxt) => convoTxt.message_id === txt.id))
+      .map(async (ctx) => {
+        const content = await withCaptions(ctx);
+
+        return {
+          conversation_id: conversation.conversation_id,
+          message_id: ctx.id,
+          // context includes the bot's own earlier replies. as 'user', they'd count as someone who hasn't opted in to sharing
+          role: ctx.author.id === discordClient.user?.id ? 'assistant' : 'user',
+
+          author_id: ctx.author.id,
+          author_name: ctx.author.displayName,
+          timestamp: ctx.createdTimestamp,
+
+          reference_id: ctx.reference?.messageId ?? undefined,
+          message_content: content,
+          token_count: estimateTokens(content),
+        };
+      }));
+    const userConvoMessage: ConversationMessageTable = {
+      conversation_id: conversation.conversation_id,
+      role: 'user',
+      author_name: userMessage.author.displayName,
+      author_id: userMessage.author.id,
+      message_id: userMessage.id,
+      reference_id: messageReference?.id ?? undefined,
+      timestamp: userMessage.createdTimestamp,
+      message_content: userContent,
+      token_count: estimateTokens(userContent),
+    };
+
+    conversationContext.push(...uniqueContext);
+    conversationContext.push(userConvoMessage);
+
+    // summaries are a nice-to-have, so a failed embedding call shouldn't stop the reply
+    const relevantSummaries = await getRelevantSummaries(conversation, userConvoMessage).catch((error) => {
+      console.error(error);
+      return [];
+    });
+
+    // add the referenced message to beginning of context if it isn't already included
+    let referenceMessage: ConversationMessageTable | undefined;
+
+    if (messageReference) {
+      if (!conversationContext.find((stm) => messageReference.id === stm.message_id)) {
+        referenceMessage = {
+          role: messageReference.author.id === discordClient.user?.id ? 'assistant' : 'user',
+          conversation_id: conversation.conversation_id,
+          timestamp: messageReference.createdTimestamp,
+          author_id: messageReference.author.id,
+          author_name: messageReference.author.displayName,
+          message_content: await withCaptions(messageReference),
+          message_id: messageReference.id,
+        };
+      }
+    }
+
+    // sort by chronological order
+    conversationContext.sort((msg1, msg2) => msg1.timestamp - msg2.timestamp);
+
+    // only the latest results, so a long conversation's prompt doesn't keep growing. all of them are still kept for the summary
+    const toolContext = getConversationToolResults(conversation.conversation_id).slice(-MAX_PROMPT_TOOL_RESULTS);
+    const agentInput = await formatInput(guild, messageChannel, conversation, referenceMessage, toolContext, conversationContext);
+    const indexMsg = agentInput.shift()!;
+    const summaryStr = relevantSummaries.map((summary) => `<summary>${summary.summary}</summary>`).join('\n');
+    const memories = getVisibleMemories(serverID);
+    // the workspace is shared like the main memories, so detached servers don't get it
+    const useSandbox = isSandboxEnabled() && isAttached(serverID);
+    const workspaceNotes = useSandbox ? await readNotes() : '';
+    // given to every tool by the bot, never by the model
+    const replyContext = {
+      server_id: serverID,
+      // memory tools only save to the shared context when everyone in this conversation has opted in
+      shareable: isShareable(serverID, conversationContext.filter((msg) => msg.role === 'user').map((msg) => msg.author_id)),
+      reference_message_id: messageReference?.id, // the message the user is replying to, shown to the model as [$0]
+    };
+
+    // SYSTEM.md (or the server's override), with the server's persona layered on top
+    const systemPrompt = `<system>
+        ${getSystemPrompt(chatbot)}
+      </system>
+      ${chatbot.chatbot_prompt ? `<persona>
+        ${chatbot.chatbot_prompt}
+      </persona>` : ''}
+      <relevant_summaries>
+        ${summaryStr}
+      </relevant_summaries>
+      <memory_list>
+        ${memories.map((memory) => memory.name).join('\n')}
+      </memory_list>
+      ${workspaceNotes ? `<workspace_notes>
+        ${workspaceNotes}
+      </workspace_notes>` : ''}
+      <conversation conversation_id="${conversation.conversation_id}" server_id="${serverID}" current_date="${new Date().toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'long' })}" />
+      <index>
+        ${indexMsg.content}
+      </index>`;
+
+    const model = chatbot.model ?? DEFAULT_MODEL;
+    // models without tool support get none, rather than an error
+    const tools: ToolUnion[] | undefined = chatbot.tools_enabled && supportsTools(model) ? [
+      {
+        type: 'openrouter:web_search',
+        parameters: { engine: 'native', max_results: 20 }, // "native" on Grok includes X search
+      } as unknown as ToolUnion,
+      // our own persistent workspace when it's set up and the server is attached. otherwise openrouter's shell, which is a fresh container each reply
+      ...(useSandbox ? [
+        toAnthropicTool('run_command', localTools.runCommand),
+        toAnthropicTool('write_file', localTools.writeFile),
+      ] : [{
+        // runs commands in a sandbox on openrouter's side (python 3.11 and node 22 are installed), never on this machine.
+        // network is limited to package registries, so it can still pip/npm install
+        type: 'openrouter:shell',
+        parameters: {
+          engine: 'openrouter',
+          environment: {
+            type: 'container_auto',
+            network_policy: { type: 'allowlist', allowed_domains: ['*'] },
+          },
+        },
+      } as unknown as ToolUnion]),
+      toAnthropicTool('react_to_message', localTools.reactToMessage),
+      toAnthropicTool('create_reminder', localTools.createReminder),
+      toAnthropicTool('edit_reminder', localTools.editReminder),
+      toAnthropicTool('list_reminders', localTools.listReminders),
+      toAnthropicTool('view_reminder', localTools.viewReminder),
+      toAnthropicTool('remove_reminder', localTools.removeReminder),
+      toAnthropicTool('create_memory', localTools.createMemory),
+      toAnthropicTool('edit_memory', localTools.editMemory),
+      toAnthropicTool('list_memories', localTools.listMemories),
+      toAnthropicTool('view_memory', localTools.viewMemory),
+      toAnthropicTool('remove_memory', localTools.removeMemory),
+      toAnthropicTool('fetch_url', localTools.fetchURL),
+      toAnthropicTool('caption_image', localTools.captionImage),
+      toAnthropicTool('counter', localTools.counter),
+      // only offered once the key is in .env, so the model doesn't reach for a tool that can't work
+      ...(process.env.TWITTER_API_KEY ? [toAnthropicTool('x_search', localTools.xSearch)] : []),
+    ] : undefined;
+
+    // tools we execute ourselves. web search runs on OpenRouter's side
+    const localToolMap: Record<string, Tool<any, any>> = {
+      react_to_message: localTools.reactToMessage,
+
+      create_reminder: localTools.createReminder,
+      edit_reminder: localTools.editReminder,
+      list_reminders: localTools.listReminders,
+      view_reminder: localTools.viewReminder,
+      remove_reminder: localTools.removeReminder,
+
+      create_memory: localTools.createMemory,
+      edit_memory: localTools.editMemory,
+      list_memories: localTools.listMemories,
+      view_memory: localTools.viewMemory,
+      remove_memory: localTools.removeMemory,
+
+      fetch_url: localTools.fetchURL,
+      caption_image: localTools.captionImage,
+      counter: localTools.counter,
+      x_search: localTools.xSearch,
+
+      run_command: localTools.runCommand,
+      write_file: localTools.writeFile,
+    };
+
+    const messages = agentInput as MessageParam[];
+    let streamStr = '';
+    const toolList: ConversationToolResultTable[] = [];
+
     // unlike streamText, the Anthropic SDK doesn't run tools for us, so loop until the model stops asking for them
     for (let step = 0; step < MAX_TOOL_STEPS; step++) {
       const stream = anthropicClient.messages.stream({
         model,
         temperature: 1.0,
-        max_tokens: 0,
+        // reasoning counts toward it too. openrouter treats 0 as no limit, and refuses the request if the credits can't cover that much output
+        max_tokens: 20_000,
         system: systemPrompt,
         // openrouter quietly ignores efforts a model can't use. it also accepts 'none' and 'minimal', which the sdk's type doesn't list
         output_config: { effort: (chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT) as OutputConfig['effort'] },
