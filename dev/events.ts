@@ -2,7 +2,8 @@ import { BaseMessageOptions, Channel, Client, EmbedBuilder, Events, GuildMember,
 import cron from 'node-cron';
 
 import { commandMap } from './commands';
-import { handleChatbotReply, markMessageDeleted } from './chatbot/chatbot';
+import { generateReply, isAllowedServer, markMessageDeleted } from './chatbot/chatbot';
+import { loadHeartbeats } from './chatbot/heartbeat';
 
 import { Command } from './types/bot';
 import { addResponseMessage, deleteConversationMessageByID, deleteHeartBoardMessage, deleteResponseMessage, getAllConversations, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, updateReminder, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotSubscriber, isConversationMessage, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, updateDatabase, updateHeartBoardMessage } from './data';
@@ -89,6 +90,8 @@ function clientEvents(discordClient: Client) {
           name: `${reminder.server_id}${reminder.reminder_name}`,
         });
       });
+
+      loadHeartbeats(guildID);
     });
 
     const conversations = getAllConversations();
@@ -137,8 +140,6 @@ function clientEvents(discordClient: Client) {
     }
   });
 
-  const allowedServers = ['917588427959058462', '1064698336185172010', '708642778300547142', '1148069131711680633', '1547088936256671866'];
-
   // grok functionality, when message was sent
   discordClient.on(Events.MessageCreate, async (message) => {
     const { author, channel, guildId: serverID } = message;
@@ -179,8 +180,8 @@ function clientEvents(discordClient: Client) {
     // the bot cannot respond to itself
     if (!author.id || author.id === discordClient.user?.id || !isChatbotSubscriber(serverID, author.id)) return;
 
-    // only works within my servers, sorry! otherwise it's a waste of xAI tokens & money :/
-    if (!allowedServers.find((id) => serverID === id)) return;
+    if (!isAllowedServer(serverID)) return;
+    if (!message.inGuild() || !channel.isSendable()) return;
 
     // we also do not care if...
     if (
@@ -203,8 +204,17 @@ function clientEvents(discordClient: Client) {
       clearInterval(typingExtension);
     }, 300000); // cancel interval after 5 minutes, if it's still somehow going
 
-    // get response from LLM, and reply
-    await handleChatbotReply(serverID, typingExtension, message, messageReference, context ?? []);
+    // get response from LLM, and reply. nothing is sent until the whole reply is ready
+    try {
+      const { chunks: [firstChunk, ...restChunks] } = await generateReply(serverID, { channel: message.channel, context: context ?? [], message, reference: messageReference });
+      if (firstChunk) await message.reply({ content: firstChunk });
+      for (const chunk of restChunks) await channel.send({ content: chunk }); // one at a time, so they arrive in order
+    } catch (error: any) {
+      console.error(error);
+      message.reply(`There was an issue... Please try again later...\n\`\`\`${error?.message ?? ''}\`\`\``).catch((err) => console.error(err));
+    } finally {
+      clearInterval(typingExtension);
+    }
   });
 
   const handleMessageDelete = (serverID: string, messageID: string) => {

@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import cron from 'node-cron';
 import { readFileSync } from 'fs';
 
-import { AutomaticResponseTable, ReminderTable, CounterTable, ChatbotSubscriberTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable } from './types/schema';
+import { AutomaticResponseTable, ReminderTable, HeartbeatTable, CounterTable, ChatbotSubscriberTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable } from './types/schema';
 import { ConfigData, ServerConfig, ServerData } from './types/bot';
 import { getBaseSystemPrompt, getDefaultSystemPrompt } from './chatbot/chatbot';
 import { fromBlob, SOURCE_SEPARATOR, toBlob } from './chatbot/conversation';
@@ -576,6 +576,26 @@ function deleteReminder(reminder: ReminderTable) {
   db.prepare('DELETE FROM Reminder WHERE server_id = ? AND reminder_name = ?').run(reminder.server_id, reminder.reminder_name);
 }
 
+// ==================== Heartbeat ====================
+function getHeartbeat(server_id: Snowflake, heartbeat_name: string): HeartbeatTable | undefined {
+  return db.prepare('SELECT * FROM Heartbeat WHERE server_id = ? AND heartbeat_name = ?').get(server_id, heartbeat_name) as HeartbeatTable | undefined;
+}
+function getHeartbeatsByServer(server_id: Snowflake): HeartbeatTable[] {
+  return db.prepare('SELECT * FROM Heartbeat WHERE server_id = ?').all(server_id) as HeartbeatTable[];
+}
+function insertHeartbeat(heartbeat: HeartbeatTable): void {
+  db.prepare('INSERT INTO Heartbeat (server_id, heartbeat_name, channel_id, created_by, repeats, cron_schedule, prompt, context) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(heartbeat.server_id, heartbeat.heartbeat_name, heartbeat.channel_id, heartbeat.created_by, heartbeat.repeats ? 1 : 0, heartbeat.cron_schedule, heartbeat.prompt, heartbeat.context ?? null);
+}
+function updateHeartbeat(heartbeat: HeartbeatTable): void {
+  db.prepare('UPDATE Heartbeat SET channel_id = ?, repeats = ?, cron_schedule = ?, prompt = ?, context = ? WHERE server_id = ? AND heartbeat_name = ?')
+    .run(heartbeat.channel_id, heartbeat.repeats ? 1 : 0, heartbeat.cron_schedule, heartbeat.prompt, heartbeat.context ?? null, heartbeat.server_id, heartbeat.heartbeat_name);
+}
+// only the row. removeHeartbeat in chatbot/heartbeat.ts also stops its cron task
+function deleteHeartbeat(server_id: Snowflake, heartbeat_name: string): void {
+  db.prepare('DELETE FROM Heartbeat WHERE server_id = ? AND heartbeat_name = ?').run(server_id, heartbeat_name);
+}
+
 // ==================== Server ====================
 function getServer(server_id: Snowflake): ServerTable | undefined {
   return db.prepare('SELECT * FROM Server WHERE server_id = ?').get(server_id) as ServerTable | undefined;
@@ -770,12 +790,18 @@ const updateDatabase = db.transaction(() => {
     if (hasColumn('Chatbot', 'chatbot_core_memory')) db.prepare('ALTER TABLE Chatbot DROP COLUMN chatbot_core_memory').run();
     db.pragma('user_version = 7');
   }
+  if (currentVersion < 8) {
+    // Heartbeat was briefly created without it
+    if (!hasColumn('Heartbeat', 'context')) db.prepare('ALTER TABLE Heartbeat ADD COLUMN context TEXT').run();
+    db.pragma('user_version = 8');
+  }
 });
 
 export {
   db, updateDatabase,
   getAllServers, getServer, insertServer, deleteServer,
   getReminder, getRemindersByServer, addReminder, updateReminder, deleteReminder,
+  getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, deleteHeartbeat,
   getCounter, getCountersByServer, insertCounter, setCounterValue, incrementCounter, deleteCounter,
   getChatbot, getAttachedServers, upsertChatbot, deleteChatbot, setChatbotPrompt,
   isChatbotSubscriber, addChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, getCrossServerSubscribers, removeChatbotSubscriber,

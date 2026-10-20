@@ -170,9 +170,21 @@ interface ReminderTable {
   cron_schedule: string,
   message_content: string;
 }
+// a prompt the chatbot is given on a schedule, with no message to answer
+interface HeartbeatTable {
+  server_id: Snowflake,
+  heartbeat_name: string, // not case-sensitive
+  channel_id: Snowflake,
+  created_by: Snowflake, // the admin who made it, or the bot's own id if the bot scheduled it
+
+  repeats: boolean,
+  cron_schedule: string,
+  prompt: string,
+  context?: string; // background shown with the prompt, e.g. what happened that it's following up on
+}
 
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
-  AutomaticResponseTable, ResponseMessageTable, ReminderTable, CounterTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
+  AutomaticResponseTable, ResponseMessageTable, ReminderTable, HeartbeatTable, CounterTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
   ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable, /* AI-related structures */
 };

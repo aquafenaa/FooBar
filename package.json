@@ -1,6 +1,5 @@
 {
   "dependencies": {
-    "@ai-sdk/xai": "^4.0.30",
     "@anthropic-ai/sdk": "^0.134.0",
     "@discord-player/extractor": "^4.4.0",
     "@discord-player/utils": "^0.2.2",
