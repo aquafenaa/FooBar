@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { Guild, GuildChannel, GuildTextBasedChannel, Message, MessageMentionOptions, SendableChannels, Snowflake } from 'discord.js';
+import { ChannelType, Guild, GuildChannel, GuildTextBasedChannel, Message, MessageMentionOptions, SendableChannels, Snowflake } from 'discord.js';
 import { ModelMessage, Tool } from 'ai';
 import cron from 'node-cron';
 import { z as zod } from 'zod';
@@ -32,6 +32,20 @@ const DELETED_MEMORY_DURATION = 10 * 60_000; // 10 minutes, far longer than a re
 const MAX_PROMPT_TOOL_RESULTS = 10; // most recent tool results given back to the model each reply
 const MAX_PROMPT_TOOL_RESULT_LENGTH = 4000; // characters of each one. the full result stays in the database
 const MAX_CONVERSATION_TOKENS = 10_000; // ~125 messages. past this, the conversation is summarized and a new one starts
+
+// shown as each channel's type in the index, so the model knows what it can do there (e.g. threads can't hold threads)
+const CHANNEL_TYPE_NAMES: Partial<Record<ChannelType, string>> = {
+  [ChannelType.GuildText]: 'text',
+  [ChannelType.GuildAnnouncement]: 'announcement',
+  [ChannelType.GuildForum]: 'forum',
+  [ChannelType.GuildMedia]: 'media',
+  [ChannelType.GuildVoice]: 'voice',
+  [ChannelType.GuildStageVoice]: 'stage',
+  [ChannelType.GuildCategory]: 'category',
+  [ChannelType.PublicThread]: 'thread',
+  [ChannelType.AnnouncementThread]: 'thread',
+  [ChannelType.PrivateThread]: 'private thread',
+};
 
 // only works within my servers, sorry! otherwise it's a waste of tokens & money :/
 const ALLOWED_SERVERS = ['917588427959058462', '1064698336185172010', '708642778300547142', '1148069131711680633', '1547088936256671866'];
@@ -147,6 +161,11 @@ async function formatInput(guild: Guild, currentChannel: SendableChannels, conve
 
     return indexUser;
   });
+  // in a thread, the channel it's in gets a ref too, so the model can use it (e.g. for a new forum post, since a thread can't hold threads)
+  if (currentChannel.isThread() && currentChannel.parent && !mentionedChannels.some((channel) => channel.id === currentChannel.parentId)) {
+    mentionedChannels.push(currentChannel.parent);
+  }
+
   mentionedChannels.map((channel) => {
     let indexChannel = getIndexChannel(conversation.conversation_id, channel.id);
     if (indexChannel) {
@@ -257,7 +276,12 @@ async function formatInput(guild: Guild, currentChannel: SendableChannels, conve
     ${mentionedChannels.length === 0
     ? ''
     : `<channels>
-      ${mentionedChannels.map((channel) => `<channel id="${channel.id}" name="${esc(channel.name ?? '')}" refID="${referenceMap.get(channel.id)}" />`).join('\n\t')}
+      ${mentionedChannels.map((channel) => {
+    // a thread points to the channel it's in, when that has a ref
+    const isThread = [ChannelType.PublicThread, ChannelType.AnnouncementThread, ChannelType.PrivateThread].includes(channel.type);
+    const parentRef = isThread && channel.parentId ? referenceMap.get(channel.parentId) : undefined;
+    return `<channel id="${channel.id}" name="${esc(channel.name ?? '')}" refID="${referenceMap.get(channel.id)}" type="${CHANNEL_TYPE_NAMES[channel.type] ?? 'other'}"${parentRef ? ` parent="${parentRef}"` : ''} />`;
+  }).join('\n\t')}
     </channels>`}
     ${mentionedRoles.length === 0
     ? ''
@@ -384,6 +408,7 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'fetch_channel': return ['read', clip(input.channel) || 'this channel'];
     case 'search_channel': return [`searched ${clip(input.channel) || 'this channel'} for`, quote(input.query ?? input.author)];
     case 'send_message': return ['sent a message in', clip(input.channel) || 'this channel'];
+    case 'create_thread': return ['created thread', quote(input.name)];
     case 'react_to_message': return ['reacted', clip(input.emoji, 8)];
     case 'change_nickname': return ['changed nickname to', quote(input.nickname) || 'default'];
     case 'create_reminder': return ['created reminder', quote(input.reminder_name)];
@@ -440,8 +465,6 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
   const chatbot = getChatbot(serverID)!;
   const guild = await discordClient.guilds.fetch(serverID)!;
-
-  const userContent = userMessage ? await withCaptions(userMessage) : '';
 
   let conversation = heartbeat ? undefined : getConversationByChannel(channel.id);
   if (heartbeat) {
@@ -502,7 +525,10 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         token_count: estimateTokens(content),
       };
     }));
-  const userConvoMessage: ConversationMessageTable | undefined = userMessage && {
+  // a retried reply's message is already saved, with its captions, so it's reused rather than captioned and added again
+  const savedUserMessage = userMessage && conversationContext.find((msg) => msg.message_id === userMessage.id);
+  const userContent = userMessage && !savedUserMessage ? await withCaptions(userMessage) : '';
+  const userConvoMessage: ConversationMessageTable | undefined = savedUserMessage ?? (userMessage && {
     conversation_id: conversation.conversation_id,
     role: 'user',
     author_name: userMessage.author.displayName,
@@ -512,10 +538,10 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     timestamp: userMessage.createdTimestamp,
     message_content: userContent,
     token_count: estimateTokens(userContent),
-  };
+  });
 
   conversationContext.push(...uniqueContext);
-  if (userConvoMessage) conversationContext.push(userConvoMessage);
+  if (userConvoMessage && !savedUserMessage) conversationContext.push(userConvoMessage);
 
   // saved so the summary knows why the bot posted, but kept out of conversationContext, since it's given as the last turn instead.
   // saved now, rather than with the rest, so it's there even if the reply fails partway
@@ -636,6 +662,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toAnthropicTool('fetch_channel', localTools.fetchChannel),
     toAnthropicTool('search_channel', localTools.searchChannel),
     toAnthropicTool('send_message', localTools.sendMessage),
+    toAnthropicTool('create_thread', localTools.createThread),
     toAnthropicTool('create_memory', localTools.createMemory),
     toAnthropicTool('edit_memory', localTools.editMemory),
     toAnthropicTool('list_memories', localTools.listMemories),
@@ -663,6 +690,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     fetch_channel: localTools.fetchChannel,
     search_channel: localTools.searchChannel,
     send_message: localTools.sendMessage,
+    create_thread: localTools.createThread,
 
     create_memory: localTools.createMemory,
     edit_memory: localTools.editMemory,

@@ -4,6 +4,7 @@ import cron from 'node-cron';
 import { commandMap } from './commands';
 import { generateReply, isAllowedServer, markMessageDeleted } from './chatbot/chatbot';
 import { loadHeartbeats } from './chatbot/heartbeat';
+import { handleReplyButton, sendReply } from './chatbot/replies';
 
 import { Command } from './types/bot';
 import { addResponseMessage, deleteConversationMessageByID, deleteHeartBoardMessage, deleteResponseMessage, getAllConversations, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, updateReminder, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotSubscriber, isConversationMessage, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, updateDatabase, updateHeartBoardMessage } from './data';
@@ -107,6 +108,11 @@ function clientEvents(discordClient: Client) {
 
   // On command
   discordClient.on(Events.InteractionCreate, async (interaction) => {
+    // the retry and version buttons under the chatbot's replies
+    if (interaction.isButton()) {
+      if (interaction.customId.startsWith('reply:')) await handleReplyButton(interaction).catch((error) => console.error(error));
+      return;
+    }
     if (!interaction.isCommand() && !interaction.isAutocomplete() && !interaction.isModalSubmit()) return;
     if (!interaction.guild) return;
 
@@ -206,9 +212,8 @@ function clientEvents(discordClient: Client) {
 
     // get response from LLM, and reply. nothing is sent until the whole reply is ready
     try {
-      const { chunks: [firstChunk, ...restChunks] } = await generateReply(serverID, { channel: message.channel, context: context ?? [], message, reference: messageReference });
-      if (firstChunk) await message.reply({ content: firstChunk });
-      for (const chunk of restChunks) await channel.send({ content: chunk }); // one at a time, so they arrive in order
+      const { chunks } = await generateReply(serverID, { channel: message.channel, context: context ?? [], message, reference: messageReference });
+      await sendReply(message, chunks);
     } catch (error: any) {
       console.error(error);
       message.reply(`There was an issue... Please try again later...\n\`\`\`${error?.message ?? ''}\`\`\``).catch((err) => console.error(err));
