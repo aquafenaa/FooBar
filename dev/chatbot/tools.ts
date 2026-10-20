@@ -9,6 +9,7 @@ import { MemoryTable, ReminderTable } from '../types/schema';
 import { sendReminder } from '../utils';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './context';
 import { MAX_TIMEOUT, sandboxExec } from './sandbox';
+import { captionImage } from './vision';
 
 // filled in by the bot for each reply, rather than by the model, so the model can't get it wrong (or reach another server's memories)
 const replyContextSchema = zod.object({
@@ -556,6 +557,31 @@ const fetchURL = tool({
   },
 });
 
+const captionImageTool = tool({
+  description: 'Look at an image at a URL, and get back a short description of it, including any text in it. '
+    + 'Use it on images you find mid-response (e.g. from a web search or a fetched page), or to look again at an image in the conversation, which are shown as "(url) [image: caption]". '
+    + 'Give a question to have it look for something specific. Only works on JPEG, PNG, GIF, and WebP images up to 5MB.',
+  inputExamples: [
+    { input: { url: 'https://example.com/images/chart.png' } },
+    { input: { url: 'https://example.com/menu.jpg', question: 'How much is the large pepperoni pizza?' } },
+  ],
+  inputSchema: zod.object({
+    url: zod.string().describe('Full URL of the image, including https://'),
+    question: zod.string().optional().describe('Something specific to look for or answer about the image'),
+  }),
+  execute: async (input: { url: string, question?: string }): Promise<{ result: 'success' | 'failure', caption?: string, message: string }> => {
+    try {
+      const caption = await captionImage(input.url, input.question);
+      return { result: 'success', caption, message: 'Captioned image.' };
+    } catch (error: any) {
+      return {
+        result: 'failure',
+        message: error?.name === 'TimeoutError' ? 'Fetching the image timed out after 15 seconds.' : String(error?.message ?? error),
+      };
+    }
+  },
+});
+
 // X's API bills $0.005 per post returned, and won't return fewer than 10, so every search costs about 5 cents
 const X_SEARCH_RESULTS = 10;
 
@@ -739,4 +765,4 @@ const writeFile = tool({
   },
 });
 
-export default { reactToMessage, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, xSearch, counter, runCommand, writeFile };
+export default { reactToMessage, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, captionImage: captionImageTool, xSearch, counter, runCommand, writeFile };
