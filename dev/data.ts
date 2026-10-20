@@ -189,6 +189,10 @@ function insertConversationMessage(message: ConversationMessageTable): void {
 function isConversationMessage(message_id: string): boolean {
   return db.prepare('SELECT 1 FROM ConversationMessage WHERE message_id = ?').get(message_id) !== undefined;
 }
+// e.g. when a reply is switched to another version. does nothing if the message isn't saved
+function updateConversationMessageContent(message_id: string, message_content: string, token_count: number): void {
+  db.prepare('UPDATE ConversationMessage SET message_content = ?, token_count = ? WHERE message_id = ?').run(message_content, token_count, message_id);
+}
 function deleteConversationMessageByID(message_id: string): void {
   db.prepare('DELETE FROM ConversationMessage WHERE message_id = ?').run(message_id);
 }
@@ -812,7 +816,7 @@ export {
   getVoicePingInputs, insertVoicePingInput, deleteAllVoicePingInputs, deleteVoicePingInput,
   saveAnonymizedMessage,
   getConversation, getAllConversations, getConversationsBySource, getConversationByChannel, getExpiredConversations, upsertConversation, deleteConversation, deleteAllConversations,
-  getConversationMessages, insertConversationMessage, isConversationMessage, deleteConversationMessageByID, deleteConversationMessage, clearConversationMessages, getConversationTokenCount,
+  getConversationMessages, insertConversationMessage, isConversationMessage, updateConversationMessageContent, deleteConversationMessageByID, deleteConversationMessage, clearConversationMessages, getConversationTokenCount,
   getMemory, getMemoriesBySource, upsertMemory, deleteMemory,
   getConversationSummary, getConversationSummaries, getConversationSummariesBySource, getLatestConversationSummaries, upsertConversationSummary, deleteConversationSummary,
   getNextUserRef, getIndexUser, getIndexUsers, insertIndexUser, resolveUserRef, deleteIndexUser,

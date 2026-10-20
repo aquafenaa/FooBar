@@ -20,16 +20,17 @@ If you would like to add this bot to your own server, feel free! If you encounte
   - [x] Ability to change prompt between servers
   - [x] Publicize thinking and tool uses, but non-intrusive, closable
     - [ ] Not closable, and doesn't show context, but definitely non-intrusive
-  - [ ] Heartbeat schedule
-  - [x] Resolve user pings for less model confusion
-  - [x] Reformat entire chat for better model understanding
+  - [x] Heartbeat schedule
+  - [ ] Bluesky
   - [ ] Skills
-    - [ ] Change nickname
+    - [x] Create threads
+    - [x] Send message
+    - [x] Change nickname
     - [x] Reminder / Message scheduler
     - [ ] Get profile / bio (?)
     - [ ] Play sounds in voice chat (?)
-  - [ ] "Retry response" button
-    - [ ] ◀️▶️ for switching between responses
+  - [x] "Retry response" button
+    - [x] ◀️▶️ for switching between responses
   - [x] Limit money hemorrhaging
     - [x] Allow ability to enable or disable tool calls per server
     - [x] Check "relevancy" via top-k embedding similarity

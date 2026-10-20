@@ -1,10 +1,10 @@
 import { tool } from 'ai';
 import { z as zod } from 'zod';
 import cron from 'node-cron';
-import { ChannelType, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
+import { AnyThreadChannel, ChannelType, GuildBasedChannel, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
 
 import { discordClient } from '..';
-import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
+import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getIndexChannel, getNextChannelRef, insertIndexChannel, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
 import { MemoryTable, ReminderTable } from '../types/schema';
 import { estimateTokens, safeFetch, sendReminder } from '../utils';
 import { formatReactions, formatResponse } from './chatbot';
@@ -751,10 +751,10 @@ const MAX_SEARCH_RESULTS = 20;
 const MAX_CHANNEL_MESSAGE_LENGTH = 1000; // characters of each message given back, so a few long ones can't fill the prompt
 
 /**
- * A text channel in this server, from a ref like [#3], a <#id> mention, or a plain id. Defaults to the channel being replied in.
+ * A channel in this server, from a ref like [#3], a <#id> mention, or a plain id. Defaults to the channel being replied in.
  * Returns why not instead, worded to give to the model as-is
  */
-async function resolveTextChannel(context: ReplyContext, channelInput?: string): Promise<GuildTextBasedChannel | string> {
+async function resolveChannel(context: ReplyContext, channelInput?: string): Promise<GuildBasedChannel | string> {
   const raw = channelInput?.trim();
   let channelID: string | undefined = context.channel_id;
   // [#0] is always the current channel, and isn't saved like other refs
@@ -770,9 +770,53 @@ async function resolveTextChannel(context: ReplyContext, channelInput?: string):
   const guild = await safeFetch(() => discordClient.guilds.fetch(context.server_id));
   const channel = await safeFetch(() => guild!.channels.fetch(channelID));
   if (!channel) return `There is no channel ${raw ?? channelID} in this server.`;
+
+  return channel;
+}
+// same, but only text channels (including threads and voice channels' chats)
+async function resolveTextChannel(context: ReplyContext, channelInput?: string): Promise<GuildTextBasedChannel | string> {
+  const channel = await resolveChannel(context, channelInput);
+  if (typeof channel === 'string') return channel;
   if (!channel.isTextBased()) return 'This channel is not text based!';
 
   return channel;
+}
+
+/**
+ * Counts one more use of a limited tool this reply, returning false if the limit's already reached.
+ * Keyed by the reply's context object, which the bot makes once per reply and passes to every tool call.
+ * Call it before anything is awaited, so calls made at the same time can't all slip under the limit
+ */
+function countUse(counts: WeakMap<ReplyContext, number>, context: ReplyContext, max: number): boolean {
+  const used = counts.get(context) ?? 0;
+  if (used >= max) return false;
+
+  counts.set(context, used + 1);
+  return true;
+}
+
+// saved as the bot's turn, so what it sends outside its reply is in the conversation's summary
+function saveSentMessage(context: ReplyContext, sent: Message<boolean>): void {
+  insertConversationMessage({
+    conversation_id: context.conversation_id,
+    message_id: sent.id,
+    role: 'assistant',
+    author_id: sent.author.id,
+    author_name: sent.author.displayName,
+    timestamp: sent.createdTimestamp,
+    message_content: sent.content,
+    token_count: estimateTokens(sent.content),
+  });
+}
+
+// a channel's ref in this conversation, like [#4], made if it doesn't have one yet, so the model can use it in later tool calls
+function channelRef(context: ReplyContext, channelID: string): string {
+  const existing = getIndexChannel(context.conversation_id, channelID);
+  if (existing) return existing.shorthand;
+
+  const shorthand = `[#${getNextChannelRef(context.conversation_id)}]`;
+  insertIndexChannel({ conversation_id: context.conversation_id, channel_id: channelID, shorthand });
+  return shorthand;
 }
 
 // the current channel, or one everyone in the server can see, so a private channel's messages can't be read out to people who couldn't see them
@@ -800,8 +844,18 @@ function toChannelMessage(message: Message<boolean>) {
 }
 type ChannelMessage = ReturnType<typeof toChannelMessage>;
 
+// what a channel is for: its name, its description (topic), and for a thread, the channel it's in
+function describeChannel(channel: GuildTextBasedChannel): { name: string, description?: string, thread_in?: string } {
+  const topic = 'topic' in channel ? channel.topic : undefined;
+  return {
+    name: channel.name,
+    description: topic || undefined,
+    thread_in: channel.isThread() ? channel.parent?.name : undefined,
+  };
+}
+
 const fetchChannel = tool({
-  description: `Read the most recent messages in a channel, oldest first. Up to ${MAX_FETCH_MESSAGES} at once. `
+  description: `Read the most recent messages in a channel, oldest first. Up to ${MAX_FETCH_MESSAGES} at once. Also gives the channel's name and description. `
     + 'Defaults to this channel. Other channels can only be read if everyone in the server can see them.',
   inputExamples: [
     { input: { count: 20 } },
@@ -812,7 +866,7 @@ const fetchChannel = tool({
     count: zod.number().int().optional().describe(`How many messages, from 1 to ${MAX_FETCH_MESSAGES}. Defaults to 20`),
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { channel?: string, count?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', messages?: ChannelMessage[], message: string }> => {
+  execute: async (input: { channel?: string, count?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', channel?: ReturnType<typeof describeChannel>, messages?: ChannelMessage[], message: string }> => {
     const channel = await resolveTextChannel(context, input.channel);
     if (typeof channel === 'string') return { result: 'failure', message: channel };
     if (!isPublicOrCurrent(channel, context)) return { result: 'failure', message: PRIVATE_CHANNEL_MESSAGE };
@@ -820,7 +874,7 @@ const fetchChannel = tool({
     try {
       const count = Math.min(Math.max(input.count ?? 20, 1), MAX_FETCH_MESSAGES);
       const messages = [...(await channel.messages.fetch({ limit: count })).values()].reverse().map(toChannelMessage);
-      return { result: 'success', messages, message: `Fetched ${messages.length} messages from #${channel.name}.` };
+      return { result: 'success', channel: describeChannel(channel), messages, message: `Fetched ${messages.length} messages from #${channel.name}.` };
     } catch (error: any) {
       return { result: 'failure', message: String(error?.message ?? error) };
     }
@@ -887,8 +941,7 @@ const searchChannel = tool({
 });
 
 const MAX_SENDS_PER_REPLY = 5;
-// send_message calls so far, per reply. keyed by the reply's context object, which the bot makes once per reply and passes to every tool call
-const sendCounts = new WeakMap<ReplyContext, number>();
+const sendCounts = new WeakMap<ReplyContext, number>(); // send_message calls so far, per reply
 
 const sendMessage = tool({
   description: 'Send a message to a channel in this server, separate from your reply. Use it to post somewhere else, or to post more than one message. '
@@ -904,10 +957,7 @@ const sendMessage = tool({
   execute: async (input: { channel?: string, content: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message_ids?: string[], message: string }> => {
     if (!input.content.trim()) return { result: 'failure', message: 'The message is empty.' };
 
-    // counted before anything is awaited, so calls made at the same time can't all slip under the limit
-    const sends = sendCounts.get(context) ?? 0;
-    if (sends >= MAX_SENDS_PER_REPLY) return { result: 'failure', message: `You've already sent ${MAX_SENDS_PER_REPLY} messages this reply, the most allowed.` };
-    sendCounts.set(context, sends + 1);
+    if (!countUse(sendCounts, context, MAX_SENDS_PER_REPLY)) return { result: 'failure', message: `You've already sent ${MAX_SENDS_PER_REPLY} messages this reply, the most allowed.` };
 
     const channel = await resolveTextChannel(context, input.channel);
     if (typeof channel === 'string') return { result: 'failure', message: channel };
@@ -919,20 +969,81 @@ const sendMessage = tool({
       for (const chunk of chunks) {
         const sent = await channel.send({ content: chunk }); // one at a time, so they arrive in order
         messageIDs.push(sent.id);
-        // saved as the bot's turn, so it's in the conversation's summary
-        insertConversationMessage({
-          conversation_id: context.conversation_id,
-          message_id: sent.id,
-          role: 'assistant',
-          author_id: sent.author.id,
-          author_name: sent.author.displayName,
-          timestamp: sent.createdTimestamp,
-          message_content: chunk,
-          token_count: estimateTokens(chunk),
-        });
+        saveSentMessage(context, sent);
       }
 
       return { result: 'success', message_ids: messageIDs, message: `Sent ${messageIDs.length} message${messageIDs.length === 1 ? '' : 's'} in #${channel.name}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
+const MAX_THREADS_PER_REPLY = 2;
+const threadCounts = new WeakMap<ReplyContext, number>(); // create_thread calls so far, per reply
+const MAX_THREAD_NAME_LENGTH = 100; // discord's limit
+
+const createThread = tool({
+  description: 'Create a public thread in a channel, either on its own or started from a message, like Discord\'s "Create Thread". '
+    + 'You can post a first message in it. In a forum channel, the first message is required, since it\'s the post. '
+    + `Gives back the thread's ref (e.g. [#5]), which works with send_message and fetch_channel. At most ${MAX_THREADS_PER_REPLY} per reply.`,
+  inputExamples: [
+    { input: { name: 'Movie night plans', message: '[$0]' } },
+    { input: { name: 'Book club: chapter 3', channel: '[#2]', content: 'Discuss chapter 3 here! No spoilers past it, please.' } },
+  ],
+  inputSchema: zod.object({
+    name: zod.string().describe(`Title of the thread. At most ${MAX_THREAD_NAME_LENGTH} characters`),
+    channel: zod.string().optional().describe('Reference of the channel to make it in, e.g. [#2], or its id. Defaults to this channel'),
+    message: zod.string().optional().describe('Reference of a message in that channel to start it from, e.g. [$4]. Leave out for a thread on its own'),
+    content: zod.string().optional().describe('First message to post in the thread. Refs like [@2] work the same as in your replies. Required in forum channels'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { name: string, channel?: string, message?: string, content?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', thread?: string, message: string }> => {
+    const name = input.name.trim();
+    if (!name) return { result: 'failure', message: 'The thread needs a name.' };
+    if (name.length > MAX_THREAD_NAME_LENGTH) return { result: 'failure', message: `Thread names can be at most ${MAX_THREAD_NAME_LENGTH} characters.` };
+    if (!countUse(threadCounts, context, MAX_THREADS_PER_REPLY)) return { result: 'failure', message: `You've already made ${MAX_THREADS_PER_REPLY} threads this reply, the most allowed.` };
+
+    const channel = await resolveChannel(context, input.channel);
+    if (typeof channel === 'string') return { result: 'failure', message: channel };
+
+    try {
+      const chunks = input.content?.trim() ? await formatResponse(context.conversation_id, input.content) : [];
+      let thread: AnyThreadChannel;
+      let rest = chunks; // what's left to post in the thread once it's made
+
+      if (channel.type === ChannelType.GuildForum) {
+        if (chunks.length === 0) return { result: 'failure', message: 'A forum post needs a first message, as its content.' };
+
+        thread = await channel.threads.create({ name, message: { content: chunks[0] } });
+        rest = chunks.slice(1);
+        const starter = await thread.fetchStarterMessage().catch(() => null);
+        if (starter) saveSentMessage(context, starter);
+      } else if (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildAnnouncement) {
+        if (input.message) {
+          const ref = input.message.trim();
+          // [$0] is the message the user is replying to, which the bot passes in. every other ref is saved, so look it up
+          const messageID = REPLY_REFS.includes(ref)
+            ? context.reference_message_id
+            : /^\d{17,20}$/.exec(ref)?.[0] ?? resolveMessageRef(context.conversation_id, ref) ?? resolveMessageRef(context.conversation_id, `[${ref}]`) ?? resolveMessageRef(context.conversation_id, `[$${ref}]`);
+          const message = messageID ? await safeFetch(() => channel.messages.fetch(messageID)) : undefined;
+          if (!message) return { result: 'failure', message: `There is no message ${ref} in #${channel.name}.` };
+          if (message.thread) return { result: 'failure', message: `That message already has a thread: ${channelRef(context, message.thread.id)}.` };
+
+          thread = await message.startThread({ name });
+        } else {
+          if (channel.type === ChannelType.GuildAnnouncement) return { result: 'failure', message: 'In announcement channels, a thread has to start from a message.' };
+
+          thread = await channel.threads.create({ name, type: ChannelType.PublicThread }); // public only, so nobody's left out of what the bot says in it
+        }
+      } else {
+        return { result: 'failure', message: 'Threads can only be made in text, announcement, and forum channels.' };
+      }
+
+      for (const chunk of rest) saveSentMessage(context, await thread.send({ content: chunk })); // one at a time, so they arrive in order
+
+      const ref = channelRef(context, thread.id);
+      return { result: 'success', thread: ref, message: `Created thread "${thread.name}" (${ref}) in #${channel.name}.` };
     } catch (error: any) {
       return { result: 'failure', message: String(error?.message ?? error) };
     }
@@ -1085,4 +1196,4 @@ const writeFile = tool({
   },
 });
 
-export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, captionImage: captionImageTool, xSearch, counter, heartbeat, fetchChannel, searchChannel, sendMessage, runCommand, writeFile };
+export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, captionImage: captionImageTool, xSearch, counter, heartbeat, fetchChannel, searchChannel, sendMessage, createThread, runCommand, writeFile };
