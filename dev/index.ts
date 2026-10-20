@@ -32,6 +32,7 @@ const discordClient = new Client({
   // lets events fire for messages that aren't cached (e.g. sent before a restart), so deleting old messages is noticed.
   // these messages arrive partial: only their id, channel, and guild are known
   partials: [Partials.Message],
+  allowedMentions: { parse: [ 'users', 'roles' ] } // disallows @everyone & @here by default
 });
 
 discordClient.login(DISCORD_TOKEN);
