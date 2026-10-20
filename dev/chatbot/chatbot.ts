@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { Guild, GuildChannel, Message, SendableChannels, Snowflake } from 'discord.js';
+import { Guild, GuildChannel, Message, MessageMentionOptions, SendableChannels, Snowflake } from 'discord.js';
 import { ModelMessage, Tool } from 'ai';
 import cron from 'node-cron';
 import { z as zod } from 'zod';
@@ -609,10 +609,10 @@ async function generateReply(serverID: Snowflake, userMessage: Message<boolean>,
 
     toolMessage.delete();
 
-    const initialResponse = replyArr.shift() ?? '';
-    await userMessage.reply(initialResponse);
+    const initialResponse = replyArr.shift() ?? '';;
+    await userMessage.reply({ content: initialResponse });
     replyArr.forEach(async (reply) => {
-      await messageChannel.send(reply);
+      await messageChannel.send({ content: reply });
     });
 
     // skip any message deleted while the reply was generating, since its delete event found nothing to delete yet
