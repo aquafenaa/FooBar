@@ -32,6 +32,7 @@ const DELETED_MEMORY_DURATION = 10 * 60_000; // 10 minutes, far longer than a re
 const MAX_PROMPT_TOOL_RESULTS = 10; // most recent tool results given back to the model each reply
 const MAX_PROMPT_TOOL_RESULT_LENGTH = 4000; // characters of each one. the full result stays in the database
 const MAX_CONVERSATION_TOKENS = 10_000; // ~125 messages. past this, the conversation is summarized and a new one starts
+const MESSAGE_BREAK_GAP = 60 * 60_000; // 1 hour. a longer silence between two messages is marked, so the model knows time has passed
 
 // shown as each channel's type in the index, so the model knows what it can do there (e.g. threads can't hold threads)
 const CHANNEL_TYPE_NAMES: Partial<Record<ChannelType, string>> = {
@@ -105,6 +106,14 @@ function formatReactions(message: Message<boolean>): string {
     const emoji = reaction.emoji.id ? `:${reaction.emoji.name}:` : reaction.emoji.name; // custom emoji by name, rather than the long <:name:id>
     return `${emoji} ${reaction.count}${reaction.me ? ' (you)' : ''}`;
   }).join(' · ');
+}
+
+// a rough, readable length of time, e.g. "3 hours" or "2 days"
+function formatElapsed(millis: number): string {
+  const hours = Math.round(millis / (60 * 60_000));
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'}`;
 }
 
 /**
@@ -222,7 +231,8 @@ async function formatInput(guild: Guild, currentChannel: SendableChannels, conve
   });
 
   // if there's a reference message, but not currently in the conversation's context, we must insert it to both the list and the map
-  if (referenceMessage && !referenceMap.get(referenceMessage.message_id)) {
+  const outOfContextReference = referenceMessage !== undefined && !referenceMap.get(referenceMessage.message_id);
+  if (referenceMessage && outOfContextReference) {
     referenceMap.set(referenceMessage.message_id, '[$0]');
     convoContext.unshift(referenceMessage);
   }
@@ -249,19 +259,24 @@ async function formatInput(guild: Guild, currentChannel: SendableChannels, conve
   const reactionsToBot: string[] = [];
 
   // format the message to include message number, and reference message number
-  const modelMessages: ModelMessage[] = stm.map((msg) => {
+  const modelMessages: ModelMessage[] = stm.flatMap((msg, i): ModelMessage[] => {
     const messageShorthand = referenceMap.get(msg.message_id) ?? '[$unknown]';
     const reactions = reactionsOf(msg.message_id);
 
+    // a long silence gets its own user turn, so it also works before the bot's messages (e.g. heartbeats). the out-of-context reference is skipped, since it's out of order
+    const previous = i > 0 && !(i === 1 && outOfContextReference) ? stm[i - 1] : undefined;
+    const gap = previous ? msg.timestamp - previous.timestamp : 0;
+    const messageBreak: ModelMessage[] = gap > MESSAGE_BREAK_GAP ? [{ role: 'user', content: `<message_break elapsed="${formatElapsed(gap)}" />` }] : [];
+
     if (msg.author_id === discordClient.user!.id) {
       if (reactions) reactionsToBot.push(`<reactions message="${messageShorthand}">${reactions}</reactions>`);
-      return { role: 'assistant', content: `${messageShorthand} ${msg.message_content}` };
+      return [...messageBreak, { role: 'assistant', content: `${messageShorthand} ${msg.message_content}` }];
     }
 
-    return {
+    return [...messageBreak, {
       role: 'user',
       content: `${messageShorthand} ${referenceMap.get(msg.reference_id ?? '') !== undefined ? `↪ ${referenceMap.get(msg.reference_id!)} ` : ''}${msg.author_name}: ${msg.message_content}${reactions ? ` <reactions>${reactions}</reactions>` : ''}`,
-    };
+    }];
   });
 
   const indexMsg: ModelMessage = {
@@ -322,7 +337,8 @@ async function formatResponse(conversationID: string, agentResponse: string): Pr
     .replace(/\[#\d+\]/g, (ref) => { const id = resolveChannelRef(conversationID, ref); return id ? `<#${id}>` : ref; })
     .replace(/\[&\d+\]/g, (ref) => { const id = resolveRoleRef(conversationID, ref); return id ? `<@&${id}>` : ref; })
     .replace(/(?<!")\[\$\d+\]|\[\$\d+\](?!")/g, '') // replace local message numbers from output
-    .replace(/<reactions\b[^>]*>[\s\S]*?<\/reactions>/g, ''); // in case it copies the reaction tags it's shown
+    .replace(/<reactions\b[^>]*>[\s\S]*?<\/reactions>/g, '') // in case it copies the reaction tags it's shown
+    .replace(/<message_break\b[^>]*\/>/g, ''); // same for the message breaks
   let open: string | null = null; // fence line still open at the start of `rest`
 
   while (rest.length > 0) {
@@ -351,7 +367,10 @@ async function formatResponse(conversationID: string, agentResponse: string): Pr
 }
 
 // what a reply is generated for: a message someone sent the bot, or a heartbeat, which has no message to answer
-type ReplyTrigger = { channel: GuildTextBasedChannel } & (
+type ReplyTrigger = {
+  channel: GuildTextBasedChannel,
+  onStatus?: (status: string) => void, // told what the reply is doing (e.g. which tool it's using), for a live status message
+} & (
   { message: Message<true>, reference?: Message<boolean>, context: Message<boolean>[] } // context: recent messages before it
   // a heartbeat isn't shown the channel. it can look with fetch_channel or search_channel
   // the caller picks the heartbeat's conversation id, so it can settle the conversation even if this fails partway
@@ -661,6 +680,10 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toAnthropicTool('heartbeat', localTools.heartbeat),
     toAnthropicTool('fetch_channel', localTools.fetchChannel),
     toAnthropicTool('search_channel', localTools.searchChannel),
+    toAnthropicTool('fetch_embed', localTools.fetchEmbed),
+    toAnthropicTool('search_users', localTools.searchUsers),
+    toAnthropicTool('list_users', localTools.listUsers),
+    toAnthropicTool('view_user', localTools.viewUser),
     toAnthropicTool('send_message', localTools.sendMessage),
     toAnthropicTool('create_thread', localTools.createThread),
     toAnthropicTool('create_memory', localTools.createMemory),
@@ -689,6 +712,10 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
     fetch_channel: localTools.fetchChannel,
     search_channel: localTools.searchChannel,
+    fetch_embed: localTools.fetchEmbed,
+    search_users: localTools.searchUsers,
+    list_users: localTools.listUsers,
+    view_user: localTools.viewUser,
     send_message: localTools.sendMessage,
     create_thread: localTools.createThread,
 
@@ -732,6 +759,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     let afterToolUse = false; // server tools (web search, shell) run mid-response, so text can continue right after one
     for await (const event of stream) {
       if (event.type === 'content_block_start' && (event.content_block.type === 'tool_use' || event.content_block.type === 'server_tool_use')) {
+        trigger.onStatus?.(`-# using ${String(event.content_block.name).replace(/^openrouter:/, '')}...`); // e.g. openrouter:web_search -> web_search
         afterToolUse = true;
       } else if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
         // the model never adds a line break itself, so text before and after a tool would run together ("...hellOKAY...")

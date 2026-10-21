@@ -26,6 +26,7 @@ async function startup() {
 const discordClient = new Client({
   intents: [
     GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers, // privileged: lets the user tools list every member, rather than only cached ones
     GatewayIntentBits.GuildMessageTyping,
     GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessageReactions,
   ],
