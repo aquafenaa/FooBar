@@ -1,10 +1,10 @@
 import { tool } from 'ai';
 import { z as zod } from 'zod';
 import cron from 'node-cron';
-import { AnyThreadChannel, ChannelType, GuildBasedChannel, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
+import { AnyThreadChannel, ChannelType, Embed, GuildBasedChannel, GuildMember, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
 
 import { discordClient } from '..';
-import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getIndexChannel, getNextChannelRef, insertIndexChannel, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
+import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getIndexChannel, getNextChannelRef, insertIndexChannel, getIndexUser, getNextUserRef, insertIndexUser, resolveRoleRef, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
 import { MemoryTable, ReminderTable } from '../types/schema';
 import { estimateTokens, safeFetch, sendReminder } from '../utils';
 import { formatReactions, formatResponse } from './chatbot';
@@ -820,7 +820,7 @@ function channelRef(context: ReplyContext, channelID: string): string {
 }
 
 // the current channel, or one everyone in the server can see, so a private channel's messages can't be read out to people who couldn't see them
-function isPublicOrCurrent(channel: GuildTextBasedChannel, context: ReplyContext): boolean {
+function isPublicOrCurrent(channel: GuildBasedChannel, context: ReplyContext): boolean {
   if (channel.id === context.channel_id) return true;
   if (channel.type === ChannelType.PrivateThread) return false; // takes its parent's permissions, even though only its members can see it
 
@@ -937,6 +937,217 @@ const searchChannel = tool({
     } catch (error: any) {
       return { result: 'failure', message: String(error?.message ?? error) };
     }
+  },
+});
+
+// everything in an embed, leaving out what it doesn't have so it costs fewer tokens
+function toEmbedInfo(embed: Embed) {
+  return {
+    type: embed.data.type,
+    title: embed.title ?? undefined,
+    description: embed.description ?? undefined,
+    url: embed.url ?? undefined,
+    color: embed.hexColor ?? undefined,
+    timestamp: embed.timestamp ?? undefined,
+    author: embed.author ? { name: embed.author.name, url: embed.author.url, icon_url: embed.author.iconURL } : undefined,
+    footer: embed.footer ? { text: embed.footer.text, icon_url: embed.footer.iconURL } : undefined,
+    provider: embed.provider ? { name: embed.provider.name, url: embed.provider.url } : undefined,
+    image: embed.image?.url,
+    thumbnail: embed.thumbnail?.url,
+    video: embed.video?.url,
+    fields: embed.fields.length > 0 ? embed.fields.map((field) => ({ name: field.name, value: field.value, inline: field.inline ?? false })) : undefined,
+  };
+}
+type EmbedInfo = ReturnType<typeof toEmbedInfo>;
+
+const fetchEmbed = tool({
+  description: 'Read everything in a message\'s embeds (link previews, bot cards, etc.): title, description, url, author, footer, fields, images, and more. '
+    + 'Defaults to a message in this channel. Other channels can only be read if everyone in the server can see them.',
+  inputExamples: [
+    { input: { message: '[$4]' } },
+    { input: { message: '[$0]' } }, // the message the user is replying to
+    { input: { channel: '[#2]', message: '1234567890123456789' } },
+  ],
+  inputSchema: zod.object({
+    message: zod.string().describe('Reference of the message, e.g. [$4], or its id'),
+    channel: zod.string().optional().describe('Reference of the message\'s channel, e.g. [#2], or its id. Defaults to this channel'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { message: string, channel?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', content?: string, embeds?: EmbedInfo[], message: string }> => {
+    const channel = await resolveTextChannel(context, input.channel);
+    if (typeof channel === 'string') return { result: 'failure', message: channel };
+    if (!isPublicOrCurrent(channel, context)) return { result: 'failure', message: PRIVATE_CHANNEL_MESSAGE };
+
+    const ref = input.message.trim();
+    // [$0] is the message the user is replying to, which the bot passes in. every other ref is saved, so look it up
+    const messageID = REPLY_REFS.includes(ref)
+      ? context.reference_message_id
+      : /^\d{17,20}$/.exec(ref)?.[0] ?? resolveMessageRef(context.conversation_id, ref) ?? resolveMessageRef(context.conversation_id, `[${ref}]`) ?? resolveMessageRef(context.conversation_id, `[$${ref}]`);
+    const message = messageID ? await safeFetch(() => channel.messages.fetch(messageID)) : undefined;
+    if (!message) return { result: 'failure', message: `There is no message ${ref} in #${channel.name}.` };
+    if (message.embeds.length === 0) return { result: 'failure', message: 'That message has no embeds.' };
+
+    const embeds = message.embeds.map(toEmbedInfo);
+    return {
+      result: 'success',
+      content: message.content || undefined,
+      embeds,
+      message: `Fetched ${embeds.length} embed${embeds.length === 1 ? '' : 's'}.`,
+    };
+  },
+});
+
+const MAX_USER_SEARCH_RESULTS = 25;
+const MAX_LIST_USERS = 100; // most users list_users gives back, so a big server can't fill the prompt
+
+// a user's ref in this conversation, like [@5], made if they don't have one yet, so the model can mention them right away
+function userRef(context: ReplyContext, userID: string): string {
+  const existing = getIndexUser(context.conversation_id, userID);
+  if (existing) return existing.shorthand;
+
+  const shorthand = `[@${getNextUserRef(context.conversation_id)}]`;
+  insertIndexUser({ conversation_id: context.conversation_id, user_id: userID, shorthand });
+  return shorthand;
+}
+
+function toUserCard(context: ReplyContext, member: GuildMember) {
+  return {
+    ref: userRef(context, member.id),
+    name: member.displayName,
+    username: member.user.username,
+    nickname: member.nickname ?? undefined,
+    bot: member.user.bot,
+  };
+}
+type UserCard = ReturnType<typeof toUserCard>;
+
+const searchUsers = tool({
+  description: `Search this server's members by the start of their username or nickname. Up to ${MAX_USER_SEARCH_RESULTS} matches. `
+    + 'Each one comes with a ref, like [@5], to mention them with.',
+  inputExamples: [
+    { input: { query: 'ath' } },
+    { input: { query: 'foo', limit: 5 } },
+  ],
+  inputSchema: zod.object({
+    query: zod.string().describe('Start of their username or nickname'),
+    limit: zod.number().int().optional().describe(`How many matches, from 1 to ${MAX_USER_SEARCH_RESULTS}. Defaults to 10`),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { query: string, limit?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', users?: UserCard[], message: string }> => {
+    const query = input.query.trim();
+    if (!query) return { result: 'failure', message: 'Give some text to search for.' };
+
+    try {
+      // the server comes from the bot, so only this server's members can be found
+      const guild = await discordClient.guilds.fetch(context.server_id);
+      const limit = Math.min(Math.max(input.limit ?? 10, 1), MAX_USER_SEARCH_RESULTS);
+      const users = (await guild.members.search({ query, limit })).map((member) => toUserCard(context, member));
+      return {
+        result: 'success',
+        users,
+        message: users.length === 0 ? `No members match "${query}".` : `Found ${users.length} members matching "${query}".`,
+      };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
+const listUsers = tool({
+  description: `List the members of this server, or of a channel (who can see it, or who's in it for a voice channel or thread). Up to ${MAX_LIST_USERS}, sorted by name, along with the total. `
+    + 'Can be narrowed to a role. Channels other than this one can only be listed if everyone in the server can see them.',
+  inputExamples: [
+    { input: { scope: 'server' } },
+    { input: { scope: 'channel' } }, // this channel
+    { input: { scope: 'channel', channel: '[#2]' } },
+    { input: { scope: 'server', role: '[&1]' } },
+  ],
+  inputSchema: zod.object({
+    scope: zod.enum(['server', 'channel']).describe('Whether to list the whole server, or one channel'),
+    channel: zod.string().optional().describe('With the channel scope: reference of the channel, e.g. [#2], or its id. Defaults to this channel'),
+    role: zod.string().optional().describe('Only members with this role: a reference like [&1], or its id'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { scope: 'server' | 'channel', channel?: string, role?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', users?: UserCard[], total?: number, truncated?: boolean, message: string }> => {
+    try {
+      const guild = await discordClient.guilds.fetch(context.server_id);
+      await guild.members.fetch(); // fills the cache, which channels' member lists are read from
+
+      let members: GuildMember[];
+      let where = 'this server';
+      if (input.scope === 'channel') {
+        const channel = await resolveChannel(context, input.channel);
+        if (typeof channel === 'string') return { result: 'failure', message: channel };
+        if (!isPublicOrCurrent(channel, context)) return { result: 'failure', message: 'This channel is private, so its members can only be listed from inside it.' };
+
+        // a thread's members are the people who joined it, rather than everyone who can see it
+        members = channel.isThread()
+          ? [...(await channel.members.fetch({ withMember: true })).values()].map((threadMember) => threadMember.guildMember).filter((member): member is GuildMember => !!member)
+          : [...channel.members.values()];
+        where = `#${channel.name}`;
+      } else {
+        members = [...guild.members.cache.values()];
+      }
+
+      if (input.role) {
+        const raw = input.role.trim();
+        const roleID = /^<?@?&?(\d{17,20})>?$/.exec(raw)?.[1] ?? resolveRoleRef(context.conversation_id, raw) ?? resolveRoleRef(context.conversation_id, `[${raw}]`) ?? resolveRoleRef(context.conversation_id, `[&${raw}]`);
+        const role = roleID ? await safeFetch(() => guild.roles.fetch(roleID)) : undefined;
+        if (!role) return { result: 'failure', message: `There is no role ${raw} in this server.` };
+
+        members = members.filter((member) => member.roles.cache.has(role.id));
+        where += ` with the role ${role.name}`;
+      }
+
+      members.sort((a, b) => a.displayName.localeCompare(b.displayName));
+      const users = members.slice(0, MAX_LIST_USERS).map((member) => toUserCard(context, member));
+      const truncated = members.length > MAX_LIST_USERS;
+      return {
+        result: 'success',
+        users,
+        total: members.length,
+        truncated: truncated || undefined,
+        message: `${members.length} members in ${where}${truncated ? `, showing the first ${MAX_LIST_USERS}` : ''}.`,
+      };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
+const viewUser = tool({
+  description: 'View everything about a member of this server: names, whether they\'re a bot, when they made their account and joined, their roles, avatar, and whether they\'re timed out.',
+  inputExamples: [
+    { input: { user: '[@3]' } },
+    { input: { user: '123456789012345678' } },
+  ],
+  inputSchema: zod.object({
+    user: zod.string().describe('Reference of the user, e.g. [@3], or their id'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { user: string }, { context }: { context: ReplyContext }) => {
+    const raw = input.user.trim();
+    const userID = /^<?@?!?(\d{17,20})>?$/.exec(raw)?.[1] ?? resolveUserRef(context.conversation_id, raw) ?? resolveUserRef(context.conversation_id, `[${raw}]`) ?? resolveUserRef(context.conversation_id, `[@${raw}]`);
+    if (!userID) return { result: 'failure' as const, message: `There is no user with ref ${raw}.` };
+
+    const guild = await safeFetch(() => discordClient.guilds.fetch(context.server_id));
+    const member = await safeFetch(() => guild!.members.fetch(userID));
+    if (!member) return { result: 'failure' as const, message: `${raw} isn't a member of this server.` };
+
+    const time = (timestamp: number) => new Date(timestamp).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+    return {
+      result: 'success' as const,
+      user: {
+        ...toUserCard(context, member),
+        id: member.id,
+        account_created: time(member.user.createdTimestamp),
+        joined_server: member.joinedTimestamp ? time(member.joinedTimestamp) : undefined,
+        roles: member.roles.cache.filter((role) => role.id !== member.guild.id).sort((a, b) => b.position - a.position).map((role) => role.name), // highest first, without @everyone
+        avatar_url: member.displayAvatarURL(),
+        timed_out_until: member.isCommunicationDisabled() ? time(member.communicationDisabledUntilTimestamp) : undefined,
+      },
+      message: `Viewed ${member.displayName}.`,
+    };
   },
 });
 
@@ -1196,4 +1407,4 @@ const writeFile = tool({
   },
 });
 
-export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, captionImage: captionImageTool, xSearch, counter, heartbeat, fetchChannel, searchChannel, sendMessage, createThread, runCommand, writeFile };
+export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, captionImage: captionImageTool, xSearch, counter, heartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };

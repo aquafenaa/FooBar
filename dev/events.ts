@@ -201,24 +201,24 @@ function clientEvents(discordClient: Client) {
     const messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
     const context: Message<boolean>[] | undefined = Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: message.id }))).values()); // fetch 5 most recent messages as context
 
-    message.channel.sendTyping(); // starts typing indicator...
-    const typingExtension = setInterval(() => {
-      message.channel.sendTyping();
-    }, 5000); // ... and refreshes it every 5 seconds, until cancelled
-
-    setTimeout(() => {
-      clearInterval(typingExtension);
-    }, 300000); // cancel interval after 5 minutes, if it's still somehow going
+    // sent first, so the user sees a sign of a reply right away. edited as it uses tools, then deleted once the reply is sent
+    let status = '-# thinking...';
+    const statusMessage = await safeFetch(() => message.channel.send(status));
+    const onStatus = (newStatus: string) => {
+      if (newStatus === status) return;
+      status = newStatus;
+      statusMessage?.edit(status).catch((err) => console.error(err));
+    };
 
     // get response from LLM, and reply. nothing is sent until the whole reply is ready
     try {
-      const { chunks } = await generateReply(serverID, { channel: message.channel, context: context ?? [], message, reference: messageReference });
+      const { chunks } = await generateReply(serverID, { channel: message.channel, context: context ?? [], message, reference: messageReference, onStatus });
       await sendReply(message, chunks);
+      statusMessage?.delete().catch((err) => console.error(err));
     } catch (error: any) {
       console.error(error);
-      message.reply(`There was an issue... Please try again later...\n\`\`\`${error?.message ?? ''}\`\`\``).catch((err) => console.error(err));
-    } finally {
-      clearInterval(typingExtension);
+      const errorText = `There was an issue... Please try again later...\n\`\`\`${error?.message ?? ''}\`\`\``;
+      (statusMessage ? statusMessage.edit(errorText) : message.reply(errorText)).catch((err) => console.error(err));
     }
   });
 

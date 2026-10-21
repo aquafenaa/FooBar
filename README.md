@@ -22,7 +22,7 @@ If you would like to add this bot to your own server, feel free! If you encounte
     - [ ] Not closable, and doesn't show context, but definitely non-intrusive
   - [x] Heartbeat schedule
   - [ ] Bluesky
-  - [ ] Skills
+  - [ ] Tools
     - [x] Create threads
     - [x] Send message
     - [x] Change nickname
