@@ -2229,10 +2229,12 @@ const heartbeat = tool({
   },
 });
 
-// the web service in docker-compose.yml serves the workspace's site/ folder here
+// the web service in docker-compose.yml passes every request here to a web server the bot runs in its workspace
 const { SITE_URL } = process.env;
 const SITE_DESCRIPTION = SITE_URL
-  ? ` Anything in site/ is your public website, at ${SITE_URL} (site/index.html is the home page). It's static files only (HTML, CSS, JS, images), and anyone can see them, so never put anything private there.`
+  ? ` Your public website is ${SITE_URL}: every request to it is passed to whatever web server you run in your workspace, which must listen on 0.0.0.0 port 80. `
+    + 'Start it in the background so it outlives the command (e.g. setsid nohup python3 server.py > server.log 2>&1 &). It stops if your workspace restarts, so check it\'s up when the site comes up. '
+    + 'Anyone on the internet can reach it, so never serve NOTES.md or anything private, and never let a visitor\'s input be run as code or commands.'
   : '';
 
 const SANDBOX_DESCRIPTION = 'Your own persistent Linux workspace (Debian, with python3, pip, git, curl, and jq, and internet access). '
