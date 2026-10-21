@@ -1,21 +1,25 @@
-# serves the bot's website: whatever it puts in site/ in its workspace, which is mounted read-only at /srv/site.
+# the bot's website: every request is passed to the web server it runs in its workspace (the sandbox container), on port 80.
 # SITE_URL comes from .env, e.g. https://cok.aquafenaa.dev. Caddy gets its HTTPS certificate on its own
 {$SITE_URL} {
-	root * /srv/site
 	encode zstd gzip
 
-	# dotfiles (.git, .env, ...) are never served, in case the bot leaves one there
-	@hidden path */.*
-	respond @hidden 404
+	# never passed on: dotfiles (.git, .env, ...) and the bot's notes, in case its server serves its whole workspace
+	@private path */.* /NOTES.md
+	respond @private 404
 
-	file_server
+	reverse_proxy sandbox:80
 
 	header {
 		X-Content-Type-Options nosniff
 		Referrer-Policy strict-origin-when-cross-origin
 		-Server
+		defer # after the bot's server has answered, so its own Server header is removed too
 	}
 
+	# the bot's server isn't running, e.g. after the workspace restarted
+	handle_errors 502 503 504 {
+		respond "This site is offline right now. Check back soon!" 503
+	}
 	handle_errors {
 		respond "{err.status_code} {err.status_text}"
 	}

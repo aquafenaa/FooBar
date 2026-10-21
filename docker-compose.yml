@@ -21,14 +21,13 @@ services:
       test: ["CMD", "test", "-d", "/workspace/site"]
       interval: 10s
 
-  # the bot's public website, at SITE_URL in .env. it can only read site/, never the rest of the workspace
+  # the bot's public website, at SITE_URL in .env. passes every request to the web server the bot runs in the sandbox, on port 80
   web:
     image: caddy:2.10-alpine
     container_name: foobar-web
     restart: unless-stopped
     depends_on:
-      sandbox:
-        condition: service_healthy
+      - sandbox
     ports:
       - "80:80"
       - "443:443"
@@ -36,12 +35,6 @@ services:
     environment:
       SITE_URL: ${SITE_URL:-}
     volumes:
-      - type: volume
-        source: workspace
-        target: /srv/site
-        read_only: true
-        volume:
-          subpath: site
       - ./web/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data # its HTTPS certificates, so they aren't requested again on every restart
       - caddy-config:/config
