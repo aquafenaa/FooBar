@@ -588,12 +588,12 @@ function getHeartbeatsByServer(server_id: Snowflake): HeartbeatTable[] {
   return db.prepare('SELECT * FROM Heartbeat WHERE server_id = ?').all(server_id) as HeartbeatTable[];
 }
 function insertHeartbeat(heartbeat: HeartbeatTable): void {
-  db.prepare('INSERT INTO Heartbeat (server_id, heartbeat_name, channel_id, created_by, repeats, cron_schedule, prompt, context) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(heartbeat.server_id, heartbeat.heartbeat_name, heartbeat.channel_id, heartbeat.created_by, heartbeat.repeats ? 1 : 0, heartbeat.cron_schedule, heartbeat.prompt, heartbeat.context ?? null);
+  db.prepare('INSERT INTO Heartbeat (server_id, heartbeat_name, channel_id, created_by, repeats, silent, cron_schedule, prompt, context) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(heartbeat.server_id, heartbeat.heartbeat_name, heartbeat.channel_id, heartbeat.created_by, heartbeat.repeats ? 1 : 0, heartbeat.silent ? 1 : 0, heartbeat.cron_schedule, heartbeat.prompt, heartbeat.context ?? null);
 }
 function updateHeartbeat(heartbeat: HeartbeatTable): void {
-  db.prepare('UPDATE Heartbeat SET channel_id = ?, repeats = ?, cron_schedule = ?, prompt = ?, context = ? WHERE server_id = ? AND heartbeat_name = ?')
-    .run(heartbeat.channel_id, heartbeat.repeats ? 1 : 0, heartbeat.cron_schedule, heartbeat.prompt, heartbeat.context ?? null, heartbeat.server_id, heartbeat.heartbeat_name);
+  db.prepare('UPDATE Heartbeat SET channel_id = ?, repeats = ?, silent = ?, cron_schedule = ?, prompt = ?, context = ? WHERE server_id = ? AND heartbeat_name = ?')
+    .run(heartbeat.channel_id, heartbeat.repeats ? 1 : 0, heartbeat.silent ? 1 : 0, heartbeat.cron_schedule, heartbeat.prompt, heartbeat.context ?? null, heartbeat.server_id, heartbeat.heartbeat_name);
 }
 // only the row. removeHeartbeat in chatbot/heartbeat.ts also stops its cron task
 function deleteHeartbeat(server_id: Snowflake, heartbeat_name: string): void {
@@ -798,6 +798,10 @@ const updateDatabase = db.transaction(() => {
     // Heartbeat was briefly created without it
     if (!hasColumn('Heartbeat', 'context')) db.prepare('ALTER TABLE Heartbeat ADD COLUMN context TEXT').run();
     db.pragma('user_version = 8');
+  }
+  if (currentVersion < 9) {
+    if (!hasColumn('Heartbeat', 'silent')) db.prepare('ALTER TABLE Heartbeat ADD COLUMN silent BOOLEAN').run(); // empty, so every existing heartbeat keeps posting
+    db.pragma('user_version = 9');
   }
 });
 

@@ -5,9 +5,13 @@ import {
   ChannelType,
   PermissionFlagsBits,
   ModalBuilder,
+  ModalSubmitInteraction,
   LabelBuilder,
   TextInputBuilder,
   TextInputStyle,
+  TextDisplayBuilder,
+  CheckboxBuilder,
+  CheckboxGroupBuilder,
 } from 'discord.js';
 import cron from 'node-cron';
 import { Command, ConfigCommand } from './types/bot';
@@ -42,6 +46,75 @@ function summaryKey(summary: ConversationSummaryTable): string {
 function summaryScopeLabel(summary: ConversationSummaryTable): string {
   return fromSummarySource(summary.source_id).shared ? 'shared' : 'local';
 }
+
+const MODAL_TIMEOUT = 10 * 60_000; // 10 minutes to fill one in
+const MODAL_TEXT_LIMIT = 4_000; // the most a modal's text box can hold
+
+type TextFieldOptions = {
+  description?: string,
+  value?: string,
+  placeholder?: string,
+  paragraph?: boolean,
+  maxLength?: number,
+  required?: boolean,
+};
+
+// a labelled text box. ids only need to be unique within their own modal
+function textField(id: string, label: string, options: TextFieldOptions = {}): LabelBuilder {
+  const maxLength = options.maxLength ?? MODAL_TEXT_LIMIT;
+  const input = new TextInputBuilder()
+    .setCustomId(id)
+    .setStyle(options.paragraph ? TextInputStyle.Paragraph : TextInputStyle.Short)
+    .setMaxLength(maxLength)
+    .setRequired(options.required ?? true);
+  if (options.value) input.setValue(options.value.substring(0, maxLength));
+  if (options.placeholder) input.setPlaceholder(options.placeholder.substring(0, 100));
+
+  const field = new LabelBuilder().setLabel(label.substring(0, 45)).setTextInputComponent(input);
+  if (options.description) field.setDescription(options.description.substring(0, 100));
+  return field;
+}
+
+function checkboxField(id: string, label: string, description: string, checked = false): LabelBuilder {
+  return new LabelBuilder().setLabel(label).setDescription(description)
+    .setCheckboxComponent(new CheckboxBuilder().setCustomId(id).setDefault(checked));
+}
+
+// several yes/no settings in one field, since a modal only fits 5. each option's value is its key
+function checkboxGroupField(id: string, label: string, options: { value: string, label: string, description: string, checked: boolean }[]): LabelBuilder {
+  const group = new CheckboxGroupBuilder().setCustomId(id).setMinValues(0).setRequired(false)
+    .setOptions(options.map((option) => ({ value: option.value, label: option.label, description: option.description, default: option.checked })));
+  return new LabelBuilder().setLabel(label).setCheckboxGroupComponent(group);
+}
+
+// a text box only holds 4000 characters, so saving something longer would cut off its end. this says so up front
+function overflowNote(text: string | undefined, what: string): TextDisplayBuilder | undefined {
+  if (!text || text.length <= MODAL_TEXT_LIMIT) return undefined;
+  return new TextDisplayBuilder().setContent(`⚠️ This ${what} is ${text.length.toLocaleString()} characters, but the box below only holds ${MODAL_TEXT_LIMIT.toLocaleString()}. `
+    + `Saving will cut off the last ${(text.length - MODAL_TEXT_LIMIT).toLocaleString()}.`);
+}
+
+/**
+ * Shows a modal, and waits for it to be sent. Undefined if it's closed or runs out of time,
+ * which Discord never tells us about, so it isn't treated as an error
+ */
+async function askModal(interaction: ChatInputCommandInteraction, modal: ModalBuilder): Promise<ModalSubmitInteraction | undefined> {
+  const modalID = `modal:${interaction.id}`;
+  await interaction.showModal(modal.setCustomId(modalID));
+  return interaction.awaitModalSubmit({ time: MODAL_TIMEOUT, filter: (submit) => submit.customId === modalID && submit.user.id === interaction.user.id })
+    .catch(() => undefined);
+}
+
+// a modal can't be reopened from its own submission, so when one is turned down, the longest thing typed is handed back to copy
+function rejectModal(submit: ModalSubmitInteraction, message: string, draft?: string): void {
+  const room = 2000 - message.length - 80;
+  const kept = draft && room > 0 ? `\n-# Here's what you wrote, so it isn't lost:\n\`\`\`\n${draft.replace(/```/g, '`​``').substring(0, room)}\n\`\`\`` : '';
+  submit.reply({ content: `${message}${kept}`, flags: MessageFlags.Ephemeral }).catch((error) => console.error(error));
+}
+
+// what the schedule fields accept. both are stored as cron
+const SCHEDULE_DESCRIPTION = 'Cron (e.g. 0 9 * * * for 9am daily), or a Discord timestamp like <t:1767225600:f>';
+const INVALID_SCHEDULE_MESSAGE = 'That schedule isn\'t a valid cron schedule or Discord timestamp!';
 
 const ChatbotCommand: ConfigCommand = {
   data: new SlashCommandBuilder()
@@ -81,8 +154,7 @@ const ChatbotCommand: ConfigCommand = {
         .setDescription('Set the system prompt override.'))
       .addSubcommand((deleteSystemPromptSubcommand) => deleteSystemPromptSubcommand.setName('delete')
         .setDescription('Delete the override, going back to the base system prompt.')))
-    .addSubcommand((clearMemoryCommand) => clearMemoryCommand.setName('clear-memory').setDescription('Clears this server\'s conversations and summaries. Memories are kept')
-      .addBooleanOption((confirmationOption) => confirmationOption.setName('confirmation').setDescription('Are you sure you wish to clear the memory? True = Yes, False = No.')))
+    .addSubcommand((clearMemoryCommand) => clearMemoryCommand.setName('clear-memory').setDescription('Clears this server\'s conversations and summaries. Memories are kept'))
     .addSubcommandGroup((summariesGroup) => summariesGroup.setName('summaries')
       .setDescription('View, edit, and delete the conversation summaries for the chatbot.')
       .addSubcommand((createSubcommand) => createSubcommand.setName('create')
@@ -113,9 +185,7 @@ const ChatbotCommand: ConfigCommand = {
           .setDescription('Name of the memory. Not case-sensitive')
           .setRequired(true)
           .setMaxLength(100)
-          .setAutocomplete(true))
-        .addBooleanOption((sharedOption) => sharedOption.setName('shared')
-          .setDescription('For new memories: share with other servers. Defaults to False')))
+          .setAutocomplete(true)))
       .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete')
         .setDescription('Delete a memory.')
         .addStringOption((nameOption) => nameOption.setName('name')
@@ -182,47 +252,50 @@ const ChatbotCommand: ConfigCommand = {
       }
       if (subcommand === 'set') {
         const existingMemory = findMemory(serverID, name!);
-        const shared = interaction.options.getBoolean('shared') ?? false;
-        if (!existingMemory && shared && !isAttached(serverID)) {
-          interaction.reply({ content: 'This server is detached, so it can\'t share memories! Try /chatbot detach enable:False first', flags: MessageFlags.Ephemeral });
+        // where a memory lives is picked when it's made, and only attached servers can share
+        const canShare = !existingMemory && isAttached(serverID);
+
+        const memoryModal = new ModalBuilder().setTitle(`${existingMemory ? 'Edit' : 'Create'} Memory`);
+        const note = overflowNote(existingMemory?.content, 'memory');
+        if (note) memoryModal.addTextDisplayComponents(note);
+        memoryModal.addLabelComponents(
+          textField('name', 'Name', {
+            value: existingMemory?.name ?? name!,
+            maxLength: 100,
+            description: existingMemory ? 'Change it to rename the memory. Not case-sensitive' : 'Not case-sensitive',
+          }),
+          textField('content', 'Content', {
+            paragraph: true,
+            value: existingMemory?.content,
+            placeholder: 'e.g. Sam\'s birthday is March 3rd, and they love lemon cake.',
+            description: 'What the chatbot remembers. It can look this up in any conversation',
+          }),
+        );
+        if (canShare) memoryModal.addLabelComponents(checkboxField('shared', 'Share with other servers', 'Every attached server can see it. Can\'t be changed later'));
+
+        const submit = await askModal(interaction, memoryModal);
+        if (!submit) return;
+
+        const newName = submit.fields.getTextInputValue('name').trim();
+        const content = submit.fields.getTextInputValue('content');
+        const shared = canShare && submit.fields.getCheckbox('shared');
+
+        // a rename can't take another memory's name. a change of casing is fine, since names aren't case-sensitive
+        const clash = findMemory(serverID, newName);
+        const isSelf = existingMemory && clash && clash.source_id === existingMemory.source_id && clash.name.toLowerCase() === existingMemory.name.toLowerCase();
+        if (clash && !isSelf) {
+          rejectModal(submit, `There's already a memory named "${clash.name}"!`, content);
           return;
         }
 
-        const modalID = `memory:${interaction.id}`;
-        const memoryModal = new ModalBuilder().setCustomId(modalID).setTitle(existingMemory ? 'Edit Memory' : 'Create Memory');
+        // an existing memory stays where it is. the old row goes first, so a casing-only rename isn't deleted along with it
+        const sourceID = existingMemory?.source_id ?? (shared ? MAIN_SOURCE : serverID);
+        if (existingMemory && existingMemory.name !== newName) deleteMemory(existingMemory.source_id, existingMemory.name);
+        upsertMemory({ source_id: sourceID, name: newName, content });
 
-        const paragraphID = `memory:paragraph:${interaction.id}`;
-        const memoryParagraph = new TextInputBuilder()
-          .setCustomId(paragraphID)
-          .setStyle(TextInputStyle.Paragraph)
-          .setValue(existingMemory?.content.substring(0, 4000) ?? '')
-          .setMaxLength(4_000);
-        const memoryLabel = new LabelBuilder().setLabel(`Content of "${name}"`.substring(0, 45)).setTextInputComponent(memoryParagraph);
-
-        memoryModal.addLabelComponents(memoryLabel);
-
-        await interaction.showModal(memoryModal);
-
-        try {
-          const submitModal = await interaction.awaitModalSubmit({
-            time: 60_000 * 10, // 10 minutes
-            filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
-          });
-          const content = submitModal.fields.getTextInputValue(paragraphID);
-
-          // an existing memory stays where it is, and keeps its casing, since names aren't case-sensitive
-          upsertMemory({
-            source_id: existingMemory?.source_id ?? (shared ? MAIN_SOURCE : serverID),
-            name: existingMemory?.name ?? name!,
-            content,
-          });
-
-          submitModal.reply({ content: `Successfully ${existingMemory ? 'updated' : 'created'} memory!`, flags: MessageFlags.Ephemeral });
-          return;
-        } catch (error) {
-          console.error(error);
-          return;
-        }
+        const renamed = existingMemory && existingMemory.name !== newName ? `, renamed to "${newName}"` : '';
+        submit.reply({ content: `Successfully ${existingMemory ? 'updated' : 'created'} ${sourceID === MAIN_SOURCE ? 'shared ' : ''}memory${renamed}!`, flags: MessageFlags.Ephemeral });
+        return;
       }
       if (subcommand === 'delete') {
         const memory = findMemory(serverID, name!);
@@ -302,37 +375,29 @@ const ChatbotCommand: ConfigCommand = {
           return;
         }
 
-        const modalID = `summary:${interaction.id}`;
-        const summaryModal = new ModalBuilder().setCustomId(modalID).setTitle('Edit Summary');
+        const summaryModal = new ModalBuilder().setTitle(`Edit ${summaryScopeLabel(summary)} summary · ${new Date(summary.timestamp).toLocaleDateString()}`.substring(0, 45));
+        const note = overflowNote(summary.summary, 'summary');
+        if (note) summaryModal.addTextDisplayComponents(note);
+        summaryModal.addLabelComponents(textField('summary', 'Summary', {
+          paragraph: true,
+          value: summary.summary,
+          description: 'What the chatbot recalls about this conversation, when it comes up again',
+        }));
 
-        const paragraphID = `summary:paragraph:${interaction.id}`;
-        const summaryParagraph = new TextInputBuilder()
-          .setCustomId(paragraphID)
-          .setStyle(TextInputStyle.Paragraph)
-          .setValue(summary.summary.substring(0, 4000))
-          .setMaxLength(4_000);
-        const summaryLabel = new LabelBuilder().setLabel('Edit the conversation summary.').setTextInputComponent(summaryParagraph);
+        const submit = await askModal(interaction, summaryModal);
+        if (!submit) return;
 
-        summaryModal.addLabelComponents(summaryLabel);
-
-        await interaction.showModal(summaryModal);
-
+        await submit.deferReply({ flags: MessageFlags.Ephemeral }); // embedding can take longer than discord's 3 second reply window
+        const newSummary = submit.fields.getTextInputValue('summary');
         try {
-          const submitModal = await interaction.awaitModalSubmit({
-            time: 60_000 * 10, // 10 minutes
-            filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
-          });
-          const newSummary = submitModal.fields.getTextInputValue(paragraphID);
-
           // re-embed, so relevant summary lookup matches the new text
           upsertConversationSummary({ ...summary, summary: newSummary, embedding: await getEmbedding(newSummary) });
-
-          submitModal.reply({ content: 'Successfully updated summary!', flags: MessageFlags.Ephemeral });
-          return;
+          submit.editReply({ content: 'Successfully updated summary!' });
         } catch (error) {
           console.error(error);
-          return;
+          submit.editReply({ content: `Failed to save the summary.\n-# Here's what you wrote, so it isn't lost:\n\`\`\`\n${newSummary.substring(0, 1850)}\n\`\`\`` });
         }
+        return;
       }
       if (subcommand === 'delete') {
         // deletes both the local and shared copies of every conversation from this server
@@ -389,42 +454,38 @@ const ChatbotCommand: ConfigCommand = {
       const promptName = isPersona ? 'persona' : 'system prompt override';
 
       if (subcommand === 'set') {
-        const modalID = `${subcommandGroup}:${interaction.id}`;
-        const promptModal = new ModalBuilder().setCustomId(modalID).setTitle(isPersona ? 'Set Persona' : 'Override System Prompt');
+        const promptModal = new ModalBuilder().setTitle(isPersona ? 'Set Persona' : 'Override System Prompt');
 
         // an override starts from the current system prompt, so it can be tweaked rather than written from scratch
         const currentPrompt = isPersona ? chatbot.chatbot_prompt : getSystemPrompt(chatbot);
-        const paragraphID = `${subcommandGroup}:paragraph:${interaction.id}`;
-        const promptParagraph = new TextInputBuilder()
-          .setCustomId(paragraphID)
-          .setStyle(TextInputStyle.Paragraph)
-          .setValue((currentPrompt ?? '').substring(0, 4000))
-          .setMaxLength(4_000);
-        const promptLabel = new LabelBuilder()
-          .setLabel(isPersona ? 'Persona, added on top of the system prompt.' : 'Replaces the system prompt for this server.')
-          .setTextInputComponent(promptParagraph);
+        const note = overflowNote(currentPrompt, isPersona ? 'persona' : 'system prompt');
+        if (note) promptModal.addTextDisplayComponents(note);
+        promptModal.addLabelComponents(isPersona
+          ? textField('prompt', 'Persona', {
+            paragraph: true,
+            value: currentPrompt,
+            required: false,
+            placeholder: 'e.g. You\'re a laid-back pirate who loves puns, and calls everyone "matey".',
+            description: 'Who the chatbot is in this server, added on top of the system prompt. Empty for none',
+          })
+          : textField('prompt', 'System prompt', {
+            paragraph: true,
+            value: currentPrompt,
+            required: false,
+            description: 'Replaces SYSTEM.md in this server. Empty to go back to SYSTEM.md',
+          }));
 
-        promptModal.addLabelComponents(promptLabel);
+        const submit = await askModal(interaction, promptModal);
+        if (!submit) return;
 
-        await interaction.showModal(promptModal);
+        const newPrompt = submit.fields.getTextInputValue('prompt').trim();
+        if (isPersona) chatbot.chatbot_prompt = newPrompt;
+        else chatbot.system_prompt_override = newPrompt || undefined;
+        upsertChatbot(chatbot);
 
-        try {
-          const submitModal = await interaction.awaitModalSubmit({
-            time: 60_000 * 10, // 10 minutes
-            filter: (inter) => inter.customId === modalID && inter.user.id === interaction.user.id,
-          });
-
-          const newPrompt = submitModal.fields.getTextInputValue(paragraphID);
-          if (isPersona) chatbot.chatbot_prompt = newPrompt;
-          else chatbot.system_prompt_override = newPrompt || undefined;
-          upsertChatbot(chatbot);
-
-          submitModal.reply({ content: `Successfully updated ${promptName}!`, flags: MessageFlags.Ephemeral });
-          return;
-        } catch (error) {
-          console.error(error);
-          return;
-        }
+        const result = newPrompt ? `updated ${promptName}` : `cleared ${promptName}${isPersona ? '' : ', so SYSTEM.md is used again'}`;
+        submit.reply({ content: `Successfully ${result}!`, flags: MessageFlags.Ephemeral });
+        return;
       }
       if (subcommand === 'delete') {
         if (isPersona) chatbot.chatbot_prompt = '';
@@ -517,13 +578,6 @@ const ChatbotCommand: ConfigCommand = {
       return;
     }
     if (subcommand === 'clear-memory') {
-      const confirmation = interaction.options.getBoolean('confirmation')!;
-
-      if (!confirmation) {
-        interaction.reply({ content: 'Confirmation set to false! To clear the memory, set the confirmation option to true!', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
       // only this server's conversations. deleting them also deletes their messages, summaries, tool results, and index
       const conversations = getConversationsBySource(serverID);
 
@@ -532,14 +586,29 @@ const ChatbotCommand: ConfigCommand = {
         return;
       }
 
-      // cancel their pending summaries, since there'll be nothing left to summarize
       const conversationIDs = new Set(conversations.map((conversation) => conversation.conversation_id));
+      const summaryCount = getServerSummaries(serverID).filter((summary) => conversationIDs.has(summary.conversation_id)).length;
+      const plural = (count: number, word: string) => `${count.toLocaleString()} ${word}${count === 1 ? '' : 's'}`;
+
+      const confirmModal = new ModalBuilder().setTitle('Clear Memory')
+        .addTextDisplayComponents(new TextDisplayBuilder().setContent(`This deletes **${plural(conversations.length, 'conversation')}** and **${plural(summaryCount, 'summary').replace(/ys$/, 'ies')}** from this server, `
+          + 'including the copies shared with other servers. The chatbot will forget them for good.\n\nMemories are kept.'))
+        .addLabelComponents(checkboxField('confirm', 'Yes, delete them', 'This can\'t be undone'));
+
+      const submit = await askModal(interaction, confirmModal);
+      if (!submit) return;
+      if (!submit.fields.getCheckbox('confirm')) {
+        submit.reply({ content: 'Nothing was deleted, since the box wasn\'t ticked.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      // cancel their pending summaries, since there'll be nothing left to summarize
       cron.getTasks().forEach((task) => {
         if (task.name && conversationIDs.has(task.name)) task.destroy();
       });
       conversations.forEach((conversation) => deleteConversation(conversation.conversation_id));
 
-      interaction.reply({ content: `Successfully cleared ${conversations.length} conversation${conversations.length === 1 ? '' : 's'} and their summaries!`, flags: MessageFlags.Ephemeral });
+      submit.reply({ content: `Successfully cleared ${plural(conversations.length, 'conversation')} and their summaries!`, flags: MessageFlags.Ephemeral });
       return;
     }
     if (subcommand === 'tools') {
@@ -1200,36 +1269,13 @@ const ResponseCommand: ConfigCommand = {
         .setDescription('Whether the Response should be enabled or not. True = Enable')
         .setRequired(true)))
     .addSubcommand((createResponseSubcommand) => createResponseSubcommand.setName('create')
-      .setDescription('Creates an automated, generated response, when a specific phrase is sent')
-      .addStringOption((nameOption) => nameOption.setName('name')
-        .setDescription('Name of the automated response')
-        .setRequired(true))
-      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
-        .setDescription('Whether the response starts enabled or not.')
-        .setRequired(true))
-      .addStringOption((activationRegexOption) => activationRegexOption.setName('activation-regex')
-        .setDescription('Regex that activates the formatted response, when detected')
-        .setRequired(true))
-      .addStringOption((captureRegexOption) => captureRegexOption.setName('capture-regex')
-        .setDescription('Regex for capturing and grouping terms within the original text')
-        .setRequired(true))
-      .addStringOption((outputTemplateOption) => outputTemplateOption.setName('output-template')
-        .setDescription('String for formatted output. Use {1}, {2}..., to use captured groups')
-        .setRequired(true)))
+      .setDescription('Creates an automated, generated response, when a specific phrase is sent'))
     .addSubcommand((editSubcommand) => editSubcommand.setName('edit')
       .setDescription('Edit pre-existing responses')
       .addStringOption((nameOption) => nameOption.setName('name')
         .setDescription('Name of the response to edit')
         .setAutocomplete(true)
-        .setRequired(true))
-      .addBooleanOption((enabledOption) => enabledOption.setName('enabled')
-        .setDescription('Whether the response is enabled or not'))
-      .addStringOption((activationRegexOption) => activationRegexOption.setName('activation-regex')
-        .setDescription('Regex that triggers the response'))
-      .addStringOption((captureRegexOption) => captureRegexOption.setName('capture-regex')
-        .setDescription('Regex for capturing and grouping terms within the original text.'))
-      .addStringOption((outputTemplateOption) => outputTemplateOption.setName('output-template')
-        .setDescription('String for formatted output. Use {1}, {2}..., to use captured groups')))
+        .setRequired(true)))
     .addSubcommand((removeSubcommand) => removeSubcommand.setName('remove')
       .setDescription('Remove a response')
       .addStringOption((nameOption) => nameOption.setName('name')
@@ -1276,69 +1322,60 @@ const ResponseCommand: ConfigCommand = {
       interaction.reply({ content: 'Successfully edited Response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, referencedResponse)], flags: MessageFlags.Ephemeral });
     }
 
-    if (subCommand === 'create') {
-      const nameOption = interaction.options.getString('name')!;
-      const enabledOption = interaction.options.getBoolean('enabled')! ?? false;
-      const activationRegex = interaction.options.getString('activation-regex')!;
-      const captureRegex = interaction.options.getString('capture-regex')!;
-      const outputTemplate = interaction.options.getString('output-template')!;
-
-      if (getAutomaticResponse(serverID, nameOption)) {
-        interaction.reply({ content: 'There is already a response with this name. Please try again with a unique name', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const newResponse: AutomaticResponseTable = {
-        server_id: serverID,
-        name: nameOption,
-        enabled: enabledOption,
-        activation_regex: activationRegex,
-        capture_regex: captureRegex,
-        output_template: outputTemplate,
-      };
-
-      insertAutomaticResponse(newResponse);
-
-      interaction.reply({ content: 'Successfully created response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, newResponse)], flags: MessageFlags.Ephemeral });
-      return;
-    }
-
-    if (subCommand === 'edit') {
-      const nameOption = interaction.options.getString('name')!;
-      const enabledOption = interaction.options.getBoolean('enabled');
-      const activationRegex = interaction.options.getString('activation-regex');
-      const captureRegex = interaction.options.getString('capture-regex');
-      const outputTemplate = interaction.options.getString('output-template');
-
-      // if user hasn't specified any attributes
-      if (enabledOption === null && !activationRegex && !captureRegex && !outputTemplate) {
-        interaction.reply({ content: 'You must select at least one attribute to edit!', flags: MessageFlags.Ephemeral });
-
-        return;
-      }
-
-      const referencedResponse = getAutomaticResponse(serverID, nameOption);
-      if (!referencedResponse) {
+    // create and edit share one modal, filled in with the response being edited
+    if (subCommand === 'create' || subCommand === 'edit') {
+      const existing = subCommand === 'edit' ? getAutomaticResponse(serverID, interaction.options.getString('name')!) : undefined;
+      if (subCommand === 'edit' && !existing) {
         interaction.reply({ content: 'No server responses with that name were found. Ensure you spelled it correctly!', flags: MessageFlags.Ephemeral });
         return;
       }
 
-      if (enabledOption !== null) {
-        referencedResponse.enabled = enabledOption;
+      const responseModal = new ModalBuilder().setTitle(existing ? `Edit Response: ${existing.name}`.substring(0, 45) : 'Create Response');
+      if (!existing) responseModal.addLabelComponents(textField('name', 'Name', { maxLength: 100, placeholder: 'e.g. Twitter links' }));
+      responseModal.addLabelComponents(
+        textField('activation', 'Activation regex', {
+          value: existing?.activation_regex, maxLength: 1000, placeholder: 'e.g. https://(www\\.)?(twitter|x)\\.com/\\S+', description: 'A message matching this sets off the response',
+        }),
+        textField('capture', 'Capture regex', {
+          value: existing?.capture_regex, maxLength: 1000, placeholder: 'e.g. (twitter|x)\\.com/(\\S+)', description: 'Its groups, in brackets, fill in {1}, {2}, ... in the output',
+        }),
+        textField('output', 'Output template', {
+          paragraph: true, value: existing?.output_template, maxLength: 2000, placeholder: 'e.g. https://fxtwitter.com/{2}', description: 'What the bot sends. {1}, {2}, ... are the capture regex\'s groups',
+        }),
+        checkboxField('enabled', 'Enabled', 'Whether it responds to messages yet', existing ? !!existing.enabled : true),
+      );
+
+      const submit = await askModal(interaction, responseModal);
+      if (!submit) return;
+
+      const name = existing?.name ?? submit.fields.getTextInputValue('name').trim();
+      const response: AutomaticResponseTable = {
+        server_id: serverID,
+        name,
+        enabled: submit.fields.getCheckbox('enabled'),
+        activation_regex: submit.fields.getTextInputValue('activation'),
+        capture_regex: submit.fields.getTextInputValue('capture'),
+        output_template: submit.fields.getTextInputValue('output'),
+      };
+
+      if (!existing && getAutomaticResponse(serverID, name)) {
+        rejectModal(submit, `There's already a response named "${name}"!`, response.output_template);
+        return;
+      }
+      // checked here, since a bad regex would otherwise only fail once a message comes in
+      for (const [label, pattern] of [['activation', response.activation_regex], ['capture', response.capture_regex]]) {
+        try {
+          new RegExp(pattern); // eslint-disable-line no-new
+        } catch (error: any) {
+          rejectModal(submit, `The ${label} regex isn't valid: ${error.message}`, response.output_template);
+          return;
+        }
       }
 
-      if (activationRegex) {
-        referencedResponse.activation_regex = activationRegex;
-      }
-      if (captureRegex) {
-        referencedResponse.capture_regex = captureRegex;
-      }
-      if (outputTemplate) {
-        referencedResponse.output_template = outputTemplate;
-      }
-
-      updateAutomaticResponse(referencedResponse);
-      interaction.reply({ content: 'Successfully edited the Response!', embeds: [ResponseCommand.configEmbedBuilder(serverID, referencedResponse)], flags: MessageFlags.Ephemeral });
+      if (existing) updateAutomaticResponse(response);
+      else insertAutomaticResponse(response);
+      submit.reply({ content: `Successfully ${existing ? 'edited' : 'created'} response!`, embeds: [ResponseCommand.configEmbedBuilder(serverID, response)], flags: MessageFlags.Ephemeral });
+      return;
     }
 
     if (subCommand === 'view') {
@@ -1383,7 +1420,7 @@ const ResponseCommand: ConfigCommand = {
         { name: 'Status', value: automaticResponse.enabled ? 'Enabled' : 'Disabled' },
         { name: 'Activation Phrase', value: automaticResponse.activation_regex },
         { name: 'Capture Regex', value: automaticResponse.capture_regex },
-        { name: 'Output Channel', value: automaticResponse.output_template.replace('https://', 'https​://') }, // invisible character to stop "{1}" displaying as "%7B1%7D" in link
+        { name: 'Output Template', value: automaticResponse.output_template.replace('https://', 'https​://') }, // invisible character to stop "{1}" displaying as "%7B1%7D" in link
       ]);
   },
 };
@@ -1391,23 +1428,13 @@ const ResponseCommand: ConfigCommand = {
 const ReminderCommand: ConfigCommand = {
   data: new SlashCommandBuilder().setName('reminder').setDescription('Create a reminder for a later date, or a reoccuring reminder')
     .addSubcommand((addSubcommand) => addSubcommand.setName('add').setDescription('Add a reminder')
-      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the reminder')
-        .setRequired(true).setMaxLength(40))
-      .addStringOption((scheduleOption) => scheduleOption.setName('schedule').setDescription('Discord @time string (<t:xxxxxxxxxx:s>) or cron schedule for the reminder')
-        .setRequired(true).setMaxLength(40))
-      .addStringOption((messageOption) => messageOption.setName('message').setDescription('Reminder message to send')
-        .setRequired(true).setMaxLength(2000))
-      .addChannelOption((channelOption) => channelOption.setName('output-channel').setDescription('Channel the reminder should be sent to')
-        .addChannelTypes(ChannelType.GuildText, ChannelType.PublicThread, ChannelType.GuildAnnouncement, ChannelType.PrivateThread, ChannelType.GuildVoice))
-      .addBooleanOption((repeatsOption) => repeatsOption.setName('repeats').setDescription('Whether the schedule repeats, or deletes after single use. True = Repeats, False = Deletes')))
+      .addChannelOption((channelOption) => channelOption.setName('output-channel').setDescription('Channel the reminder is sent to. Defaults to this one')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.PublicThread, ChannelType.GuildAnnouncement, ChannelType.PrivateThread, ChannelType.GuildVoice)))
     .addSubcommand((editSubcommand) => editSubcommand.setName('edit').setDescription('Edit a reminder')
-      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the schedule to edit')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the reminder to edit')
         .setRequired(true).setAutocomplete(true))
-      .addStringOption((scheduleOption) => scheduleOption.setName('schedule').setDescription('New discord @time string or cron schedule to change to').setAutocomplete(true))
-      .addStringOption((messageOption) => messageOption.setName('message').setDescription('New message to change to'))
-      .addChannelOption((channelOption) => channelOption.setName('output-channel').setDescription('Channel the reminder should be sent to')
-        .addChannelTypes(ChannelType.GuildText, ChannelType.PublicThread, ChannelType.GuildAnnouncement, ChannelType.PrivateThread, ChannelType.GuildVoice))
-      .addBooleanOption((repeatOption) => repeatOption.setName('repeat').setDescription('New value whether the schedule repeats, or deletes after single use.')))
+      .addChannelOption((channelOption) => channelOption.setName('output-channel').setDescription('New channel to send it to')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.PublicThread, ChannelType.GuildAnnouncement, ChannelType.PrivateThread, ChannelType.GuildVoice)))
     .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View the contents of a reminder')
       .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the reminder')
         .setRequired(true).setAutocomplete(true)))
@@ -1417,110 +1444,68 @@ const ReminderCommand: ConfigCommand = {
   async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
     const subcommand = interaction.options.getSubcommand();
 
-    if (subcommand === 'add') {
-      const nameOption = interaction.options.getString('name')!;
-      const scheduleOption = interaction.options.getString('schedule')!;
-      const messageOption = interaction.options.getString('message')!;
-      const channelOption = interaction.options.getChannel('output-channel');
-      const repeatOption = interaction.options.getBoolean('repeats');
-
-      const existingReminder = getReminder(serverID, nameOption);
-      if (existingReminder) {
-        interaction.reply({ content: 'There is already a reminder with this name! Please try a different name!', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      // create cron schedule either from the cron string, or the discord date tag
-      const cronSchedule = inputToSchedule(scheduleOption);
-
-      if (!cronSchedule) {
-        interaction.reply({ content: 'The given schedule is not a valid Discord @time or cron schedule! Please ensure it follows one of these formats!', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const guild = interaction.guild!;
-      const outputChannel = channelOption ? (await guild.channels.fetch(channelOption.id))! : (await guild.channels.fetch(interaction.channelId))!;
-
-      const reminder = {
-        server_id: serverID,
-        reminder_name: nameOption,
-
-        channel_id: outputChannel.id,
-        repeats: repeatOption ?? false,
-        cron_schedule: cronSchedule,
-        message_content: messageOption,
-      };
-
-      addReminder(reminder);
-      cron.schedule(cronSchedule, () => sendReminder(outputChannel, serverID, reminder.reminder_name), {
-        name: `${reminder.server_id}${reminder.reminder_name}`,
-      });
-
-      interaction.reply({ content: 'Successfully created schedule!', flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (subcommand === 'edit') {
-      const nameOption = interaction.options.getString('name')!;
-      const scheduleOption = interaction.options.getString('schedule');
-      const messageOption = interaction.options.getString('message');
-      const channelOption = interaction.options.getChannel('output-channel');
-      const repeatOption = interaction.options.getBoolean('repeats');
-
-      const reminder = getReminder(serverID, nameOption);
-      if (!reminder) {
+    // add and edit share one modal, filled in with the reminder being edited
+    if (subcommand === 'add' || subcommand === 'edit') {
+      const existing = subcommand === 'edit' ? getReminder(serverID, interaction.options.getString('name')!) : undefined;
+      if (subcommand === 'edit' && !existing) {
         interaction.reply({ content: 'There is no reminder with this name! Please ensure you\'ve spelled it correctly!', flags: MessageFlags.Ephemeral });
         return;
       }
-      if (!scheduleOption && !messageOption && !channelOption && repeatOption === null) {
-        interaction.reply({ content: 'You must edit at least one field!', flags: MessageFlags.Ephemeral });
+
+      // checked before the modal, so a bad channel doesn't throw away what was typed
+      const channelOption = interaction.options.getChannel('output-channel');
+      const outputChannel = await interaction.guild!.channels.fetch(channelOption?.id ?? existing?.channel_id ?? interaction.channelId);
+      if (!outputChannel?.isSendable()) {
+        interaction.reply({ content: 'The bot can\'t send messages in that channel!', flags: MessageFlags.Ephemeral });
         return;
       }
 
-      if (scheduleOption) {
-        const cronSchedule = inputToSchedule(scheduleOption);
-        if (!cronSchedule) {
-          interaction.reply({ content: 'The given schedule is not a valid Discord @time or cron schedule! Please ensure it follows one of these formats!', flags: MessageFlags.Ephemeral });
-          return;
-        }
+      const reminderModal = new ModalBuilder().setTitle(existing ? `Edit Reminder: ${existing.reminder_name}`.substring(0, 45) : 'Add Reminder');
+      if (!existing) reminderModal.addLabelComponents(textField('name', 'Name', { maxLength: 40, placeholder: 'e.g. Med Alarm' }));
+      reminderModal.addLabelComponents(
+        textField('schedule', 'Schedule', { value: existing?.cron_schedule, maxLength: 40, placeholder: '0 22 * * *', description: SCHEDULE_DESCRIPTION }),
+        textField('message', 'Message', {
+          paragraph: true, value: existing?.message_content, maxLength: 2000, placeholder: 'e.g. It\'s time to take your meds!', description: `What's sent in #${outputChannel.name}`,
+        }),
+        checkboxField('repeats', 'Repeats', 'Keep sending it on the schedule. Otherwise it\'s sent once, then deleted', !!existing?.repeats),
+      );
 
-        reminder.cron_schedule = cronSchedule;
+      const submit = await askModal(interaction, reminderModal);
+      if (!submit) return;
+
+      const name = existing?.reminder_name ?? submit.fields.getTextInputValue('name').trim();
+      const message = submit.fields.getTextInputValue('message');
+      if (!existing && getReminder(serverID, name)) {
+        rejectModal(submit, `There's already a reminder named "${name}"!`, message);
+        return;
       }
-      if (channelOption) {
-        const guild = interaction.guild!;
-        const outputChannel = channelOption ? (await guild.channels.fetch(channelOption.id))! : (await guild.channels.fetch(interaction.channelId))!;
-        if (!outputChannel.isSendable()) {
-          interaction.reply({ content: 'The channel given must be able to be sent to!', flags: MessageFlags.Ephemeral });
-          return;
-        }
-
-        reminder.channel_id = outputChannel.id;
-      }
-      if (messageOption && messageOption !== '') {
-        reminder.message_content = messageOption;
-      }
-      if (repeatOption !== null) {
-        reminder.repeats = repeatOption;
-      }
-
-      updateReminder(reminder);
-
-      // if schedule or channel has changed, recreate cron task
-      if (scheduleOption || channelOption) {
-        const taskName = `${reminder.server_id}${reminder.reminder_name}`;
-        cron.getTasks().forEach((task) => {
-          if (task.name === taskName) {
-            task.destroy();
-          }
-        });
-
-        const outputChannel = (await interaction.guild!.channels.fetch(reminder.channel_id))!;
-        cron.schedule(reminder.cron_schedule, () => sendReminder(outputChannel, serverID, reminder.reminder_name), {
-          name: taskName,
-        });
+      // either a cron schedule, or a discord timestamp turned into one
+      const cronSchedule = inputToSchedule(submit.fields.getTextInputValue('schedule').trim());
+      if (!cronSchedule) {
+        rejectModal(submit, INVALID_SCHEDULE_MESSAGE, message);
+        return;
       }
 
-      interaction.reply({ content: 'Successfully updated reminder!', flags: MessageFlags.Ephemeral });
-      // return;
+      const reminder: ReminderTable = {
+        server_id: serverID,
+        reminder_name: name,
+        channel_id: outputChannel.id,
+        repeats: submit.fields.getCheckbox('repeats'),
+        cron_schedule: cronSchedule,
+        message_content: message,
+      };
+      if (existing) updateReminder(reminder);
+      else addReminder(reminder);
+
+      // (re)scheduled every time, since it's cheap, and the schedule or channel may have changed
+      const taskName = `${serverID}${name}`;
+      cron.getTasks().forEach((task) => {
+        if (task.name === taskName) task.destroy();
+      });
+      cron.schedule(cronSchedule, () => sendReminder(outputChannel, serverID, name), { name: taskName });
+
+      submit.reply({ content: `Successfully ${existing ? 'updated' : 'created'} reminder!`, embeds: [this.configEmbedBuilder(serverID, reminder)], flags: MessageFlags.Ephemeral });
+      return;
     }
     if (subcommand === 'view') {
       const nameOption = interaction.options.getString('name')!;
@@ -1574,26 +1559,13 @@ const HeartbeatCommand: ConfigCommand = {
   data: new SlashCommandBuilder().setName('heartbeat').setDescription('Give the chatbot a prompt on a schedule, so it can post on its own')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild) // each beat is a model call that runs by itself
     .addSubcommand((addSubcommand) => addSubcommand.setName('add').setDescription('Add a heartbeat')
-      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat. Not case-sensitive')
-        .setRequired(true).setMaxLength(40))
-      .addStringOption((scheduleOption) => scheduleOption.setName('schedule').setDescription('Discord @time string (<t:xxxxxxxxxx:s>) or cron schedule for the heartbeat')
-        .setRequired(true).setMaxLength(40))
-      .addStringOption((promptOption) => promptOption.setName('prompt').setDescription('What the chatbot is told each time it runs')
-        .setRequired(true).setMaxLength(2000))
-      .addStringOption((contextOption) => contextOption.setName('context').setDescription('Background shown with the prompt. The chatbot doesn\'t see the channel unless it looks')
-        .setMaxLength(2000))
       .addChannelOption((channelOption) => channelOption.setName('channel').setDescription('Channel it posts in. Defaults to this one')
-        .addChannelTypes(...HEARTBEAT_CHANNEL_TYPES))
-      .addBooleanOption((repeatsOption) => repeatsOption.setName('repeats').setDescription('Whether it keeps running on the schedule, or runs once then deletes itself. Defaults to once')))
+        .addChannelTypes(...HEARTBEAT_CHANNEL_TYPES)))
     .addSubcommand((editSubcommand) => editSubcommand.setName('edit').setDescription('Edit a heartbeat')
       .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat to edit')
         .setRequired(true).setAutocomplete(true))
-      .addStringOption((scheduleOption) => scheduleOption.setName('schedule').setDescription('New Discord @time string or cron schedule').setMaxLength(40))
-      .addStringOption((promptOption) => promptOption.setName('prompt').setDescription('New prompt').setMaxLength(2000))
-      .addStringOption((contextOption) => contextOption.setName('context').setDescription('New background shown with the prompt').setMaxLength(2000))
       .addChannelOption((channelOption) => channelOption.setName('channel').setDescription('New channel to post in')
-        .addChannelTypes(...HEARTBEAT_CHANNEL_TYPES))
-      .addBooleanOption((repeatsOption) => repeatsOption.setName('repeats').setDescription('Whether it keeps running on the schedule, or runs once then deletes itself')))
+        .addChannelTypes(...HEARTBEAT_CHANNEL_TYPES)))
     .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View a heartbeat, or every heartbeat in this server')
       .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat. Leave blank to view all')
         .setAutocomplete(true)))
@@ -1603,39 +1575,65 @@ const HeartbeatCommand: ConfigCommand = {
   async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
     const subcommand = interaction.options.getSubcommand();
     const nameOption = interaction.options.getString('name');
-    const scheduleOption = interaction.options.getString('schedule');
-    const promptOption = interaction.options.getString('prompt');
-    const contextOption = interaction.options.getString('context');
-    const channelOption = interaction.options.getChannel('channel');
-    const repeatsOption = interaction.options.getBoolean('repeats');
 
-    // both cron and Discord @time tags are accepted, and stored as cron
-    const cronSchedule = scheduleOption ? inputToSchedule(scheduleOption) : undefined;
-    if (scheduleOption && !cronSchedule) {
-      interaction.reply({ content: 'The given schedule is not a valid Discord @time or cron schedule! Please ensure it follows one of these formats!', flags: MessageFlags.Ephemeral });
-      return;
-    }
+    // add and edit share one modal, filled in with the heartbeat being edited
+    if (subcommand === 'add' || subcommand === 'edit') {
+      const existing = subcommand === 'edit' ? getHeartbeat(serverID, nameOption!) : undefined;
+      if (subcommand === 'edit' && !existing) {
+        interaction.reply({ content: 'There is no heartbeat by this name, ensure you\'ve spelled it correctly', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const channelID = interaction.options.getChannel('channel')?.id ?? existing?.channel_id ?? interaction.channelId;
 
-    if (subcommand === 'add') {
-      if (getHeartbeat(serverID, nameOption!)) {
-        interaction.reply({ content: 'There is already a heartbeat with this name! Please try a different name!', flags: MessageFlags.Ephemeral });
+      const heartbeatModal = new ModalBuilder().setTitle(existing ? `Edit Heartbeat: ${existing.heartbeat_name}`.substring(0, 45) : 'Add Heartbeat');
+      if (!existing) heartbeatModal.addLabelComponents(textField('name', 'Name', { maxLength: 40, placeholder: 'e.g. Morning check-in', description: 'Not case-sensitive' }));
+      heartbeatModal.addLabelComponents(
+        textField('schedule', 'Schedule', { value: existing?.cron_schedule, maxLength: 40, placeholder: '0 9 * * *', description: SCHEDULE_DESCRIPTION }),
+        textField('prompt', 'Prompt', {
+          paragraph: true, value: existing?.prompt, placeholder: 'e.g. Post a short good morning, and mention any reminders due today.', description: 'What the chatbot is told each time it runs',
+        }),
+        textField('context', 'Context', {
+          paragraph: true, value: existing?.context, required: false, description: 'Optional background shown with the prompt. It doesn\'t see the channel unless it looks',
+        }),
+        checkboxGroupField('options', 'Options', [
+          { value: 'repeats', label: 'Repeats', description: 'Keep running on the schedule. Otherwise it runs once, then deletes itself', checked: !!existing?.repeats },
+          { value: 'silent', label: 'Silent', description: 'Never post its reply, for heartbeats that only use tools', checked: !!existing?.silent },
+        ]),
+      );
+
+      const submit = await askModal(interaction, heartbeatModal);
+      if (!submit) return;
+
+      const name = existing?.heartbeat_name ?? submit.fields.getTextInputValue('name').trim();
+      const prompt = submit.fields.getTextInputValue('prompt');
+      if (!existing && getHeartbeat(serverID, name)) {
+        rejectModal(submit, `There's already a heartbeat named "${name}"!`, prompt);
+        return;
+      }
+      // both cron and Discord timestamps are accepted, and stored as cron
+      const cronSchedule = inputToSchedule(submit.fields.getTextInputValue('schedule').trim());
+      if (!cronSchedule) {
+        rejectModal(submit, INVALID_SCHEDULE_MESSAGE, prompt);
         return;
       }
 
+      const options = submit.fields.getCheckboxGroup('options');
       const heartbeat: HeartbeatTable = {
         server_id: serverID,
-        heartbeat_name: nameOption!,
-        channel_id: channelOption?.id ?? interaction.channelId,
-        created_by: interaction.user.id,
-        repeats: repeatsOption ?? false,
-        cron_schedule: cronSchedule!,
-        prompt: promptOption!,
-        context: contextOption ?? undefined,
+        heartbeat_name: name,
+        channel_id: channelID,
+        created_by: existing?.created_by ?? interaction.user.id,
+        repeats: options.includes('repeats'),
+        silent: options.includes('silent'),
+        cron_schedule: cronSchedule,
+        prompt,
+        context: submit.fields.getTextInputValue('context').trim() || undefined,
       };
-      insertHeartbeat(heartbeat);
+      if (existing) updateHeartbeat(heartbeat);
+      else insertHeartbeat(heartbeat);
       scheduleHeartbeat(heartbeat);
 
-      interaction.reply({ embeds: [this.configEmbedBuilder(serverID, heartbeat)], flags: MessageFlags.Ephemeral });
+      submit.reply({ content: `Successfully ${existing ? 'updated' : 'created'} heartbeat!`, embeds: [this.configEmbedBuilder(serverID, heartbeat)], flags: MessageFlags.Ephemeral });
       return;
     }
     if (subcommand === 'view' && !nameOption) {
@@ -1646,7 +1644,7 @@ const HeartbeatCommand: ConfigCommand = {
       }
 
       const heartbeatEmbed = new EmbedBuilder().setTitle('Heartbeats')
-        .setDescription(heartbeats.map((hb) => `**${hb.heartbeat_name}**: \`${hb.cron_schedule}\` in <#${hb.channel_id}>${hb.repeats ? '' : ' (once)'}`).join('\n').substring(0, 4096));
+        .setDescription(heartbeats.map((hb) => `**${hb.heartbeat_name}**: \`${hb.cron_schedule}\` in <#${hb.channel_id}>${hb.repeats ? '' : ' (once)'}${hb.silent ? ' (silent)' : ''}`).join('\n').substring(0, 4096));
       interaction.reply({ embeds: [heartbeatEmbed], flags: MessageFlags.Ephemeral });
       return;
     }
@@ -1658,26 +1656,6 @@ const HeartbeatCommand: ConfigCommand = {
       return;
     }
 
-    if (subcommand === 'edit') {
-      if (!scheduleOption && !promptOption && !contextOption && !channelOption && repeatsOption === null) {
-        interaction.reply({ content: 'You must edit at least one field!', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const edited: HeartbeatTable = {
-        ...heartbeat,
-        cron_schedule: cronSchedule ?? heartbeat.cron_schedule,
-        prompt: promptOption ?? heartbeat.prompt,
-        context: contextOption ?? heartbeat.context,
-        channel_id: channelOption?.id ?? heartbeat.channel_id,
-        repeats: repeatsOption ?? !!heartbeat.repeats,
-      };
-      updateHeartbeat(edited);
-      scheduleHeartbeat(edited);
-
-      interaction.reply({ embeds: [this.configEmbedBuilder(serverID, edited)], flags: MessageFlags.Ephemeral });
-      return;
-    }
     if (subcommand === 'view') {
       interaction.reply({ embeds: [this.configEmbedBuilder(serverID, heartbeat)], flags: MessageFlags.Ephemeral });
       return;
@@ -1702,6 +1680,7 @@ const HeartbeatCommand: ConfigCommand = {
         { name: 'Channel', value: `<#${heartbeat.channel_id}>` },
         { name: 'Schedule', value: `\`${heartbeat.cron_schedule}\`` },
         { name: 'Repeats', value: heartbeat.repeats ? 'Yes' : 'No, runs once' },
+        { name: 'Silent', value: heartbeat.silent ? 'Yes, its reply is never posted' : 'No' },
         { name: 'Made by', value: `<@${heartbeat.created_by}>` },
         { name: 'Prompt', value: heartbeat.prompt.substring(0, 1024) },
         { name: 'Context', value: heartbeat.context?.substring(0, 1024) || 'None' },

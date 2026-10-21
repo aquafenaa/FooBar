@@ -217,6 +217,7 @@ CREATE TABLE IF NOT EXISTS Heartbeat(
   created_by VARCHAR(20) NOT NULL,
 
   repeats BOOLEAN,
+  silent BOOLEAN,
   cron_schedule VARCHAR(40) NOT NULL,
   prompt TEXT NOT NULL,
   context TEXT,

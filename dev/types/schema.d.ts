@@ -178,6 +178,7 @@ interface HeartbeatTable {
   created_by: Snowflake, // the admin who made it, or the bot's own id if the bot scheduled it
 
   repeats: boolean,
+  silent?: boolean, // its reply is never posted, for beats that only use tools (e.g. browsing Bluesky). it can still send_message
   cron_schedule: string,
   prompt: string,
   context?: string; // background shown with the prompt, e.g. what happened that it's following up on

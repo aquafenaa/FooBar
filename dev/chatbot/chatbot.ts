@@ -395,7 +395,9 @@ ${heartbeat.context ? `<heartbeat_context>
 ${heartbeat.context}
 </heartbeat_context>
 ` : ''}This is a scheduled heartbeat, not a message from anyone. Nothing from the channel is shown, so use fetch_channel or search_channel if you need to see what's been said.
-Your reply is posted in [#0]. If there's nothing worth posting, reply with exactly ${HEARTBEAT_OK} and nothing will be sent.`;
+${heartbeat.silent
+    ? 'This heartbeat is silent: your reply isn\'t posted anywhere, so do what it asks with your tools. If something is worth saying in Discord, use send_message. End with a short note of what you did, for your own memory.'
+    : `Your reply is posted in [#0]. If there's nothing worth posting, reply with exactly ${HEARTBEAT_OK} and nothing will be sent.`}`;
 }
 
 // a short phrase for what one tool call did, e.g. ['searched', '"weather today"']. calls with the same verb are listed together
@@ -407,7 +409,8 @@ function describeToolCall(name: string, input: any): [string, string] {
       .replace(/\[@\d+\]/g, 'a user')
       .replace(/\[&\d+\]/g, 'a role')
       .trim();
-    return text.length > max ? `${text.substring(0, max - 1)}…` : text;
+    const clipped = text.length > max ? `${text.substring(0, max - 1)}…` : text;
+    return clipped.replace(/https?:\/\/\S+/g, (url) => `<${url}>`); // after clipping, so the brackets are never cut off. <> stops discord embedding links
   };
   const quote = (value: unknown) => (value ? `"${clip(value)}"` : '');
   const host = (url: unknown) => {
@@ -496,6 +499,7 @@ function formatToolHeader(calls: { name: string, input: unknown }[]): string {
   });
   let synopsis = [...byVerb].map(([verb, details]) => (details.length > 0 ? `${verb} ${details.join(', ')}` : verb)).join(' · ');
   if (synopsis.length > MAX_TOOL_SYNOPSIS_LENGTH) synopsis = `${synopsis.substring(0, MAX_TOOL_SYNOPSIS_LENGTH - 1)}…`;
+  if (synopsis.lastIndexOf('<') > synopsis.lastIndexOf('>')) synopsis += '>'; // cut partway through a link, so it'd embed without its closing bracket
 
   return `> -# used ${used}\n> -# ${synopsis}`;
 }

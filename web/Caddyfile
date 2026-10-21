@@ -1,0 +1,22 @@
+# serves the bot's website: whatever it puts in site/ in its workspace, which is mounted read-only at /srv/site.
+# SITE_URL comes from .env, e.g. https://play.aquafenaa.dev. Caddy gets its HTTPS certificate on its own
+{$SITE_URL} {
+	root * /srv/site
+	encode zstd gzip
+
+	# dotfiles (.git, .env, ...) are never served, in case the bot leaves one there
+	@hidden path */.*
+	respond @hidden 404
+
+	file_server
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	handle_errors {
+		respond "{err.status_code} {err.status_text}"
+	}
+}
