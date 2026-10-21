@@ -1,5 +1,5 @@
 # serves the bot's website: whatever it puts in site/ in its workspace, which is mounted read-only at /srv/site.
-# SITE_URL comes from .env, e.g. https://play.aquafenaa.dev. Caddy gets its HTTPS certificate on its own
+# SITE_URL comes from .env, e.g. https://cok.aquafenaa.dev. Caddy gets its HTTPS certificate on its own
 {$SITE_URL} {
 	root * /srv/site
 	encode zstd gzip
