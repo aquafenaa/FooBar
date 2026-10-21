@@ -113,17 +113,11 @@ function clientEvents(discordClient: Client) {
       if (interaction.customId.startsWith('reply:')) await handleReplyButton(interaction).catch((error) => console.error(error));
       return;
     }
-    if (!interaction.isCommand() && !interaction.isAutocomplete() && !interaction.isModalSubmit()) return;
+    // modal submissions are picked up by the command that showed the modal, with awaitModalSubmit
+    if (!interaction.isCommand() && !interaction.isAutocomplete()) return;
     if (!interaction.guild) return;
 
     const serverID: string = interaction.guild.id;
-
-    if (interaction.isModalSubmit()) {
-      const parsedID = Array.from(interaction.customId.matchAll(/([a-z\-A-Z]+)_([a-z\-A-Z]+)/gm))[0];
-      if (!parsedID) return;
-
-      return;
-    }
 
     const command: Command = commandMap.get(interaction.commandName)!;
 

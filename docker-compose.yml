@@ -15,7 +15,46 @@ services:
     mem_limit: 1g
     cpus: 1.0
     pids_limit: 256
+    # site/ is what the web service serves, and it has to exist before that can mount it
+    command: ["sh", "-c", "mkdir -p /workspace/site && exec sleep infinity"]
+    healthcheck:
+      test: ["CMD", "test", "-d", "/workspace/site"]
+      interval: 10s
+
+  # the bot's public website, at SITE_URL in .env. it can only read site/, never the rest of the workspace
+  web:
+    image: caddy:2.10-alpine
+    container_name: foobar-web
+    restart: unless-stopped
+    depends_on:
+      sandbox:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      SITE_URL: ${SITE_URL:-}
+    volumes:
+      - type: volume
+        source: workspace
+        target: /srv/site
+        read_only: true
+        volume:
+          subpath: site
+      - ./web/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data # its HTTPS certificates, so they aren't requested again on every restart
+      - caddy-config:/config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
 
 volumes:
   workspace:
     name: foobar-workspace
+  caddy-data:
+    name: foobar-caddy-data
+  caddy-config:
+    name: foobar-caddy-config

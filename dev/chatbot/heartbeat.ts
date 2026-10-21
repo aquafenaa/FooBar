@@ -83,6 +83,25 @@ async function runHeartbeat(serverID: Snowflake, heartbeatName: string): Promise
     // its own conversation, rather than the channel's. picked here, so it can be settled even if generating fails partway
     conversationID = `${channel.id}${SnowflakeUtil.generate().toString()}`;
     const { chunks } = await generateReply(serverID, { channel, heartbeat, conversation_id: conversationID });
+
+    // a silent beat's reply isn't posted, but it's still saved as the bot's turn, so the summary has what it said it did
+    if (heartbeat.silent) {
+      const reply = chunks.join('\n');
+      if (reply) {
+        insertConversationMessage({
+          conversation_id: conversationID,
+          message_id: `heartbeat-reply${Date.now()}`,
+          role: 'assistant',
+          author_id: discordClient.user!.id,
+          author_name: discordClient.user!.displayName,
+          timestamp: Date.now(),
+          message_content: reply,
+          token_count: estimateTokens(reply),
+        });
+      }
+      return;
+    }
+
     for (const chunk of chunks) {
       const sent = await channel.send({ content: chunk }); // one at a time, so they arrive in order
       // saved as the bot's turns, so the summary has what was actually posted

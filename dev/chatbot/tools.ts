@@ -2151,10 +2151,12 @@ function isAtMostHourly(cronSchedule: string): boolean {
 const heartbeat = tool({
   description: 'Schedule a heartbeat: a prompt you\'ll be given on a cron schedule, in this channel, so you can post on your own later (e.g. check back on something, or a daily check-in). '
     + `Actions: "list" this server's heartbeats, "create" one, "edit" one, or "delete" one. You can only edit or delete ones you made, and have at most ${MAX_BOT_HEARTBEATS}. `
-    + 'Schedules are cron, at most hourly (the minute must be a fixed number). Set repeats to false for one that runs once, then deletes itself.',
+    + 'Schedules are cron, at most hourly (the minute must be a fixed number). Set repeats to false for one that runs once, then deletes itself. '
+    + 'Set silent to true for one whose reply is never posted, for when it only needs to use tools (e.g. browsing Bluesky). It can still send_message if something\'s worth saying.',
   inputExamples: [
     { input: { action: 'create', name: 'Check exam results', prompt: 'Sam (user id 1087654321098765432) gets their exam results today. Ping them with <@1087654321098765432> and ask how it went.', schedule: '0 17 21 10 *', repeats: false } },
     { input: { action: 'create', name: 'Morning check-in', prompt: 'Post a short good morning, and mention any reminders due today.', schedule: '0 9 * * *', repeats: true } },
+    { input: { action: 'create', name: 'Bluesky', prompt: 'Check your Bluesky notifications and timeline, and reply to or like anything you want to.', schedule: '0 * * * *', repeats: true, silent: true } },
     { input: { action: 'list' } },
   ],
   inputSchema: zod.object({
@@ -2164,15 +2166,16 @@ const heartbeat = tool({
     context: zod.string().optional().describe('For create and edit: background you\'ll be shown with the prompt, e.g. what was said that it\'s following up on. You won\'t see the channel unless you fetch it'),
     schedule: zod.string().optional().describe('For create and edit: cron schedule it runs on. Hour is 0-23'),
     repeats: zod.boolean().optional().describe('For create and edit: whether it keeps running on the schedule (true), or runs once then deletes itself (false). Defaults to false'),
+    silent: zod.boolean().optional().describe('For create and edit: whether its reply is never posted (true), or posted in this channel (false). Defaults to false'),
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { action: 'list' | 'create' | 'edit' | 'delete', name?: string, prompt?: string, context?: string, schedule?: string, repeats?: boolean }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', heartbeats?: { name: string, schedule: string, repeats: boolean, channel_id: string, prompt: string, context?: string, made_by_you: boolean }[], message: string }> => {
+  execute: async (input: { action: 'list' | 'create' | 'edit' | 'delete', name?: string, prompt?: string, context?: string, schedule?: string, repeats?: boolean, silent?: boolean }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', heartbeats?: { name: string, schedule: string, repeats: boolean, silent: boolean, channel_id: string, prompt: string, context?: string, made_by_you: boolean }[], message: string }> => {
     const serverID = context.server_id; // from the bot, so it can only touch this server's heartbeats
     const botID = discordClient.user!.id;
 
     if (input.action === 'list') {
       const heartbeats = getHeartbeatsByServer(serverID).map((hb) => ({
-        name: hb.heartbeat_name, schedule: hb.cron_schedule, repeats: !!hb.repeats, channel_id: hb.channel_id, prompt: hb.prompt, context: hb.context ?? undefined, made_by_you: hb.created_by === botID,
+        name: hb.heartbeat_name, schedule: hb.cron_schedule, repeats: !!hb.repeats, silent: !!hb.silent, channel_id: hb.channel_id, prompt: hb.prompt, context: hb.context ?? undefined, made_by_you: hb.created_by === botID,
       }));
       return { result: 'success', heartbeats, message: heartbeats.length === 0 ? 'There are no heartbeats in this server.' : `Found ${heartbeats.length} heartbeats.` };
     }
@@ -2193,10 +2196,10 @@ const heartbeat = tool({
         return { result: 'failure', message: `You already have ${MAX_BOT_HEARTBEATS} heartbeats in this server. Delete one first.` };
       }
 
-      const created = { server_id: serverID, heartbeat_name: input.name, channel_id: context.channel_id, created_by: botID, repeats: input.repeats ?? false, cron_schedule: input.schedule, prompt: input.prompt, context: input.context };
+      const created = { server_id: serverID, heartbeat_name: input.name, channel_id: context.channel_id, created_by: botID, repeats: input.repeats ?? false, silent: input.silent ?? false, cron_schedule: input.schedule, prompt: input.prompt, context: input.context };
       insertHeartbeat(created);
       scheduleHeartbeat(created);
-      return { result: 'success', message: `Scheduled heartbeat "${input.name}" (${input.schedule}${created.repeats ? ', repeating' : ', once'}).` };
+      return { result: 'success', message: `Scheduled heartbeat "${input.name}" (${input.schedule}${created.repeats ? ', repeating' : ', once'}${created.silent ? ', silent' : ''}).` };
     }
 
     // every other action needs a heartbeat this bot made
@@ -2204,7 +2207,9 @@ const heartbeat = tool({
     if (existing.created_by !== botID) return { result: 'failure', message: `"${existing.heartbeat_name}" was made by an admin, so only they can change it, with /heartbeat.` };
 
     if (input.action === 'edit') {
-      if (input.prompt === undefined && input.context === undefined && input.schedule === undefined && input.repeats === undefined) return { result: 'failure', message: 'Give a new prompt, context, schedule, or repeats to edit.' };
+      if (input.prompt === undefined && input.context === undefined && input.schedule === undefined && input.repeats === undefined && input.silent === undefined) {
+        return { result: 'failure', message: 'Give a new prompt, context, schedule, repeats, or silent to edit.' };
+      }
 
       const edited = {
         ...existing,
@@ -2212,6 +2217,7 @@ const heartbeat = tool({
         context: input.context ?? existing.context,
         cron_schedule: input.schedule ?? existing.cron_schedule,
         repeats: input.repeats ?? !!existing.repeats,
+        silent: input.silent ?? !!existing.silent,
       };
       updateHeartbeat(edited);
       scheduleHeartbeat(edited);
@@ -2223,9 +2229,15 @@ const heartbeat = tool({
   },
 });
 
+// the web service in docker-compose.yml serves the workspace's site/ folder here
+const { SITE_URL } = process.env;
+const SITE_DESCRIPTION = SITE_URL
+  ? ` Anything in site/ is your public website, at ${SITE_URL} (site/index.html is the home page). It's static files only (HTML, CSS, JS, images), and anyone can see them, so never put anything private there.`
+  : '';
+
 const SANDBOX_DESCRIPTION = 'Your own persistent Linux workspace (Debian, with python3, pip, git, curl, and jq, and internet access). '
   + 'Everything you save there is kept between replies, conversations, and every server you share memories with. '
-  + 'Keep NOTES.md up to date with what you\'re working on and anything you\'ll want later: it\'s shown to you at the start of every reply.';
+  + `Keep NOTES.md up to date with what you're working on and anything you'll want later: it's shown to you at the start of every reply.${SITE_DESCRIPTION}`;
 const DETACHED_MESSAGE = 'The workspace is only available in servers attached to the shared context.';
 
 const runCommand = tool({
