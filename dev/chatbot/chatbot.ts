@@ -731,7 +731,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toAnthropicTool('counter', localTools.counter),
     // only offered once the key is in .env, so the model doesn't reach for a tool that can't work
     ...(process.env.TWITTER_API_KEY ? [toAnthropicTool('x_search', localTools.xSearch)] : []),
-    // toAnthropicTool('bluesky', localTools.bluesky), // always offered, since most of it works through the public API without a login
+    toAnthropicTool('bluesky', localTools.bluesky), // always offered, since most of it works through the public API without a login
     // acting as the bot's account is public, and its DMs are private, so only attached servers get these, and only once there's a login
     ...(process.env.BLUESKY_HANDLE && isAttached(serverID) ? [
       // toAnthropicTool('bluesky_act', localTools.blueskyAct),

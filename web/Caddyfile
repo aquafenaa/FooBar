@@ -7,7 +7,7 @@
 	@private path */.* /NOTES.md
 	respond @private 404
 
-	reverse_proxy sandbox:80
+	reverse_proxy 172.18.0.2:80
 
 	header {
 		X-Content-Type-Options nosniff
