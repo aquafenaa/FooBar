@@ -418,6 +418,37 @@ function describeToolCall(name: string, input: any): [string, string] {
   switch (name) {
     case 'web_search': return ['searched', quote(input.query)];
     case 'x_search': return ['searched X for', quote(input.query)];
+    case 'bluesky':
+      if (input.action === 'search') return ['searched Bluesky for', quote(input.target)];
+      if (input.action === 'notifications') return ['checked Bluesky notifications', ''];
+      return [`${input.more ? 'scrolled' : 'read'} Bluesky`, clip(input.target) || input.action];
+    case 'bluesky_act': {
+      const blueskyVerbs: Record<string, string> = {
+        post: 'posted on Bluesky',
+        reply: 'replied on Bluesky',
+        delete: 'deleted a Bluesky post',
+        like: 'liked a Bluesky post',
+        unlike: 'unliked a Bluesky post',
+        repost: 'reposted on Bluesky',
+        unrepost: 'undid a Bluesky repost',
+        mark_read: 'marked Bluesky notifications read',
+        edit_profile: 'edited Bluesky profile',
+        // these say who
+        follow: 'followed on Bluesky',
+        unfollow: 'unfollowed on Bluesky',
+        mute: 'muted on Bluesky',
+        unmute: 'unmuted on Bluesky',
+        block: 'blocked on Bluesky',
+        unblock: 'unblocked on Bluesky',
+      };
+      const verb = blueskyVerbs[input.action] ?? `used ${name}`;
+      if (input.action === 'post' || input.action === 'reply') return [verb, quote(input.text)];
+      return [verb, ['follow', 'unfollow', 'mute', 'unmute', 'block', 'unblock'].includes(input.action) ? clip(input.target) : ''];
+    }
+    case 'bluesky_dms':
+      if (input.action === 'send') return ['sent a Bluesky DM to', clip(input.with)];
+      if (input.action === 'read') return ['read Bluesky DMs with', clip(input.with)];
+      return ['checked Bluesky DMs', ''];
     case 'fetch_url': return ['fetched', host(input.url)];
     case 'caption_image': return ['looked at images', ''];
     case 'shell':
@@ -696,6 +727,12 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toAnthropicTool('counter', localTools.counter),
     // only offered once the key is in .env, so the model doesn't reach for a tool that can't work
     ...(process.env.TWITTER_API_KEY ? [toAnthropicTool('x_search', localTools.xSearch)] : []),
+    toAnthropicTool('bluesky', localTools.bluesky), // always offered, since most of it works through the public API without a login
+    // acting as the bot's account is public, and its DMs are private, so only attached servers get these, and only once there's a login
+    ...(process.env.BLUESKY_HANDLE && isAttached(serverID) ? [
+      toAnthropicTool('bluesky_act', localTools.blueskyAct),
+      toAnthropicTool('bluesky_dms', localTools.blueskyDMs),
+    ] : []),
   ] : undefined;
 
   // tools we execute ourselves. web search runs on OpenRouter's side
@@ -729,6 +766,9 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     caption_image: localTools.captionImage,
     counter: localTools.counter,
     x_search: localTools.xSearch,
+    bluesky: localTools.bluesky,
+    bluesky_act: localTools.blueskyAct,
+    bluesky_dms: localTools.blueskyDMs,
 
     run_command: localTools.runCommand,
     write_file: localTools.writeFile,
