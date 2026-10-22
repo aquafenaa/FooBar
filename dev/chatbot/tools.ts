@@ -2233,7 +2233,10 @@ const heartbeat = tool({
 const { SITE_URL } = process.env;
 const SITE_DESCRIPTION = SITE_URL
   ? ` Your public website is ${SITE_URL}: every request to it is passed to whatever web server you run in your workspace, which must listen on 0.0.0.0 port 80. `
-    + 'Start it in the background so it outlives the command (e.g. setsid nohup python3 server.py > server.log 2>&1 &). It stops if your workspace restarts, so check it\'s up when the site comes up. '
+    + 'Start it in the background, with its input and output redirected, so it outlives the command and the command doesn\'t hang: '
+    + 'setsid nohup python3 server.py < /dev/null > server.log 2>&1 & echo $! > server.pid (stop it with kill $(cat server.pid)). '
+    + 'Put the commands that start it in start.sh, which is run whenever your workspace starts, so the site comes back on its own after a restart. '
+    + 'Only publish through this site: never open tunnels (cloudflared, ngrok, ...) or other ways in, since they skip its protections. '
     + 'Anyone on the internet can reach it, so never serve NOTES.md or anything private, and never let a visitor\'s input be run as code or commands.'
   : '';
 

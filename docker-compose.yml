@@ -15,8 +15,10 @@ services:
     mem_limit: 1g
     cpus: 1.0
     pids_limit: 256
-    # site/ is what the web service serves, and it has to exist before that can mount it
-    command: ["sh", "-c", "mkdir -p /workspace/site && exec sleep infinity"]
+    # starts the bot's own web server (see the web service) whenever the container starts, if the bot has written a start.sh for it.
+    # its output goes to start.log, so the bot can see why it didn't come up
+    command: ["sh", "-c", "mkdir -p /workspace/site; if [ -f /workspace/start.sh ]; then cd /workspace && setsid sh start.sh < /dev/null >> start.log 2>&1 & fi; exec sleep infinity"]
+    init: true # a tiny init as PID 1, which cleans up the background processes the bot starts once they exit
     healthcheck:
       test: ["CMD", "test", "-d", "/workspace/site"]
       interval: 10s

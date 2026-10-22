@@ -3,11 +3,12 @@
 {$SITE_URL} {
 	encode zstd gzip
 
-	# never passed on: dotfiles (.git, .env, ...) and the bot's notes, in case its server serves its whole workspace
-	@private path */.* /NOTES.md
+	# never passed on, in case its server serves its whole workspace: dotfiles (.git, .env, ...), its notes and other markdown,
+	# its code, logs, and scripts, and server/, which holds private files
+	@private path */.* *.md *.py *.log *.sh *.pid /server /server/*
 	respond @private 404
 
-	reverse_proxy 172.18.0.2:80
+	reverse_proxy sandbox:80
 
 	header {
 		X-Content-Type-Options nosniff
