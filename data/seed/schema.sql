@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS Chatbot(
   detached BOOLEAN,
   model TEXT,
   reasoning_effort TEXT,
+  temperature REAL,
+  min_quantization TEXT,
   system_prompt_override TEXT,
   chatbot_prompt TEXT
 );
@@ -139,6 +141,8 @@ CREATE TABLE IF NOT EXISTS ConversationToolResult(
   tool_call_id VARCHAR(100) NOT NULL,
   timestamp INTEGER,
   output TEXT,
+  dirty BOOLEAN,
+  discarded TEXT,
 
   PRIMARY KEY (conversation_id, tool_call_id)
 );

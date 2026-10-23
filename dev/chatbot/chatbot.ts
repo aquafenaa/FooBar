@@ -5,18 +5,18 @@ import cron from 'node-cron';
 import { z as zod } from 'zod';
 import { Anthropic } from '@anthropic-ai/sdk';
 
-import { MessageParam, OutputConfig, ToolResultBlockParam, ToolUnion, ToolUseBlock } from '@anthropic-ai/sdk/resources';
+import { MessageParam, OutputConfig, ServerToolUseBlock, ToolResultBlockParam, ToolUnion, ToolUseBlock } from '@anthropic-ai/sdk/resources';
 
 import { existsSync, readFileSync } from 'fs';
 
-import { getChatbot, getConversationByChannel, getConversationMessages, getConversationTokenCount, getConversationToolResults, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, insertConversationMessage, insertConversationToolResult, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
+import { getChatbot, getConversationByChannel, getConversationMessages, getConversationTokenCount, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, getSubscribersAmong, insertConversationMessage, insertConversationToolResult, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
 import { ChatbotTable, ConversationMessageTable, ConversationTable, ConversationToolResultTable, HeartbeatTable } from '../types/schema';
 import { estimateTokens, millisToCronSchedule, safeFetch, splitPoint, trackFence } from '../utils';
 import { anthropicClient, discordClient, openAIClient } from '..';
-import { endConversation, getRelevantSummaries, summarizeConversation } from './conversation';
+import { endConversation, getRelevantSummaries, getVisibleToolResults, summarizeConversation } from './conversation';
 import localTools from './tools';
 import { getVisibleMemories, isAttached, isShareable } from './context';
-import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, supportsTools } from './models';
+import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, providerOptions, supportsTools, temperatureFor } from './models';
 import { isSandboxEnabled, readNotes } from './sandbox';
 import { withCaptions } from './vision';
 
@@ -26,6 +26,8 @@ const { DISCORD_ID } = process.env;
 const MAX_MESSAGE_LENGTH = 2000;
 const PADDING_LENGTH = 8;
 const MAX_TOOL_STEPS = 50; // number of model calls allowed per reply, when it keeps asking for tools
+// only whitespace, or characters that show as nothing (zero-width spaces, the braille blank...)
+const BLANK_MESSAGE = /^[\s\u200B-\u200D\u2060\uFEFF\u2800]*$/;
 const MAX_TOOL_SYNOPSIS_LENGTH = 300; // characters of the line under the tool list, saying what they were used for
 const HEARTBEAT_OK = 'HEARTBEAT_OK'; // what the model replies to a heartbeat with nothing worth posting
 const DELETED_MEMORY_DURATION = 10 * 60_000; // 10 minutes, far longer than a reply takes to generate
@@ -326,6 +328,16 @@ async function formatInput(guild: Guild, currentChannel: SendableChannels, conve
 }
 
 /**
+ * Who a message from the chatbot may ping: only the users it mentions who have subscribed in this server, so it can't ping people who never opted in.
+ * Anyone else it mentions still shows as a mention, just without a notification. Roles ping as usual, and @everyone and @here never do.
+ * Only the mentioned users are listed, which also keeps it under discord's limit of 100
+ */
+function chatbotMentions(serverID: Snowflake, content: string): MessageMentionOptions {
+  const mentioned = [...new Set([...content.matchAll(/<@!?(\d{17,20})>/g)].map((match) => match[1]))];
+  return { parse: ['roles'], users: [...getSubscribersAmong(serverID, mentioned)].slice(0, 100), repliedUser: true };
+}
+
+/**
  * Splits a finished LLM response into Discord-safe message chunks (<= 2000 chars),
  * preserving open code fences across the split.
 */
@@ -363,13 +375,15 @@ async function formatResponse(conversationID: string, agentResponse: string): Pr
     rest = rest.slice(cut).replace(/^(\n\n|\n| )/, '');
   }
 
-  return chunks;
+  // a message with nothing visible in it is never sent, or saved
+  return chunks.filter((chunk) => !BLANK_MESSAGE.test(chunk));
 }
 
 // what a reply is generated for: a message someone sent the bot, or a heartbeat, which has no message to answer
 type ReplyTrigger = {
   channel: GuildTextBasedChannel,
   onStatus?: (status: string) => void, // told what the reply is doing (e.g. which tool it's using), for a live status message
+  control?: ReplyControl, // its Stop and Cancel buttons
 } & (
   { message: Message<true>, reference?: Message<boolean>, context: Message<boolean>[] } // context: recent messages before it
   // a heartbeat isn't shown the channel. it can look with fetch_channel or search_channel
@@ -380,6 +394,34 @@ interface GeneratedReply {
   conversation_id: string,
   chunks: string[], // the reply split into Discord-sized messages. empty if there's nothing to send
 }
+
+// how a reply still being written can be cut short, by the buttons on its status message (see replies.ts)
+interface ReplyControl {
+  stop: AbortSignal, // no more tools: what's running is given up on, and the model answers right away with what it has
+  cancel: AbortSignal, // drop the reply entirely. generateReply throws, and whatever started it cleans up
+  // its author added a message while it was being written: this attempt is dropped, but what its tools did is kept for the next one
+  restart?: AbortSignal,
+  toolCallIDs: string[], // the tool results it saved, filled in as it goes, so a cancelled reply's can be marked as such
+  toolCalls: { name: string, input: unknown }[], // the tools it's used, for the summary above it. kept across restarts
+}
+
+// what a reply being written shows, on its status message, or in place of the reply while it's retried. under the tools it's used so far
+const THINKING_STATUS = '-# thinking...';
+const TYPING_STATUS = '-# typing...';
+const STOPPED_STATUS = '-# ⏹️ stopped using tools, typing the reply...';
+// in place of a reply that's still being written, wherever the model would otherwise see its status message
+const WRITING_PLACEHOLDER = '[a reply the bot was still writing]';
+
+// status messages and retried replies still being written. they show a status rather than anything said, so the model sees a placeholder
+const writingMessages = new Set<Snowflake>();
+function setWriting(messageID: Snowflake, writing: boolean): void {
+  if (writing) writingMessages.add(messageID);
+  else writingMessages.delete(messageID);
+}
+
+const STOPPED_TOOL_RESULT = 'Stopped by the user before it finished, so there is no result. It may still have taken effect.';
+const STOPPED_NOTE = 'The user pressed Stop: no more tools. Reply now, with what you have so far.';
+const STOPPED_EMPTY_REPLY = '-# stopped before it could reply';
 
 // what a heartbeat was given, as saved for its summary
 function heartbeatText(heartbeat: HeartbeatTable): string {
@@ -398,6 +440,38 @@ ${heartbeat.context}
 ${heartbeat.silent
     ? 'This heartbeat is silent: your reply isn\'t posted anywhere, so do what it asks with your tools. If something is worth saying in Discord, use send_message. End with a short note of what you did, for your own memory.'
     : `Your reply is posted in [#0]. If there's nothing worth posting, reply with exactly ${HEARTBEAT_OK} and nothing will be sent.`}`;
+}
+
+/**
+ * Whether a tool call could have changed something (sent a message, saved a memory, ran a command...), rather than only looked something up.
+ * A dirty result is never forgotten, even when its reply is cancelled or regenerated, since what it did still happened.
+ * Anything not listed counts as dirty, so a new tool is never silently forgotten
+ */
+function isDirtyCall(name: string, input: any): boolean {
+  switch (name) {
+    case 'fetch_channel':
+    case 'search_channel':
+    case 'fetch_embed':
+    case 'search_users':
+    case 'list_users':
+    case 'view_user':
+    case 'list_reminders':
+    case 'view_reminder':
+    case 'list_memories':
+    case 'view_memory':
+    case 'search_summaries':
+    case 'caption_image':
+    case 'x_search':
+    case 'bluesky':
+    case 'web_search':
+      return false;
+    case 'counter':
+    case 'heartbeat':
+      return input?.action !== 'list';
+    case 'bluesky_dms': return input?.action === 'send';
+    case 'fetch_url': return (input?.method ?? 'GET') !== 'GET';
+    default: return true;
+  }
 }
 
 // a short phrase for what one tool call did, e.g. ['searched', '"weather today"']. calls with the same verb are listed together
@@ -474,6 +548,7 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'view_memory': return ['read memory', quote(input.name)];
     case 'remove_memory': return ['forgot memory', quote(input.name)];
     case 'list_memories': return ['listed memories', ''];
+    case 'search_summaries': return ['searched summaries for', quote(input.query)];
     case 'counter':
     case 'heartbeat':
       if (input.action === 'list') return [`listed ${name}s`, ''];
@@ -562,7 +637,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   // filtered before captioning, so messages already saved (with their captions) aren't captioned again
   const uniqueContext: ConversationMessageTable[] = await Promise.all(recentMessages.filter((txt) => !conversationContext.find((convoTxt) => convoTxt.message_id === txt.id))
     .map(async (ctx) => {
-      const content = await withCaptions(ctx);
+      const content = writingMessages.has(ctx.id) ? WRITING_PLACEHOLDER : await withCaptions(ctx);
 
       return {
         conversation_id: conversation.conversation_id,
@@ -631,7 +706,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         timestamp: messageReference.createdTimestamp,
         author_id: messageReference.author.id,
         author_name: messageReference.author.displayName,
-        message_content: await withCaptions(messageReference),
+        message_content: writingMessages.has(messageReference.id) ? WRITING_PLACEHOLDER : await withCaptions(messageReference),
         message_id: messageReference.id,
       };
     }
@@ -641,7 +716,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   conversationContext.sort((msg1, msg2) => msg1.timestamp - msg2.timestamp);
 
   // only the latest results, so a long conversation's prompt doesn't keep growing. all of them are still kept for the summary
-  const toolContext = getConversationToolResults(conversation.conversation_id).slice(-MAX_PROMPT_TOOL_RESULTS);
+  const toolContext = getVisibleToolResults(conversation.conversation_id).slice(-MAX_PROMPT_TOOL_RESULTS);
   const agentInput = await formatInput(guild, channel, conversation, referenceMessage, toolContext, conversationContext);
   const indexMsg = agentInput.shift()!;
   // dated, so the model can tell how long ago it was
@@ -726,6 +801,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toAnthropicTool('list_memories', localTools.listMemories),
     toAnthropicTool('view_memory', localTools.viewMemory),
     toAnthropicTool('remove_memory', localTools.removeMemory),
+    toAnthropicTool('search_summaries', localTools.searchSummaries),
     toAnthropicTool('fetch_url', localTools.fetchURL),
     toAnthropicTool('caption_image', localTools.captionImage),
     toAnthropicTool('counter', localTools.counter),
@@ -765,6 +841,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     list_memories: localTools.listMemories,
     view_memory: localTools.viewMemory,
     remove_memory: localTools.removeMemory,
+    search_summaries: localTools.searchSummaries,
 
     fetch_url: localTools.fetchURL,
     caption_image: localTools.captionImage,
@@ -783,13 +860,49 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   if (heartbeat) messages.push({ role: 'user', content: heartbeatTurn(heartbeat) });
 
   let streamStr = '';
-  const toolCalls: { name: string, input: unknown }[] = []; // for the header above the reply
+  const toolCalls = trigger.control?.toolCalls ?? []; // for the header above the reply, and the live one on its status
+
+  const { stop, cancel, restart, toolCallIDs } = trigger.control ?? {};
+  // Cancel, or a restart, cut the model off mid-stream, and end this attempt
+  const abort = cancel && restart ? AbortSignal.any([cancel, restart]) : cancel;
+  // settles the moment Stop, Cancel, or a restart happens, so tools still running are given up on right away, rather than waited for
+  const interrupted = new Promise<void>((resolve) => {
+    [stop, abort].forEach((signal) => {
+      if (signal?.aborted) resolve();
+      signal?.addEventListener('abort', () => resolve(), { once: true });
+    });
+  });
+
+  // the status: the tools used so far, then what it's doing now. once stopped, it says so until the reply is done
+  let stage = THINKING_STATUS;
+  const showStatus = (newStage?: string) => {
+    if (newStage && !stop?.aborted) stage = newStage;
+    trigger.onStatus?.([formatToolHeader(toolCalls), stage].filter(Boolean).join('\n'));
+  };
+  stop?.addEventListener('abort', () => { stage = STOPPED_STATUS; showStatus(); }, { once: true });
+  if (stop?.aborted) stage = STOPPED_STATUS;
+  showStatus(); // a restarted reply's status shows the tools from before it
+  // saved as each one runs, so a reply that fails partway still has a record of what it did. once it's cancelled, only what could have
+  // changed something is kept, marked as from a cancelled reply. a lookup that finishes late is dropped
+  const saveToolResult = (result: ConversationToolResultTable, input: unknown) => {
+    const dirty = isDirtyCall(result.tool_name, input);
+    if (cancel?.aborted && !dirty) return;
+    insertConversationToolResult({ ...result, dirty, discarded: cancel?.aborted ? 'cancelled' : undefined });
+    toolCallIDs?.push(result.tool_call_id);
+  };
 
   // unlike streamText, the Anthropic SDK doesn't run tools for us, so loop until the model stops asking for them
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
+    abort?.throwIfAborted();
+    // the tools it was using are done, so it's back to thinking, until the stream says it's typing or using another one
+    if (step > 0) showStatus(THINKING_STATUS);
+    // after Stop, this is the last call, whatever comes back
+    const finishing = !!stop?.aborted;
     const stream = anthropicClient.messages.stream({
       model,
-      temperature: 1.0,
+      temperature: temperatureFor(model, chatbot.temperature ?? DEFAULT_TEMPERATURE),
+      // only providers running the model at the server's minimum quality, since heavily compressed ones can fall apart into garbage
+      ...providerOptions(chatbot.min_quantization),
       // reasoning counts toward it too. openrouter treats 0 as no limit, and refuses the request if the credits can't cover that much output
       max_tokens: 20_000,
       system: systemPrompt,
@@ -797,21 +910,46 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
       output_config: { effort: (chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT) as OutputConfig['effort'] },
       messages,
       tools,
-    });
+      // after Stop, it has to answer rather than call another tool
+      ...(finishing && tools ? { tool_choice: { type: 'none' as const } } : {}),
+    }, { signal: abort });
 
     let stepText = ''; // text from this round only, so a "let me check" before a tool call doesn't get posted alongside the real answer
     let afterToolUse = false; // server tools (web search, shell) run mid-response, so text can continue right after one
+    // server tools run on OpenRouter's side, in the middle of the response. each is listed as soon as the stream moves past it,
+    // to its result (shell), or to whatever the model does next (web search, which has no result block), rather than once the response ends
+    const runningServerTools: string[] = []; // ids of ones not listed yet
+    const listedServerTools = new Set<string>();
+    const listServerTools = () => {
+      if (runningServerTools.length === 0) return;
+      runningServerTools.splice(0).forEach((id) => {
+        const block = stream.currentMessage?.content.find((other: any) => other.id === id) as ServerToolUseBlock | undefined;
+        if (!block) return;
+        listedServerTools.add(id);
+        toolCalls.push({ name: String(block.name).replace(/^openrouter:/, ''), input: block.input });
+      });
+      showStatus();
+    };
     for await (const event of stream) {
-      if (event.type === 'content_block_start' && (event.content_block.type === 'tool_use' || event.content_block.type === 'server_tool_use')) {
-        trigger.onStatus?.(`-# using ${String(event.content_block.name).replace(/^openrouter:/, '')}...`); // e.g. openrouter:web_search -> web_search
+      if (event.type === 'content_block_start') listServerTools(); // whatever ran before this block is done
+      if (event.type === 'content_block_start' && event.content_block.type === 'server_tool_use') runningServerTools.push(event.content_block.id);
+
+      if (event.type === 'content_block_start' && 'tool_use_id' in event.content_block) {
+        showStatus(THINKING_STATUS); // a server tool's result: it's done, and the model carries on
+      } else if (event.type === 'content_block_start' && (event.content_block.type === 'tool_use' || event.content_block.type === 'server_tool_use')) {
+        showStatus(`-# using ${String(event.content_block.name).replace(/^openrouter:/, '')}...`); // e.g. openrouter:web_search -> web_search
         afterToolUse = true;
+      } else if (event.type === 'content_block_start' && event.content_block.type === 'thinking') {
+        showStatus(THINKING_STATUS);
       } else if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+        if (stage !== TYPING_STATUS && !stop?.aborted) showStatus(TYPING_STATUS);
         // the model never adds a line break itself, so text before and after a tool would run together ("...hellOKAY...")
         if (afterToolUse && stepText && !stepText.endsWith('\n')) stepText += '\n';
         afterToolUse = false;
         stepText += event.delta.text;
       }
     }
+    listServerTools(); // any it ended on
     streamStr = stepText || streamStr; // keep the earlier text if the final round has none
 
     const response = await stream.finalMessage();
@@ -835,43 +973,71 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
       }
 
       const toolName = String(block.name).replace(/^openrouter:/, ''); // e.g. openrouter:web_search -> web_search
-      toolCalls.push({ name: toolName, input: block.input });
-      // saved as each one runs, so a reply that fails partway still has a record of what it did
-      insertConversationToolResult({
+      // already listed while it streamed, almost always
+      if (!listedServerTools.has(block.id)) {
+        toolCalls.push({ name: toolName, input: block.input });
+        showStatus();
+      }
+      saveToolResult({
         conversation_id: conversation.conversation_id,
         timestamp: Date.now(),
         tool_call_id: block.id,
         tool_name: toolName,
         output: JSON.stringify({ input: block.input, results }),
-      });
+      }, block.input);
     });
+
+    // even if it asks for a tool anyway, it gets no more calls
+    if (finishing) {
+      if (!streamStr.trim()) streamStr = STOPPED_EMPTY_REPLY;
+      break;
+    }
 
     const toolUses = response.content.filter((block): block is ToolUseBlock => block.type === 'tool_use');
     if (response.stop_reason !== 'tool_use' || toolUses.length === 0) break;
 
-    // run each requested tool, then hand the results back for the next step
+    // run each requested tool, then hand the results back for the next step.
+    // after Stop, ones not started yet are skipped, and ones still running are given up on. they finish in the background, and still take effect
     const toolResults: ToolResultBlockParam[] = await Promise.all(toolUses.map(async (toolUse): Promise<ToolResultBlockParam> => {
-      const localTool = localToolMap[toolUse.name];
-      const output = localTool?.execute
-        ? await localTool.execute(toolUse.input, { toolCallId: toolUse.id, messages: [], context: replyContext })
-        : { result: 'failure', message: `There is no tool named ${toolUse.name}` };
-      const outputStr = typeof output === 'string' ? output : JSON.stringify(output);
+      const stoppedResult: ToolResultBlockParam = { type: 'tool_result', tool_use_id: toolUse.id, content: STOPPED_TOOL_RESULT };
+      if (stop?.aborted || abort?.aborted) return stoppedResult;
 
-      toolCalls.push({ name: toolUse.name, input: toolUse.input });
-      insertConversationToolResult({
-        conversation_id: conversation.conversation_id,
-        timestamp: Date.now(),
-        tool_call_id: toolUse.id,
-        tool_name: toolUse.name,
-        output: outputStr,
-      });
+      // listed once it finishes, or once it's given up on, so the live list grows with every result
+      let listed = false;
+      const list = () => {
+        if (listed) return;
+        listed = true;
+        toolCalls.push({ name: toolUse.name, input: toolUse.input });
+        showStatus();
+      };
+      const run = (async (): Promise<ToolResultBlockParam> => {
+        const localTool = localToolMap[toolUse.name];
+        const output = localTool?.execute
+          ? await localTool.execute(toolUse.input, { toolCallId: toolUse.id, messages: [], context: replyContext })
+          : { result: 'failure', message: `There is no tool named ${toolUse.name}` };
+        const outputStr = typeof output === 'string' ? output : JSON.stringify(output);
 
-      return { type: 'tool_result', tool_use_id: toolUse.id, content: outputStr };
+        saveToolResult({
+          conversation_id: conversation.conversation_id,
+          timestamp: Date.now(),
+          tool_call_id: toolUse.id,
+          tool_name: toolUse.name,
+          output: outputStr,
+        }, toolUse.input);
+        list();
+        return { type: 'tool_result', tool_use_id: toolUse.id, content: outputStr };
+      })();
+      run.catch((error) => console.error(error)); // a tool given up on can still fail later, with nothing waiting on it
+
+      return Promise.race([run, interrupted.then(() => { list(); return stoppedResult; })]);
     }));
+    abort?.throwIfAborted();
 
     messages.push({ role: 'assistant', content: response.content });
-    messages.push({ role: 'user', content: toolResults });
+    // a stopped reply is told why its tools stopped, and that it has to answer now
+    messages.push({ role: 'user', content: stop?.aborted ? [...toolResults, { type: 'text', text: STOPPED_NOTE }] : toolResults });
   }
+  abort?.throwIfAborted();
 
   // skip any message deleted while the reply was generating, since its delete event found nothing to delete yet
   conversationContext.filter((ctx) => !recentlyDeleted.has(ctx.message_id)).forEach((ctx) => insertConversationMessage(ctx));
@@ -890,4 +1056,4 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   return { conversation_id: conversation.conversation_id, chunks };
 }
 
-export { getBaseSystemPrompt, getDefaultSystemPrompt, getSystemPrompt, getEmbedding, formatReactions, formatResponse, generateReply, isAllowedServer, markMessageDeleted };
+export { ReplyControl, THINKING_STATUS, TYPING_STATUS, STOPPED_STATUS, setWriting, getBaseSystemPrompt, getDefaultSystemPrompt, getSystemPrompt, getEmbedding, formatReactions, formatResponse, chatbotMentions, generateReply, isAllowedServer, markMessageDeleted };

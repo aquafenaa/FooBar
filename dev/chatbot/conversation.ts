@@ -3,7 +3,7 @@ import cron from 'node-cron';
 import { anthropicClient } from '..';
 import { clearConversationMessages, clearConversationToolResults, getAttachedServers, getConversation, getConversationMessages, getConversationToolResults, getConversationSummariesBySource, getConversationSummary, getCrossServerSubscribers, getLatestConversationSummaries, upsertConversation, upsertConversationSummary } from '../data';
 import { getEmbedding } from './chatbot';
-import { ConversationMessageTable, ConversationSummaryTable, ConversationTable, ConversationToolResultTable } from '../types/schema';
+import { ConversationMessageTable, ConversationSummaryTable, ConversationTable, ConversationToolResultTable, ToolResultDiscard } from '../types/schema';
 import { dotProduct, millisToCronSchedule } from '../utils';
 import { MAIN_SOURCE, isAttached } from './context';
 
@@ -72,6 +72,35 @@ function preferLocal(summaries: ConversationSummaryTable[]): ConversationSummary
   return [...byConversation.values()];
 }
 
+/**
+ * Every summary a server's chatbot can be shown: the server's own, local and shared, and in attached servers, every attached server's shared ones.
+ * One copy per conversation, the local one when there are both. Used for the summaries it's given, and the ones it can search for
+ */
+function getVisibleSummaries(sourceID: string): ConversationSummaryTable[] {
+  const sharedSources = isAttached(sourceID) ? getAttachedServers() : [sourceID];
+  return preferLocal([
+    ...getConversationSummariesBySource(sourceID),
+    ...sharedSources.flatMap((serverID) => getConversationSummariesBySource(`${MAIN_SOURCE}${SOURCE_SEPARATOR}${serverID}`)),
+  ]);
+}
+
+// what a discarded dirty result is shown with, since what it did still happened even though its reply isn't the one on screen
+const DISCARD_NOTES: Record<ToolResultDiscard, string> = {
+  cancelled: 'From a reply that was cancelled before it was sent. This still happened.',
+  failed: 'From a reply that failed before it was sent. This still happened.',
+  replaced: 'From an earlier version of a reply that was regenerated. This still happened.',
+};
+
+/**
+ * A conversation's tool results, as the model and summaries see them. Results from replies that were cancelled, failed, or replaced
+ * are left out if they only looked something up, and kept with a note saying so if they could have changed something
+ */
+function getVisibleToolResults(conversation_id: string): ConversationToolResultTable[] {
+  return getConversationToolResults(conversation_id)
+    .filter((result) => !result.discarded || result.dirty)
+    .map((result) => (result.discarded ? { ...result, output: `(${DISCARD_NOTES[result.discarded]})\n${result.output}` } : result));
+}
+
 async function generateSummary(messages: ConversationMessageTable[], toolResults: ConversationToolResultTable[], previousSummary: string | undefined): Promise<string | undefined> {
   // messages and tool results, interleaved in the order they happened
   const transcript = [
@@ -137,7 +166,7 @@ async function summarizeConversation(conversation_id: string): Promise<string | 
 
   // tool results can hold things from people who didn't opt in (e.g. a search they asked for, or this server's memories),
   // so the shared summary only gets them when everyone opted in
-  const toolResults = getConversationToolResults(conversation_id);
+  const toolResults = getVisibleToolResults(conversation_id);
   const sharedToolResults = sharedMessages.length === messages.length ? toolResults : [];
 
   const targets: { source_id: string, messages: ConversationMessageTable[], toolResults: ConversationToolResultTable[], previous?: string }[] = [];
@@ -184,12 +213,7 @@ async function getRelevantSummaries(conversation: ConversationTable, promptMessa
     .sort((a, b) => a.timestamp - b.timestamp)
     .slice(-n);
 
-  // the server's own summaries, both local and shared. attached servers also get every attached server's shared ones
-  const sharedSources = isAttached(conversation.source_id) ? getAttachedServers() : [conversation.source_id];
-  const conversationSummaries = preferLocal([
-    ...getConversationSummariesBySource(conversation.source_id),
-    ...sharedSources.flatMap((serverID) => getConversationSummariesBySource(`${MAIN_SOURCE}${SOURCE_SEPARATOR}${serverID}`)),
-  ]);
+  const conversationSummaries = getVisibleSummaries(conversation.source_id);
   if (conversationSummaries.length === 0) return latestSummaries;
 
   const promptEmbedding = await getEmbedding(promptMessage.message_content);
@@ -256,4 +280,4 @@ function fromBlob(blob: Buffer | undefined) {
   return Array.from(f32);
 }
 
-export { summarizeConversation, endConversation, getRelevantSummaries, scheduleExpireTask, SOURCE_SEPARATOR, toSummarySource, fromSummarySource, toBlob, fromBlob };
+export { summarizeConversation, endConversation, getRelevantSummaries, getVisibleSummaries, getVisibleToolResults, scheduleExpireTask, SOURCE_SEPARATOR, toSummarySource, fromSummarySource, toBlob, fromBlob };

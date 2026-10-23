@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import cron from 'node-cron';
 import { readFileSync } from 'fs';
 
-import { AutomaticResponseTable, ReminderTable, HeartbeatTable, CounterTable, ChatbotSubscriberTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable } from './types/schema';
+import { AutomaticResponseTable, ReminderTable, HeartbeatTable, CounterTable, ChatbotSubscriberTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable } from './types/schema';
 import { ConfigData, ServerConfig, ServerData } from './types/bot';
 import { getBaseSystemPrompt, getDefaultSystemPrompt } from './chatbot/chatbot';
 import { fromBlob, SOURCE_SEPARATOR, toBlob } from './chatbot/conversation';
@@ -37,6 +37,8 @@ function getChatbot(server_id: Snowflake): ChatbotTable | null {
   chatbot.detached = Boolean(chatbot.detached);
   chatbot.model = chatbot.model ?? undefined;
   chatbot.reasoning_effort = chatbot.reasoning_effort ?? undefined;
+  chatbot.temperature = chatbot.temperature ?? undefined;
+  chatbot.min_quantization = chatbot.min_quantization ?? undefined;
   chatbot.system_prompt_override = chatbot.system_prompt_override ?? undefined;
   return chatbot;
 }
@@ -46,14 +48,16 @@ function getAttachedServers(): Snowflake[] {
 }
 function upsertChatbot(chatbot: ChatbotTable): void {
   db.prepare(`
-    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, system_prompt_override, chatbot_prompt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, temperature, min_quantization, system_prompt_override, chatbot_prompt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(server_id) DO UPDATE SET
       chatbot_enabled = excluded.chatbot_enabled,
       tools_enabled = excluded.tools_enabled,
       detached = excluded.detached,
       model = excluded.model,
       reasoning_effort = excluded.reasoning_effort,
+      temperature = excluded.temperature,
+      min_quantization = excluded.min_quantization,
       system_prompt_override = excluded.system_prompt_override,
       chatbot_prompt = excluded.chatbot_prompt
   `).run(
@@ -63,6 +67,8 @@ function upsertChatbot(chatbot: ChatbotTable): void {
     chatbot.detached ? 1 : 0,
     chatbot.model ?? null,
     chatbot.reasoning_effort ?? null,
+    chatbot.temperature ?? null,
+    chatbot.min_quantization ?? null,
     chatbot.system_prompt_override ?? null,
     chatbot.chatbot_prompt,
   );
@@ -93,6 +99,14 @@ function getCrossServerSubscribers(server_id: Snowflake, user_ids: string[]): Se
   if (user_ids.length === 0) return new Set();
 
   const rows = db.prepare(`SELECT user_id FROM ChatbotSubscriber WHERE server_id = ? AND cross_server = 1 AND user_id IN (${user_ids.map(() => '?').join(', ')})`)
+    .all(server_id, ...user_ids) as { user_id: string }[];
+  return new Set(rows.map((row) => row.user_id));
+}
+// which of the given users have subscribed to the chatbot in this server
+function getSubscribersAmong(server_id: Snowflake, user_ids: string[]): Set<string> {
+  if (user_ids.length === 0) return new Set();
+
+  const rows = db.prepare(`SELECT user_id FROM ChatbotSubscriber WHERE server_id = ? AND user_id IN (${user_ids.map(() => '?').join(', ')})`)
     .all(server_id, ...user_ids) as { user_id: string }[];
   return new Set(rows.map((row) => row.user_id));
 }
@@ -260,12 +274,19 @@ function deleteConversationSummary(conversation_id: string, source_id: string): 
 // ==================== ConversationToolResult ====================
 function getConversationToolResults(conversation_id: string): ConversationToolResultTable[] {
   // NOTE: Ordered by timestamp for prompt feeding
-  return db.prepare('SELECT * FROM ConversationToolResult WHERE conversation_id = ? ORDER BY timestamp ASC, rowid ASC')
-    .all(conversation_id) as ConversationToolResultTable[];
+  // NOTE: every result, including discarded ones. what the model and summaries see goes through getVisibleToolResults
+  return (db.prepare('SELECT * FROM ConversationToolResult WHERE conversation_id = ? ORDER BY timestamp ASC, rowid ASC')
+    .all(conversation_id) as ConversationToolResultTable[])
+    .map((result) => ({ ...result, dirty: Boolean(result.dirty), discarded: result.discarded ?? undefined }));
 }
 function insertConversationToolResult(toolResult: ConversationToolResultTable): void {
-  db.prepare('INSERT OR IGNORE INTO ConversationToolResult (conversation_id, tool_name, tool_call_id, timestamp, output) VALUES (?, ?, ?, ?, ?)')
-    .run(toolResult.conversation_id, toolResult.tool_name, toolResult.tool_call_id, toolResult.timestamp, toolResult.output);
+  db.prepare('INSERT OR IGNORE INTO ConversationToolResult (conversation_id, tool_name, tool_call_id, timestamp, output, dirty, discarded) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(toolResult.conversation_id, toolResult.tool_name, toolResult.tool_call_id, toolResult.timestamp, toolResult.output, toolResult.dirty ? 1 : 0, toolResult.discarded ?? null);
+}
+// marks results as no longer part of the reply on screen, or (with undefined) as part of it again
+function setToolResultsDiscarded(tool_call_ids: string[], discarded: ToolResultDiscard | undefined): void {
+  const update = db.prepare('UPDATE ConversationToolResult SET discarded = ? WHERE tool_call_id = ?');
+  db.transaction(() => tool_call_ids.forEach((id) => update.run(discarded ?? null, id)))();
 }
 function clearConversationToolResults(conversation_id: string): void {
   db.prepare('DELETE FROM ConversationToolResult WHERE conversation_id = ?').run(conversation_id);
@@ -803,6 +824,17 @@ const updateDatabase = db.transaction(() => {
     if (!hasColumn('Heartbeat', 'silent')) db.prepare('ALTER TABLE Heartbeat ADD COLUMN silent BOOLEAN').run(); // empty, so every existing heartbeat keeps posting
     db.pragma('user_version = 9');
   }
+  if (currentVersion < 10) {
+    if (!hasColumn('Chatbot', 'temperature')) db.prepare('ALTER TABLE Chatbot ADD COLUMN temperature REAL').run(); // empty, so every server keeps the default temperature
+    db.pragma('user_version = 10');
+  }
+  if (currentVersion < 11) {
+    // empty, so every existing result counts as it always has: not dirty, and not discarded
+    if (!hasColumn('ConversationToolResult', 'dirty')) db.prepare('ALTER TABLE ConversationToolResult ADD COLUMN dirty BOOLEAN').run();
+    if (!hasColumn('ConversationToolResult', 'discarded')) db.prepare('ALTER TABLE ConversationToolResult ADD COLUMN discarded TEXT').run();
+    if (!hasColumn('Chatbot', 'min_quantization')) db.prepare('ALTER TABLE Chatbot ADD COLUMN min_quantization TEXT').run(); // empty, so every server gets the default
+    db.pragma('user_version = 11');
+  }
 });
 
 export {
@@ -812,7 +844,7 @@ export {
   getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, deleteHeartbeat,
   getCounter, getCountersByServer, insertCounter, setCounterValue, incrementCounter, deleteCounter,
   getChatbot, getAttachedServers, upsertChatbot, deleteChatbot, setChatbotPrompt,
-  isChatbotSubscriber, addChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, getCrossServerSubscribers, removeChatbotSubscriber,
+  isChatbotSubscriber, addChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, getCrossServerSubscribers, getSubscribersAmong, removeChatbotSubscriber,
   getHeartBoard, getHeartBoardsByServer, getHeartBoardsByEmoji, insertHeartBoard, updateHeartBoard, deleteHeartBoard,
   getHeartBoardEmojis, insertHeartBoardEmoji, deleteHeartBoardEmoji, deleteAllHeartBoardEmojis,
   getHeartBoardMessage, getHeartBoardMessagesByServer, getEmbedMessagesByBoard, insertHeartBoardMessage, updateHeartBoardMessage, deleteHeartBoardMessage, isEmbedMessage,
@@ -824,7 +856,7 @@ export {
   getMemory, getMemoriesBySource, upsertMemory, deleteMemory,
   getConversationSummary, getConversationSummaries, getConversationSummariesBySource, getLatestConversationSummaries, upsertConversationSummary, deleteConversationSummary,
   getNextUserRef, getIndexUser, getIndexUsers, insertIndexUser, resolveUserRef, deleteIndexUser,
-  getConversationToolResults, insertConversationToolResult, clearConversationToolResults,
+  getConversationToolResults, insertConversationToolResult, setToolResultsDiscarded, clearConversationToolResults,
   getNextMessageRef, getIndexMessage, getIndexMessages, insertIndexMessage, resolveMessageRef, deleteIndexMessage,
   getNextChannelRef, getIndexChannel, getIndexChannels, insertIndexChannel, resolveChannelRef, deleteIndexChannel,
   getNextRoleRef, getIndexRole, getIndexRoles, insertIndexRole, resolveRoleRef, deleteIndexRole,

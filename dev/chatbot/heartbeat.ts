@@ -3,11 +3,11 @@ import cron from 'node-cron';
 import { Snowflake, SnowflakeUtil } from 'discord.js';
 
 import { discordClient } from '..';
-import { deleteConversation, deleteHeartbeat, getChatbot, getConversationMessages, getConversationToolResults, getHeartbeat, getHeartbeatsByServer, insertConversationMessage } from '../data';
+import { deleteConversation, deleteHeartbeat, getChatbot, getConversationMessages, getHeartbeat, getHeartbeatsByServer, insertConversationMessage } from '../data';
 import { HeartbeatTable } from '../types/schema';
 import { estimateTokens, safeFetch } from '../utils';
-import { generateReply, isAllowedServer } from './chatbot';
-import { summarizeConversation } from './conversation';
+import { chatbotMentions, generateReply, isAllowedServer } from './chatbot';
+import { getVisibleToolResults, summarizeConversation } from './conversation';
 
 const MAX_BOT_HEARTBEATS = 5; // per server, for ones the bot scheduled itself, since each beat is a model call
 
@@ -48,7 +48,7 @@ function loadHeartbeats(serverID: Snowflake): void {
 
 // a beat's conversation, once it's done or has failed: summarized right away if the bot did anything, or thrown away if it didn't
 async function settleConversation(conversationID: string): Promise<void> {
-  const didSomething = getConversationToolResults(conversationID).length > 0
+  const didSomething = getVisibleToolResults(conversationID).length > 0
     || getConversationMessages(conversationID).some((message) => message.role === 'assistant');
 
   if (didSomething) await summarizeConversation(conversationID);
@@ -103,7 +103,7 @@ async function runHeartbeat(serverID: Snowflake, heartbeatName: string): Promise
     }
 
     for (const chunk of chunks) {
-      const sent = await channel.send({ content: chunk }); // one at a time, so they arrive in order
+      const sent = await channel.send({ content: chunk, allowedMentions: chatbotMentions(serverID, chunk) }); // one at a time, so they arrive in order
       // saved as the bot's turns, so the summary has what was actually posted
       insertConversationMessage({
         conversation_id: conversationID,

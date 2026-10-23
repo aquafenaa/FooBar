@@ -7,11 +7,12 @@ import { discordClient } from '..';
 import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getIndexChannel, getNextChannelRef, insertIndexChannel, getIndexUser, getNextUserRef, insertIndexUser, resolveRoleRef, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
 import { MemoryTable, ReminderTable } from '../types/schema';
 import { estimateTokens, safeFetch, sendReminder } from '../utils';
-import { formatReactions, formatResponse } from './chatbot';
+import { chatbotMentions, formatReactions, formatResponse } from './chatbot';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './context';
 import { MAX_BOT_HEARTBEATS, removeHeartbeat, scheduleHeartbeat } from './heartbeat';
 import { MAX_TIMEOUT, sandboxExec } from './sandbox';
 import { captionImage } from './vision';
+import { fromSummarySource, getVisibleSummaries } from './conversation';
 
 // filled in by the bot for each reply, rather than by the model, so the model can't get it wrong (or reach another server's memories)
 const replyContextSchema = zod.object({
@@ -546,6 +547,59 @@ const removeMemory = tool({
         message: error.toString(),
       };
     }
+  },
+});
+
+const MAX_SUMMARY_RESULTS = 20;
+const MAX_SUMMARY_RESULT_LENGTH = 1500; // characters of each summary given back, so a few long ones can't fill the prompt
+
+const searchSummaries = tool({
+  description: 'Search the summaries of past conversations, for ones containing every word of a query (in any order, not case-sensitive). Newest first. '
+    + 'Use it to look back further than the summaries you\'re given, e.g. what was decided about something, or the last time someone brought it up. '
+    + `Up to ${MAX_SUMMARY_RESULTS} at once, along with how many matched in all.`,
+  inputExamples: [
+    { input: { query: 'movie night' } },
+    { input: { query: 'Sam birthday', limit: 5 } },
+  ],
+  inputSchema: zod.object({
+    query: zod.string().describe('Words the summary must all contain'),
+    limit: zod.number().int().optional().describe(`How many summaries, from 1 to ${MAX_SUMMARY_RESULTS}. Defaults to 10`),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { query: string, limit?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', summaries?: { date: string, where: string, shared: boolean, summary: string, truncated?: boolean }[], total?: number, message: string }> => {
+    const words = input.query.toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return { result: 'failure', message: 'Give some words to search for.' };
+
+    // the same summaries it can be given on its own, so searching never reaches anything new. not this conversation's own, which it's in
+    const matches = getVisibleSummaries(context.server_id)
+      .filter((summary) => summary.conversation_id !== context.conversation_id)
+      .filter((summary) => {
+        const text = summary.summary.toLowerCase();
+        return words.every((word) => text.includes(word));
+      })
+      .sort((a, b) => b.timestamp - a.timestamp);
+
+    const limit = Math.min(Math.max(input.limit ?? 10, 1), MAX_SUMMARY_RESULTS);
+    const summaries = matches.slice(0, limit).map((summary) => {
+      const { shared, source_id: serverID, channel_id: channelID } = fromSummarySource(summary.source_id);
+      return {
+        date: new Date(summary.timestamp).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }),
+        // a channel here gets a ref, so it can be read with fetch_channel. another server's channels can't be reached from here
+        where: serverID !== context.server_id ? 'another server' : channelID ? channelRef(context, channelID) : 'this server',
+        shared,
+        summary: summary.summary.substring(0, MAX_SUMMARY_RESULT_LENGTH),
+        truncated: summary.summary.length > MAX_SUMMARY_RESULT_LENGTH || undefined,
+      };
+    });
+
+    return {
+      result: 'success',
+      summaries,
+      total: matches.length,
+      message: matches.length === 0
+        ? `No summaries contain all of "${input.query}".`
+        : `Found ${matches.length} summaries${matches.length > summaries.length ? `, showing the newest ${summaries.length}` : ''}.`,
+    };
   },
 });
 
@@ -2057,7 +2111,7 @@ const sendMessage = tool({
       const chunks = await formatResponse(context.conversation_id, input.content);
       const messageIDs: string[] = [];
       for (const chunk of chunks) {
-        const sent = await channel.send({ content: chunk }); // one at a time, so they arrive in order
+        const sent = await channel.send({ content: chunk, allowedMentions: chatbotMentions(context.server_id, chunk) }); // one at a time, so they arrive in order
         messageIDs.push(sent.id);
         saveSentMessage(context, sent);
       }
@@ -2105,7 +2159,7 @@ const createThread = tool({
       if (channel.type === ChannelType.GuildForum) {
         if (chunks.length === 0) return { result: 'failure', message: 'A forum post needs a first message, as its content.' };
 
-        thread = await channel.threads.create({ name, message: { content: chunks[0] } });
+        thread = await channel.threads.create({ name, message: { content: chunks[0], allowedMentions: chatbotMentions(context.server_id, chunks[0]) } });
         rest = chunks.slice(1);
         const starter = await thread.fetchStarterMessage().catch(() => null);
         if (starter) saveSentMessage(context, starter);
@@ -2130,7 +2184,7 @@ const createThread = tool({
         return { result: 'failure', message: 'Threads can only be made in text, announcement, and forum channels.' };
       }
 
-      for (const chunk of rest) saveSentMessage(context, await thread.send({ content: chunk })); // one at a time, so they arrive in order
+      for (const chunk of rest) saveSentMessage(context, await thread.send({ content: chunk, allowedMentions: chatbotMentions(context.server_id, chunk) })); // one at a time, so they arrive in order
 
       const ref = channelRef(context, thread.id);
       return { result: 'success', thread: ref, message: `Created thread "${thread.name}" (${ref}) in #${channel.name}.` };
@@ -2303,4 +2357,4 @@ const writeFile = tool({
   },
 });
 
-export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, fetchURL, captionImage: captionImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, counter, heartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };
+export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, counter, heartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };
