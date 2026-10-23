@@ -63,6 +63,8 @@ interface ChatbotTable {
   detached: boolean, // true = keeps its own context, instead of sharing the 'main' context with other servers
   model?: string, // openrouter model id, e.g. z-ai/glm-5.3. the default model if unset
   reasoning_effort?: string, // e.g. low, high, max. which ones work depends on the model. the default effort if unset
+  temperature?: number, // 0-2, how random its replies are. the default temperature if unset
+  min_quantization?: string, // the most compressed copy of a model it'll use, e.g. 8-bit, or any. the default if unset
   system_prompt_override?: string, // replaces SYSTEM.md for this server, if set
   chatbot_prompt: string, // the server's persona, layered on top of the system prompt. Empty for none
 }
@@ -107,7 +109,11 @@ interface ConversationToolResultTable {
   tool_call_id: string,
   timestamp: number,
   output: string;
+  dirty?: boolean, // whether the call could have changed something (sent a message, saved a memory, ran a command...), rather than only looked
+  discarded?: ToolResultDiscard, // set when its reply was cancelled, failed, or replaced by another version. see getVisibleToolResults
 }
+// why a tool result no longer belongs to the reply on screen
+type ToolResultDiscard = 'cancelled' | 'failed' | 'replaced';
 interface IndexUserTable {
   conversation_id: string,
   user_id: string,
@@ -187,5 +193,5 @@ interface HeartbeatTable {
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
   AutomaticResponseTable, ResponseMessageTable, ReminderTable, HeartbeatTable, CounterTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
-  ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable, /* AI-related structures */
+  ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable, /* AI-related structures */
 };

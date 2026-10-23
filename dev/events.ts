@@ -2,9 +2,9 @@ import { BaseMessageOptions, Channel, Client, EmbedBuilder, Events, GuildMember,
 import cron from 'node-cron';
 
 import { commandMap } from './commands';
-import { generateReply, isAllowedServer, markMessageDeleted } from './chatbot/chatbot';
+import { THINKING_STATUS, generateReply, isAllowedServer, markMessageDeleted } from './chatbot/chatbot';
 import { loadHeartbeats } from './chatbot/heartbeat';
-import { handleReplyButton, sendReply } from './chatbot/replies';
+import { PendingReply, discardToolResults, nextAttempt, restartReply, handleReplyButton, handleStatusButton, sendReply, statusButtons, trackReply, untrackReply } from './chatbot/replies';
 
 import { Command } from './types/bot';
 import { addResponseMessage, deleteConversationMessageByID, deleteHeartBoardMessage, deleteResponseMessage, getAllConversations, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, updateReminder, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotSubscriber, isConversationMessage, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, updateDatabase, updateHeartBoardMessage } from './data';
@@ -108,9 +108,10 @@ function clientEvents(discordClient: Client) {
 
   // On command
   discordClient.on(Events.InteractionCreate, async (interaction) => {
-    // the retry and version buttons under the chatbot's replies
+    // the retry and version buttons under the chatbot's replies, and the stop and cancel buttons on replies still being written
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('reply:')) await handleReplyButton(interaction).catch((error) => console.error(error));
+      if (interaction.customId.startsWith('status:')) await handleStatusButton(interaction).catch((error) => console.error(error));
       return;
     }
     // modal submissions are picked up by the command that showed the modal, with awaitModalSubmit
@@ -183,6 +184,9 @@ function clientEvents(discordClient: Client) {
     if (!isAllowedServer(serverID)) return;
     if (!message.inGuild() || !channel.isSendable()) return;
 
+    // a reply to a status message, from whoever it's replying to: that reply starts over with this added, rather than this getting its own
+    if (restartReply(message)) return;
+
     // we also do not care if...
     if (
       (
@@ -192,27 +196,68 @@ function clientEvents(discordClient: Client) {
       )
     && Math.random() >= 1 / 4096) return; // ...and we don't roll a small chance to respond anyway
 
-    const messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
-    const context: Message<boolean>[] | undefined = Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: message.id }))).values()); // fetch 5 most recent messages as context
+    let messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
+    const fetchContext = async (before: Message<true>) => Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: before.id }))).values()); // the 5 most recent messages
+    let context: Message<boolean>[] = await fetchContext(message);
 
-    // sent first, so the user sees a sign of a reply right away. edited as it uses tools, then deleted once the reply is sent
-    let status = '-# thinking...';
-    const statusMessage = await safeFetch(() => message.channel.send(status));
+    // sent first, so the user sees a sign of a reply right away. edited as it uses tools, then deleted once the reply is sent.
+    // it has Stop (no more tools, answer now) and Cancel (throw it all away) buttons, which only work while it's tracked
+    let status = THINKING_STATUS;
+    let pending: PendingReply | undefined;
+    const statusMessage = await safeFetch(async () => {
+      const sent = await message.channel.send({ content: status });
+      pending = trackReply(sent.id, author.id);
+      await sent.edit({ components: statusButtons(pending) }).catch((err) => console.error(err)); // added once tracked, so a press always finds its reply
+      return sent;
+    });
+    // edits take turns, and each shows the latest status when it goes, so an older one can never land after a newer one
+    let shown = status;
+    let finished = false; // once the reply is sent or fails, nothing more is edited in
+    let editing = Promise.resolve();
     const onStatus = (newStatus: string) => {
-      if (newStatus === status) return;
       status = newStatus;
-      statusMessage?.edit(status).catch((err) => console.error(err));
+      editing = editing.then(async () => {
+        if (status === shown || finished || !statusMessage || pending?.cancel.signal.aborted) return;
+        shown = status;
+        await statusMessage.edit({ content: status, components: pending ? statusButtons(pending) : [] });
+      }).catch((err) => console.error(err));
     };
 
     // get response from LLM, and reply. nothing is sent until the whole reply is ready
     try {
-      const { chunks } = await generateReply(serverID, { channel: message.channel, context: context ?? [], message, reference: messageReference, onStatus });
-      await sendReply(message, chunks);
-      statusMessage?.delete().catch((err) => console.error(err));
+      let replyTo: Message<true> = message;
+      let chunks: string[];
+      for (;;) {
+        try {
+          ({ chunks } = await generateReply(serverID, { channel: message.channel, context, message: replyTo, reference: messageReference, onStatus, control: pending?.control }));
+          if (!pending?.restart.signal.aborted) break;
+        } catch (error) {
+          if (!pending?.restart.signal.aborted || pending.cancel.signal.aborted) throw error;
+        }
+        // its author added a message to it: start over answering that, as a follow-up to what they first said. what its tools did is kept
+        const next = nextAttempt(pending!);
+        if (!next) throw new Error('The reply started over, but lost the message it was starting over for.');
+        messageReference = replyTo;
+        replyTo = next;
+        context = await fetchContext(next);
+      }
+      if (pending) pending.sending = true; // too late to start over now, so a new message from its author gets its own reply
+      finished = true;
+      const sent = await sendReply(replyTo, chunks!, pending);
+      if (!pending?.cancel.signal.aborted) statusMessage?.delete().catch((err) => console.error(err));
+      // a Cancel that came too late to stop it keeps the reply's tool results as they are, since the reply is there
+      else if (!sent) discardToolResults(pending, 'cancelled');
     } catch (error: any) {
+      if (pending) discardToolResults(pending, pending.cancel.signal.aborted ? 'cancelled' : 'failed');
+      // cancelled with its button, which already deleted the status message
+      if (pending?.cancel.signal.aborted) return;
+
+      finished = true;
       console.error(error);
       const errorText = `There was an issue... Please try again later...\n\`\`\`${error?.message ?? ''}\`\`\``;
-      (statusMessage ? statusMessage.edit(errorText) : message.reply(errorText)).catch((err) => console.error(err));
+      (statusMessage ? statusMessage.edit({ content: errorText, components: [] }) : message.reply(errorText)).catch((err) => console.error(err));
+    } finally {
+      if (statusMessage) untrackReply(statusMessage.id);
     }
   });
 
