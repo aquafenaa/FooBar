@@ -16,7 +16,7 @@ import { anthropicClient, discordClient, openAIClient } from '..';
 import { endConversation, getRelevantSummaries, getVisibleToolResults, summarizeConversation } from './conversation';
 import localTools from './tools';
 import { getVisibleMemories, isAttached, isShareable } from './context';
-import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, providerOptions, supportsTools, temperatureFor } from './models';
+import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, supportsTools, temperatureFor } from './models';
 import { isSandboxEnabled, readNotes } from './sandbox';
 import { withCaptions } from './vision';
 
@@ -901,8 +901,6 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     const stream = anthropicClient.messages.stream({
       model,
       temperature: temperatureFor(model, chatbot.temperature ?? DEFAULT_TEMPERATURE),
-      // only providers running the model at the server's minimum quality, since heavily compressed ones can fall apart into garbage
-      ...providerOptions(chatbot.min_quantization),
       // reasoning counts toward it too. openrouter treats 0 as no limit, and refuses the request if the credits can't cover that much output
       max_tokens: 20_000,
       system: systemPrompt,

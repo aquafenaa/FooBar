@@ -64,7 +64,6 @@ interface ChatbotTable {
   model?: string, // openrouter model id, e.g. z-ai/glm-5.3. the default model if unset
   reasoning_effort?: string, // e.g. low, high, max. which ones work depends on the model. the default effort if unset
   temperature?: number, // 0-2, how random its replies are. the default temperature if unset
-  min_quantization?: string, // the most compressed copy of a model it'll use, e.g. 8-bit, or any. the default if unset
   system_prompt_override?: string, // replaces SYSTEM.md for this server, if set
   chatbot_prompt: string, // the server's persona, layered on top of the system prompt. Empty for none
 }
