@@ -9,16 +9,6 @@ const DEFAULT_MODEL = 'z-ai/glm-5.3';
 const DEFAULT_REASONING_EFFORT = 'medium';
 const DEFAULT_TEMPERATURE = 1.0;
 const MAX_TEMPERATURE = 2; // the most OpenRouter takes
-// how compressed a provider's copy of a model is, lowest quality first, as OpenRouter names them. a server picks the lowest it'll accept
-const QUANTIZATION_TIERS: { name: string, levels: string[] }[] = [
-  { name: '4-bit', levels: ['int4', 'fp4'] },
-  { name: '6-bit', levels: ['fp6'] },
-  { name: '8-bit', levels: ['int8', 'fp8'] },
-  { name: '16-bit', levels: ['fp16', 'bf16'] },
-  { name: '32-bit', levels: ['fp32'] },
-];
-const ANY_QUANTIZATION = 'any';
-const DEFAULT_MIN_QUANTIZATION = '8-bit';
 
 // models whose provider caps it lower, by id prefix. the full range is used everywhere else
 const TEMPERATURE_LIMITS: [prefix: string, max: number][] = [['anthropic/', 1]];
@@ -89,18 +79,6 @@ function temperatureFor(id: string, temperature: number): number {
 }
 
 /**
- * OpenRouter's provider settings for a server's minimum quantization: only providers at that tier or better.
- * Providers that don't say ("unknown") are still allowed, since that includes the only provider of closed models like Claude
- */
-function providerOptions(minQuantization: string | undefined): { provider?: { quantizations: string[] } } {
-  const minimum = minQuantization ?? DEFAULT_MIN_QUANTIZATION;
-  const index = QUANTIZATION_TIERS.findIndex((tier) => tier.name === minimum);
-  if (minimum === ANY_QUANTIZATION || index === -1) return {};
-
-  return { provider: { quantizations: [...QUANTIZATION_TIERS.slice(index).flatMap((tier) => tier.levels), 'unknown'] } };
-}
-
-/**
  * The effort levels a model supports, lowest to highest.
  * Every level if the model doesn't say (or the list couldn't be loaded), and none if it can't reason at all
  */
@@ -119,4 +97,4 @@ function formatPricing(model: OpenRouterModel): string {
   return `${perMillion(model.pricing.prompt)}/${perMillion(model.pricing.completion)} per M`;
 }
 
-export { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, QUANTIZATION_TIERS, ANY_QUANTIZATION, DEFAULT_MIN_QUANTIZATION, providerOptions, REASONING_EFFORTS, OpenRouterModel, loadModels, getModels, findModel, supportsTools, supportsTemperature, maxTemperature, temperatureFor, getSupportedEfforts, formatPricing };
+export { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, REASONING_EFFORTS, OpenRouterModel, loadModels, getModels, findModel, supportsTools, supportsTemperature, maxTemperature, temperatureFor, getSupportedEfforts, formatPricing };

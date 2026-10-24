@@ -27,7 +27,7 @@ import { removeHeartbeat, scheduleHeartbeat } from './chatbot/heartbeat';
 import { getEmbedding, getSystemPrompt } from './chatbot/chatbot';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
-import { ANY_QUANTIZATION, DEFAULT_MIN_QUANTIZATION, DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, QUANTIZATION_TIERS, findModel, formatPricing, getModels, getSupportedEfforts, maxTemperature, supportsTemperature, supportsTools } from './chatbot/models';
+import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, findModel, formatPricing, getModels, getSupportedEfforts, maxTemperature, supportsTemperature, supportsTools } from './chatbot/models';
 import { inputToSchedule, sendReminder } from './utils';
 
 const commandMap: Map<string, Command> = new Map();
@@ -144,14 +144,6 @@ const ChatbotCommand: ConfigCommand = {
         .setDescription(`From 0 to ${MAX_TEMPERATURE}. Leave blank to reset to the default, ${DEFAULT_TEMPERATURE}`)
         .setMinValue(0)
         .setMaxValue(MAX_TEMPERATURE)))
-    .addSubcommand((quantizationSubcommand) => quantizationSubcommand.setName('quantization')
-      .setDescription('The most compressed copy of the model it\'ll use. Very compressed ones can turn out garbage')
-      .addStringOption((levelOption) => levelOption.setName('minimum')
-        .setDescription(`Leave blank to reset to the default, ${DEFAULT_MIN_QUANTIZATION}`)
-        .addChoices(
-          { name: 'Any (no minimum)', value: ANY_QUANTIZATION },
-          ...QUANTIZATION_TIERS.map((tier) => ({ name: tier.name === DEFAULT_MIN_QUANTIZATION ? `${tier.name} (default)` : tier.name, value: tier.name })),
-        )))
     .addSubcommand((detachSubcommand) => detachSubcommand.setName('detach')
       .setDescription('Whether the bot keeps its own memories, instead of sharing them with other servers')
       .addBooleanOption((detachOption) => detachOption.setName('enable').setDescription('True = Separate from other servers, False = Joins the hivemind')
@@ -568,27 +560,6 @@ const ChatbotCommand: ConfigCommand = {
       interaction.reply({ content: `Reasoning effort set to **${effort}**!`, flags: MessageFlags.Ephemeral });
       return;
     }
-    if (subcommand === 'quantization') {
-      const chatbot = getChatbot(serverID);
-      if (!chatbot) {
-        interaction.reply({ content: 'There is no chatbot in this server! Try making one with /chatbot create', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      // blank resets it. the default is stored as empty, so it follows DEFAULT_MIN_QUANTIZATION if that changes
-      const minimum = interaction.options.getString('minimum');
-      chatbot.min_quantization = minimum === null || minimum === DEFAULT_MIN_QUANTIZATION ? undefined : minimum;
-      upsertChatbot(chatbot);
-
-      const shown = chatbot.min_quantization ?? `${DEFAULT_MIN_QUANTIZATION} (default)`;
-      interaction.reply({
-        content: chatbot.min_quantization === ANY_QUANTIZATION
-          ? 'Any provider can be used now, however compressed its copy of the model is.'
-          : `Only providers running the model at **${shown}** or better will be used.\n-# If none of the model's providers are, replies will fail, so lower this or switch models.`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
     if (subcommand === 'temperature') {
       const chatbot = getChatbot(serverID);
       if (!chatbot) {
@@ -737,7 +708,6 @@ const ChatbotCommand: ConfigCommand = {
         { name: 'Model', value: chatbot?.model ?? `${DEFAULT_MODEL} (default)` },
         { name: 'Reasoning Effort', value: chatbot?.reasoning_effort ?? `${DEFAULT_REASONING_EFFORT} (default)` },
         { name: 'Temperature', value: String(chatbot?.temperature ?? `${DEFAULT_TEMPERATURE} (default)`) },
-        { name: 'Minimum Quantization', value: chatbot?.min_quantization ?? `${DEFAULT_MIN_QUANTIZATION} (default)` },
       );
   },
   async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {

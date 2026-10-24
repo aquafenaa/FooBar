@@ -83,7 +83,6 @@ CREATE TABLE IF NOT EXISTS Chatbot(
   model TEXT,
   reasoning_effort TEXT,
   temperature REAL,
-  min_quantization TEXT,
   system_prompt_override TEXT,
   chatbot_prompt TEXT
 );

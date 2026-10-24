@@ -38,7 +38,6 @@ function getChatbot(server_id: Snowflake): ChatbotTable | null {
   chatbot.model = chatbot.model ?? undefined;
   chatbot.reasoning_effort = chatbot.reasoning_effort ?? undefined;
   chatbot.temperature = chatbot.temperature ?? undefined;
-  chatbot.min_quantization = chatbot.min_quantization ?? undefined;
   chatbot.system_prompt_override = chatbot.system_prompt_override ?? undefined;
   return chatbot;
 }
@@ -48,8 +47,8 @@ function getAttachedServers(): Snowflake[] {
 }
 function upsertChatbot(chatbot: ChatbotTable): void {
   db.prepare(`
-    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, temperature, min_quantization, system_prompt_override, chatbot_prompt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, temperature, system_prompt_override, chatbot_prompt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(server_id) DO UPDATE SET
       chatbot_enabled = excluded.chatbot_enabled,
       tools_enabled = excluded.tools_enabled,
@@ -57,7 +56,6 @@ function upsertChatbot(chatbot: ChatbotTable): void {
       model = excluded.model,
       reasoning_effort = excluded.reasoning_effort,
       temperature = excluded.temperature,
-      min_quantization = excluded.min_quantization,
       system_prompt_override = excluded.system_prompt_override,
       chatbot_prompt = excluded.chatbot_prompt
   `).run(
@@ -68,7 +66,6 @@ function upsertChatbot(chatbot: ChatbotTable): void {
     chatbot.model ?? null,
     chatbot.reasoning_effort ?? null,
     chatbot.temperature ?? null,
-    chatbot.min_quantization ?? null,
     chatbot.system_prompt_override ?? null,
     chatbot.chatbot_prompt,
   );
@@ -832,8 +829,12 @@ const updateDatabase = db.transaction(() => {
     // empty, so every existing result counts as it always has: not dirty, and not discarded
     if (!hasColumn('ConversationToolResult', 'dirty')) db.prepare('ALTER TABLE ConversationToolResult ADD COLUMN dirty BOOLEAN').run();
     if (!hasColumn('ConversationToolResult', 'discarded')) db.prepare('ALTER TABLE ConversationToolResult ADD COLUMN discarded TEXT').run();
-    if (!hasColumn('Chatbot', 'min_quantization')) db.prepare('ALTER TABLE Chatbot ADD COLUMN min_quantization TEXT').run(); // empty, so every server gets the default
     db.pragma('user_version = 11');
+  }
+  if (currentVersion < 12) {
+    // the minimum quantization setting was taken out. which providers are used is left to the openrouter key's own settings
+    if (hasColumn('Chatbot', 'min_quantization')) db.prepare('ALTER TABLE Chatbot DROP COLUMN min_quantization').run();
+    db.pragma('user_version = 12');
   }
 });
 
