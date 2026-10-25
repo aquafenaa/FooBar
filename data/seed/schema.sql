@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS User(
 );
 
 CREATE TABLE IF NOT EXISTS Server(
-  server_id VARCHAR(20) PRIMARY KEY
+  server_id VARCHAR(20) PRIMARY KEY,
+  dm_user_id VARCHAR(20) -- set for a DM with the bot, treated as a server of its own: whose DM it is, which is also its server_id
 );
 
 CREATE TABLE IF NOT EXISTS Channel(

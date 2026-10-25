@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { ChannelType, Guild, GuildChannel, GuildTextBasedChannel, Message, MessageMentionOptions, SendableChannels, Snowflake } from 'discord.js';
+import { ChannelType, Guild, GuildChannel, Message, MessageMentionOptions, SendableChannels, Snowflake, User } from 'discord.js';
 import { ModelMessage, Tool } from 'ai';
 import cron from 'node-cron';
 import { z as zod } from 'zod';
@@ -19,6 +19,7 @@ import { getVisibleMemories, isAttached, isShareable } from './context';
 import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, supportsTools, temperatureFor } from './models';
 import { isSandboxEnabled, readNotes } from './sandbox';
 import { withCaptions } from './vision';
+import { isDMServer } from './dm';
 
 const promptPath = path.join(__dirname, '../../data/SYSTEM.md'); // two levels up: this file is in dev/chatbot/ (src/chatbot/ once built)
 const { DISCORD_ID } = process.env;
@@ -38,6 +39,7 @@ const MESSAGE_BREAK_GAP = 60 * 60_000; // 1 hour. a longer silence between two m
 
 // shown as each channel's type in the index, so the model knows what it can do there (e.g. threads can't hold threads)
 const CHANNEL_TYPE_NAMES: Partial<Record<ChannelType, string>> = {
+  [ChannelType.DM]: 'dm',
   [ChannelType.GuildText]: 'text',
   [ChannelType.GuildAnnouncement]: 'announcement',
   [ChannelType.GuildForum]: 'forum',
@@ -52,8 +54,26 @@ const CHANNEL_TYPE_NAMES: Partial<Record<ChannelType, string>> = {
 
 // only works within my servers, sorry! otherwise it's a waste of tokens & money :/
 const ALLOWED_SERVERS = ['917588427959058462', '1064698336185172010', '708642778300547142', '1148069131711680633', '1547088936256671866'];
+// a DM with the bot's owner counts as its own allowed server
 function isAllowedServer(serverID: Snowflake): boolean {
-  return ALLOWED_SERVERS.includes(serverID);
+  return ALLOWED_SERVERS.includes(serverID) || isDMServer(serverID);
+}
+
+/**
+ * What the model is told in a DM with its owner: that it has full control, and every server it can reach, so it can name them in tools
+ */
+function dmContext(chatbot: ChatbotTable): string {
+  const attr = (value: string) => value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const servers = [...discordClient.guilds.cache.values()].map((guild) => `<server id="${guild.id}" name="${attr(guild.name)}" />`).join('\n      ');
+  return `<direct_message private="${chatbot.detached}">
+      This is a private DM with your owner, who has full control over you. Every tool works here, across every server you're in:
+      channel and message tools take a channel or message from any server (its id, a <#id> mention, or a Discord message link),
+      and tools about a server's members, counters, or your nickname take a server, by its id or name. Private channels can be read too.
+      ${chatbot.detached ? 'This DM is private right now, so what\'s said here stays here.' : 'This DM shares memories and summaries with every attached server.'}
+      <servers>
+      ${servers}
+      </servers>
+    </direct_message>`;
 }
 
 // messages deleted recently, so a reply that's still generating doesn't save them afterwards
@@ -122,7 +142,7 @@ function formatElapsed(millis: number): string {
  * Given short term memories, return a formatted chatbot input
  * Resolves user, channel, and role mentions.
 */
-async function formatInput(guild: Guild, currentChannel: SendableChannels, conversation: ConversationTable, referenceMessage: ConversationMessageTable | undefined, toolList: ConversationToolResultTable[], convoContext: ConversationMessageTable[]): Promise<ModelMessage[]> {
+async function formatInput(guild: Guild | undefined, currentChannel: SendableChannels, conversation: ConversationTable, referenceMessage: ConversationMessageTable | undefined, toolList: ConversationToolResultTable[], convoContext: ConversationMessageTable[]): Promise<ModelMessage[]> {
   if (!convoContext) return [];
 
   const MENTION_RE = /<(?:@!?(\d{17,20})|#(\d{17,20})|@&(\d{17,20}))>/g; // 3 capture groups for users, channels, & role mentions respectively
@@ -146,10 +166,13 @@ async function formatInput(guild: Guild, currentChannel: SendableChannels, conve
     }
   });
 
-  // resolve mentionables in guild from IDs
-  const mentionedUsers = Array.from((await Promise.all([...new Set(mentionedUserIDs)].map((user) => safeFetch(() => guild.members.fetch(user))))).filter((m) => m !== undefined && m !== null).values());
-  let mentionedChannels = Array.from((await Promise.all([...new Set(mentionedChannelIDs)].map((channel) => safeFetch(() => guild.channels.fetch(channel))))).filter((m) => m !== undefined && m !== null).values()) as GuildChannel[];
-  const mentionedRoles = Array.from((await Promise.all([...new Set(mentionedRoleIDs)].map((role) => safeFetch(() => guild.roles.fetch(role))))).filter((m) => m !== undefined && m !== null).values());
+  // resolve mentionables in guild from IDs. a DM has no guild, so users and channels are looked up anywhere instead, and roles are skipped
+  const fetchUser = async (id: string): Promise<{ id: string, user: User, nickname?: string | null } | undefined> => (guild
+    ? safeFetch(() => guild.members.fetch(id))
+    : safeFetch(async () => ({ id, user: await discordClient.users.fetch(id) })));
+  const mentionedUsers = (await Promise.all([...new Set(mentionedUserIDs)].map(fetchUser))).filter((m) => m !== undefined && m !== null);
+  let mentionedChannels = Array.from((await Promise.all([...new Set(mentionedChannelIDs)].map((channel) => safeFetch(() => (guild ? guild.channels.fetch(channel) : discordClient.channels.fetch(channel)))))).filter((m) => m !== undefined && m !== null).values()) as GuildChannel[];
+  const mentionedRoles = guild ? Array.from((await Promise.all([...new Set(mentionedRoleIDs)].map((role) => safeFetch(() => guild.roles.fetch(role))))).filter((m) => m !== undefined && m !== null).values()) : [];
 
   const referenceMap = new Map<string, string>();
 
@@ -381,11 +404,11 @@ async function formatResponse(conversationID: string, agentResponse: string): Pr
 
 // what a reply is generated for: a message someone sent the bot, or a heartbeat, which has no message to answer
 type ReplyTrigger = {
-  channel: GuildTextBasedChannel,
+  channel: SendableChannels, // a server's channel, or a DM
   onStatus?: (status: string) => void, // told what the reply is doing (e.g. which tool it's using), for a live status message
   control?: ReplyControl, // its Stop and Cancel buttons
 } & (
-  { message: Message<true>, reference?: Message<boolean>, context: Message<boolean>[] } // context: recent messages before it
+  { message: Message, reference?: Message<boolean>, context: Message<boolean>[] } // context: recent messages before it
   // a heartbeat isn't shown the channel. it can look with fetch_channel or search_channel
   // the caller picks the heartbeat's conversation id, so it can settle the conversation even if this fails partway
   | { heartbeat: HeartbeatTable, conversation_id: string });
@@ -459,15 +482,14 @@ function isDirtyCall(name: string, input: any): boolean {
     case 'view_reminder':
     case 'list_memories':
     case 'view_memory':
+    case 'list_counters':
+    case 'list_heartbeats':
     case 'search_summaries':
     case 'caption_image':
     case 'x_search':
     case 'bluesky':
     case 'web_search':
       return false;
-    case 'counter':
-    case 'heartbeat':
-      return input?.action !== 'list';
     case 'bluesky_dms': return input?.action === 'send';
     case 'fetch_url': return (input?.method ?? 'GET') !== 'GET';
     default: return true;
@@ -549,10 +571,12 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'remove_memory': return ['forgot memory', quote(input.name)];
     case 'list_memories': return ['listed memories', ''];
     case 'search_summaries': return ['searched summaries for', quote(input.query)];
-    case 'counter':
-    case 'heartbeat':
-      if (input.action === 'list') return [`listed ${name}s`, ''];
-      return [`${actionVerbs[input.action] ?? input.action} ${name}`, quote(input.name)];
+    case 'list_counters': return ['listed counters', ''];
+    case 'list_heartbeats': return ['listed heartbeats', ''];
+    case 'counter': return [`${actionVerbs[input.action] ?? input.action} counter`, quote(input.name)];
+    case 'create_heartbeat': return ['created heartbeat', quote(input.name)];
+    case 'edit_heartbeat': return ['edited heartbeat', quote(input.name)];
+    case 'delete_heartbeat': return ['deleted heartbeat', quote(input.name)];
     default: return [`used ${name}`, ''];
   }
 }
@@ -593,7 +617,9 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   const heartbeatConversationID = 'heartbeat' in trigger ? trigger.conversation_id : undefined;
 
   const chatbot = getChatbot(serverID)!;
-  const guild = await discordClient.guilds.fetch(serverID)!;
+  // a DM with the bot's owner is a server of its own, with no guild behind it. it gets full control over every server instead
+  const isDM = isDMServer(serverID);
+  const guild = isDM ? undefined : await discordClient.guilds.fetch(serverID);
 
   let conversation = heartbeat ? undefined : getConversationByChannel(channel.id);
   if (heartbeat) {
@@ -722,8 +748,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   // dated, so the model can tell how long ago it was
   const summaryStr = relevantSummaries.map((summary) => `<summary date="${new Date(summary.timestamp).toLocaleDateString('en-US', { dateStyle: 'medium' })}">${summary.summary}</summary>`).join('\n');
   const memories = getVisibleMemories(serverID);
-  // the workspace is shared like the main memories, so detached servers don't get it
-  const useSandbox = isSandboxEnabled() && isAttached(serverID);
+  // the workspace is shared like the main memories, so detached servers don't get it. a DM always does, even when private, since it has full control
+  const useSandbox = isSandboxEnabled() && (isAttached(serverID) || isDM);
   const workspaceNotes = useSandbox ? await readNotes() : '';
   // given to every tool by the bot, never by the model
   const replyContext = {
@@ -731,9 +757,11 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     channel_id: channel.id, // where heartbeats the bot schedules will post, and the default channel for channel tools
     conversation_id: conversation.conversation_id, // for resolving refs like [#3], and saving what send_message sends
     // memory tools only save to the shared context when everyone in this conversation has opted in.
-    // a heartbeat has no one to ask, and its prompt may have come from someone who didn't, so it never shares
-    shareable: !heartbeat && isShareable(serverID, conversationContext.filter((msg) => msg.role === 'user').map((msg) => msg.author_id)),
+    // a heartbeat has no one to ask, and its prompt may have come from someone who didn't, so it never shares.
+    // a DM is only its owner, so it shares unless it's been made private
+    shareable: !heartbeat && (isDM ? isAttached(serverID) : isShareable(serverID, conversationContext.filter((msg) => msg.role === 'user').map((msg) => msg.author_id))),
     reference_message_id: messageReference?.id, // the message the user is replying to, shown to the model as [$0]
+    dm: isDM || undefined, // full control: channel and server tools can reach any server the bot is in
   };
 
   // SYSTEM.md (or the server's override), with the server's persona layered on top
@@ -752,6 +780,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     ${workspaceNotes ? `<workspace_notes>
       ${workspaceNotes}
     </workspace_notes>` : ''}
+    ${isDM ? dmContext(chatbot) : ''}
     <conversation conversation_id="${conversation.conversation_id}" server_id="${serverID}" current_date="${new Date().toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'long' })}" />
     <index>
       ${indexMsg.content}
@@ -787,7 +816,10 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toAnthropicTool('list_reminders', localTools.listReminders),
     toAnthropicTool('view_reminder', localTools.viewReminder),
     toAnthropicTool('remove_reminder', localTools.removeReminder),
-    toAnthropicTool('heartbeat', localTools.heartbeat),
+    toAnthropicTool('list_heartbeats', localTools.listHeartbeats),
+    toAnthropicTool('create_heartbeat', localTools.createHeartbeat),
+    toAnthropicTool('edit_heartbeat', localTools.editHeartbeat),
+    toAnthropicTool('delete_heartbeat', localTools.deleteHeartbeat),
     toAnthropicTool('fetch_channel', localTools.fetchChannel),
     toAnthropicTool('search_channel', localTools.searchChannel),
     toAnthropicTool('fetch_embed', localTools.fetchEmbed),
@@ -804,12 +836,13 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toAnthropicTool('search_summaries', localTools.searchSummaries),
     toAnthropicTool('fetch_url', localTools.fetchURL),
     toAnthropicTool('caption_image', localTools.captionImage),
+    toAnthropicTool('list_counters', localTools.listCounters),
     toAnthropicTool('counter', localTools.counter),
     // only offered once the key is in .env, so the model doesn't reach for a tool that can't work
     ...(process.env.TWITTER_API_KEY ? [toAnthropicTool('x_search', localTools.xSearch)] : []),
     toAnthropicTool('bluesky', localTools.bluesky), // always offered, since most of it works through the public API without a login
     // acting as the bot's account is public, and its DMs are private, so only attached servers get these, and only once there's a login
-    ...(process.env.BLUESKY_HANDLE && isAttached(serverID) ? [
+    ...(process.env.BLUESKY_HANDLE && (isAttached(serverID) || isDM) ? [
       // toAnthropicTool('bluesky_act', localTools.blueskyAct),
       // toAnthropicTool('bluesky_dms', localTools.blueskyDMs),
     ] : []),
@@ -825,7 +858,10 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     list_reminders: localTools.listReminders,
     view_reminder: localTools.viewReminder,
     remove_reminder: localTools.removeReminder,
-    heartbeat: localTools.heartbeat,
+    list_heartbeats: localTools.listHeartbeats,
+    create_heartbeat: localTools.createHeartbeat,
+    edit_heartbeat: localTools.editHeartbeat,
+    delete_heartbeat: localTools.deleteHeartbeat,
 
     fetch_channel: localTools.fetchChannel,
     search_channel: localTools.searchChannel,
@@ -845,6 +881,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
     fetch_url: localTools.fetchURL,
     caption_image: localTools.captionImage,
+    list_counters: localTools.listCounters,
     counter: localTools.counter,
     x_search: localTools.xSearch,
     bluesky: localTools.bluesky,

@@ -77,7 +77,7 @@ function setChatbotPrompt(server_id: Snowflake, new_prompt: string): void {
   db.prepare('UPDATE Chatbot SET chatbot_prompt = ? WHERE server_id = ?').run(new_prompt, server_id);
 }
 function isChatbotSubscriber(server_id: Snowflake, user_id: Snowflake): boolean {
-  return db.prepare('SELECT * FROM ChatbotSubscriber WHERE server_id = ? AND user_id = ?').get(server_id, user_id) as boolean;
+  return db.prepare('SELECT 1 FROM ChatbotSubscriber WHERE server_id = ? AND user_id = ?').get(server_id, user_id) !== undefined;
 }
 function addChatbotSubscriber(server_id: Snowflake, user_id: Snowflake, cross_server = false): void {
   db.prepare('INSERT INTO ChatbotSubscriber (server_id, user_id, cross_server) VALUES (?, ?, ?)').run(server_id, user_id, cross_server ? 1 : 0);
@@ -541,7 +541,7 @@ function addResponseMessage(server_id: Snowflake, message_id: Snowflake): void {
   db.prepare('INSERT INTO ResponseMessage (server_id, message_id) VALUES (?, ?)').run(server_id, message_id);
 }
 function isResponseMessage(server_id: Snowflake, message_id: Snowflake): boolean {
-  return db.prepare('SELECT 1 FROM ResponseMessage WHERE server_id = ? AND message_id = ?').run(server_id, message_id) !== undefined;
+  return db.prepare('SELECT 1 FROM ResponseMessage WHERE server_id = ? AND message_id = ?').get(server_id, message_id) !== undefined;
 }
 function deleteResponseMessage(server_id: Snowflake, message_id: Snowflake): void {
   db.prepare('DELETE FROM ResponseMessage WHERE server_id = ? AND message_id = ?').run(server_id, message_id);
@@ -624,6 +624,13 @@ function getServer(server_id: Snowflake): ServerTable | undefined {
 }
 function insertServer(server_id: Snowflake): void {
   db.prepare('INSERT OR IGNORE INTO Server (server_id) VALUES (?)').run(server_id);
+}
+// a DM with the bot, as a server of its own, keyed by its owner's user id
+function insertDMServer(user_id: Snowflake): void {
+  db.prepare('INSERT INTO Server (server_id, dm_user_id) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET dm_user_id = excluded.dm_user_id').run(user_id, user_id);
+}
+function getDMServers(): ServerTable[] {
+  return db.prepare('SELECT * FROM Server WHERE dm_user_id IS NOT NULL').all() as ServerTable[];
 }
 function deleteServer(server_id: Snowflake): void {
   db.prepare('DELETE FROM Server WHERE server_id = ?').run(server_id);
@@ -836,11 +843,15 @@ const updateDatabase = db.transaction(() => {
     if (hasColumn('Chatbot', 'min_quantization')) db.prepare('ALTER TABLE Chatbot DROP COLUMN min_quantization').run();
     db.pragma('user_version = 12');
   }
+  if (currentVersion < 13) {
+    if (!hasColumn('Server', 'dm_user_id')) db.prepare('ALTER TABLE Server ADD COLUMN dm_user_id VARCHAR(20)').run(); // empty, so every existing server stays a server
+    db.pragma('user_version = 13');
+  }
 });
 
 export {
   db, updateDatabase,
-  getAllServers, getServer, insertServer, deleteServer,
+  getAllServers, getServer, insertServer, insertDMServer, getDMServers, deleteServer,
   getReminder, getRemindersByServer, addReminder, updateReminder, deleteReminder,
   getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, deleteHeartbeat,
   getCounter, getCountersByServer, insertCounter, setCounterValue, incrementCounter, deleteCounter,

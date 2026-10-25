@@ -1,16 +1,18 @@
-import { BaseMessageOptions, Channel, Client, EmbedBuilder, Events, GuildMember, Message, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, User } from 'discord.js';
+import { BaseMessageOptions, Channel, ChannelType, Client, EmbedBuilder, Events, GuildMember, Message, MessageFlags, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, User } from 'discord.js';
 import cron from 'node-cron';
 
 import { commandMap } from './commands';
 import { THINKING_STATUS, generateReply, isAllowedServer, markMessageDeleted } from './chatbot/chatbot';
 import { loadHeartbeats } from './chatbot/heartbeat';
-import { PendingReply, discardToolResults, nextAttempt, restartReply, handleReplyButton, handleStatusButton, sendReply, statusButtons, trackReply, untrackReply } from './chatbot/replies';
+import { PendingReply, discardToolResults, forgetReply, nextAttempt, restartReply, handleReplyButton, handleStatusButton, sendReply, statusButtons, trackReply, untrackReply } from './chatbot/replies';
 
 import { Command } from './types/bot';
-import { addResponseMessage, deleteConversationMessageByID, deleteHeartBoardMessage, deleteResponseMessage, getAllConversations, getAutomaticResponsesByServer, getChatbot, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, updateReminder, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotSubscriber, isConversationMessage, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, updateDatabase, updateHeartBoardMessage } from './data';
+import { addResponseMessage, deleteConversationMessageByID, deleteHeartBoardMessage, deleteResponseMessage, getAllConversations, getAutomaticResponsesByServer, getChatbot, getDMServers, getHeartBoardMessage, getHeartBoardMessagesByServer, getHeartBoardsByEmoji, getRemindersByServer, updateReminder, getVoicePingInputs, getVoicePingsByServer, insertHeartBoardMessage, insertServer, isChatbotSubscriber, isConversationMessage, isEmbedMessage, isResponseMessage, saveAnonymizedMessage, updateDatabase, updateHeartBoardMessage } from './data';
 import { inputToSchedule, safeFetch, sendReminder } from './utils';
 import { scheduleExpireTask } from './chatbot/conversation';
 import { loadModels } from './chatbot/models';
+import { dmRecipient, ensureDMServer, fetchServerChannel, handleDMCommand, isDMServer, isDMUser } from './chatbot/dm';
+import { dmCommandMap } from './dmCommands';
 
 const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boolean> | PartialMessage<boolean>, reaction: MessageReaction): BaseMessageOptions => {
   const authorName = author?.nickname ?? author?.displayName;
@@ -38,6 +40,151 @@ const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boo
 
   return messageOptions;
 };
+
+/**
+ * Writes the chatbot's reply to a message, and sends it: in a server, or in a DM with the bot's owner, whose server id is their user id.
+ * Until it's sent, a status message shows what it's doing, with Stop and Cancel buttons
+ */
+async function respondTo(message: Message, serverID: string): Promise<void> {
+  const { author, channel } = message;
+  if (!channel.isSendable()) return;
+
+  let messageReference: Message | undefined = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
+  const fetchContext = async (before: Message) => Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: before.id }))).values()); // the 5 most recent messages
+  let context: Message<boolean>[] = await fetchContext(message);
+
+  // sent first, so the user sees a sign of a reply right away. edited as it uses tools, then deleted once the reply is sent.
+  // it has Stop (no more tools, answer now) and Cancel (throw it all away) buttons, which only work while it's tracked
+  let status = THINKING_STATUS;
+  let pending: PendingReply | undefined;
+  const statusMessage = await safeFetch(async () => {
+    const sent = await channel.send({ content: status });
+    pending = trackReply(sent.id, author.id);
+    await sent.edit({ components: statusButtons(pending) }).catch((err) => console.error(err)); // added once tracked, so a press always finds its reply
+    return sent;
+  });
+  // edits take turns, and each shows the latest status when it goes, so an older one can never land after a newer one
+  let shown = status;
+  let finished = false; // once the reply is sent or fails, nothing more is edited in
+  let editing = Promise.resolve();
+  const onStatus = (newStatus: string) => {
+    status = newStatus;
+    editing = editing.then(async () => {
+      if (status === shown || finished || !statusMessage || pending?.cancel.signal.aborted) return;
+      shown = status;
+      await statusMessage.edit({ content: status, components: pending ? statusButtons(pending) : [] });
+    }).catch((err) => console.error(err));
+  };
+
+  // get response from LLM, and reply. nothing is sent until the whole reply is ready
+  try {
+    let replyTo: Message = message;
+    let chunks: string[];
+    for (;;) {
+      try {
+        ({ chunks } = await generateReply(serverID, { channel, context, message: replyTo, reference: messageReference, onStatus, control: pending?.control }));
+        if (!pending?.restart.signal.aborted) break;
+      } catch (error) {
+        if (!pending?.restart.signal.aborted || pending.cancel.signal.aborted) throw error;
+      }
+      // its author added a message to it: start over answering that, as a follow-up to what they first said. what its tools did is kept
+      const next = nextAttempt(pending!);
+      if (!next) throw new Error('The reply started over, but lost the message it was starting over for.');
+      messageReference = replyTo;
+      replyTo = next;
+      context = await fetchContext(next);
+    }
+    if (pending) pending.sending = true; // too late to start over now, so a new message from its author gets its own reply
+    finished = true;
+    const sent = await sendReply(serverID, replyTo, chunks!, pending);
+    if (!pending?.cancel.signal.aborted) statusMessage?.delete().catch((err) => console.error(err));
+    // a Cancel that came too late to stop it keeps the reply's tool results as they are, since the reply is there
+    else if (!sent) discardToolResults(pending, 'cancelled');
+  } catch (error: any) {
+    if (pending) discardToolResults(pending, pending.cancel.signal.aborted ? 'cancelled' : 'failed');
+    // cancelled with its button, which already deleted the status message
+    if (pending?.cancel.signal.aborted) return;
+
+    finished = true;
+    console.error(error);
+    const errorText = `There was an issue... Please try again later...\n\`\`\`${error?.message ?? ''}\`\`\``;
+    (statusMessage ? statusMessage.edit({ content: errorText, components: [] }) : message.reply(errorText)).catch((err) => console.error(err));
+  } finally {
+    if (statusMessage) untrackReply(statusMessage.id);
+  }
+}
+
+/**
+ * A DM to the bot. Only users in DM_USERS get an answer, and they get full control: the DM is treated as a server of its own,
+ * keyed by their user id. Every message gets a reply, with no mention needed, except the /private text command, which is answered directly
+ */
+async function handleDirectMessage(message: Message): Promise<void> {
+  const { author, channel } = message;
+  if (channel.type !== ChannelType.DM) return;
+
+  // the bot's own messages to its owner get a 🗑️, which they can react with to delete it. not the status message, which goes away by itself
+  if (author.id === message.client.user.id) {
+    if (message.content === THINKING_STATUS) return;
+    const recipient = await dmRecipient(channel);
+    if (recipient && isDMUser(recipient)) await message.react('🗑️').catch((error) => console.error('Couldn\'t add 🗑️ to a DM message:', error));
+    return;
+  }
+  if (author.bot || !isDMUser(author.id)) return; // anyone else's DMs are ignored
+
+  // its server id is its owner's user id
+  const chatbot = ensureDMServer(author.id);
+  if (await handleDMCommand(message, chatbot)) return;
+  if (!chatbot.chatbot_enabled) return;
+
+  // a reply to a status message: that reply starts over with this added, rather than this getting its own
+  if (restartReply(message)) return;
+  await respondTo(message, author.id);
+}
+
+/**
+ * A reaction in a DM: the bot's owner reacting 🗑️ to one of its messages deletes it, or the whole reply it's part of.
+ * The delete event then takes it out of the bot's memory of the conversation too
+ */
+async function handleDMReaction(reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser): Promise<void> {
+  if (!['🗑️', '🗑'].includes(reaction.emoji.name ?? '') || user.id === reaction.client.user.id || !isDMUser(user.id)) return;
+
+  // a message from before the bot started arrives partial, without its author
+  const message = reaction.message.partial ? await safeFetch(() => reaction.message.fetch()) : reaction.message;
+  if (!message) {
+    console.error(`🗑️ in a DM: couldn't fetch message ${reaction.message.id}, so it wasn't deleted`);
+    return;
+  }
+  // only the bot's own messages, and only in a DM, never a server's channel
+  if (message.guildId || message.channel.type !== ChannelType.DM || message.author.id !== message.client.user.id) return;
+
+  const { channel } = message;
+  await Promise.all(forgetReply(message.id).map((id) => channel.messages.delete(id).catch((error) => console.error(`Couldn't delete DM message ${id}:`, error))));
+}
+
+// schedules a server's reminders, from when the bot starts. a DM's post in the DM itself
+function loadReminders(serverID: string): void {
+  getRemindersByServer(serverID).forEach(async (reminder) => {
+    const outputChannel = await fetchServerChannel(serverID, reminder.channel_id);
+    if (!outputChannel) {
+      console.error(`Reminder "${reminder.reminder_name}" (server ${serverID}): channel ${reminder.channel_id} not found`);
+      return;
+    }
+
+    // older /reminder add saved the raw Discord @time tag instead of the cron schedule
+    const cronSchedule = inputToSchedule(reminder.cron_schedule);
+    if (!cronSchedule) {
+      console.error(`Reminder "${reminder.reminder_name}" (server ${serverID}): invalid schedule "${reminder.cron_schedule}"`);
+      return;
+    }
+    if (cronSchedule !== reminder.cron_schedule) {
+      updateReminder({ ...reminder, cron_schedule: cronSchedule });
+    }
+
+    cron.schedule(cronSchedule, () => sendReminder(outputChannel, serverID, reminder.reminder_name), {
+      name: `${reminder.server_id}${reminder.reminder_name}`,
+    });
+  });
+}
 
 function clientEvents(discordClient: Client) {
   discordClient.on(Events.ClientReady, async () => {
@@ -68,31 +215,13 @@ function clientEvents(discordClient: Client) {
         }
       });
 
-      // load reminders into cron scheduling
-      const reminders = getRemindersByServer(guildID);
-      reminders.forEach(async (reminder) => {
-        const outputChannel = await safeFetch(() => server.channels.fetch(reminder.channel_id));
-        if (!outputChannel) {
-          console.error(`Reminder "${reminder.reminder_name}" (server ${guildID}): channel ${reminder.channel_id} not found`);
-          return;
-        }
-
-        // older /reminder add saved the raw Discord @time tag instead of the cron schedule
-        const cronSchedule = inputToSchedule(reminder.cron_schedule);
-        if (!cronSchedule) {
-          console.error(`Reminder "${reminder.reminder_name}" (server ${guildID}): invalid schedule "${reminder.cron_schedule}"`);
-          return;
-        }
-        if (cronSchedule !== reminder.cron_schedule) {
-          updateReminder({ ...reminder, cron_schedule: cronSchedule });
-        }
-
-        cron.schedule(cronSchedule, () => sendReminder(outputChannel, guildID, reminder.reminder_name), {
-          name: `${reminder.server_id}${reminder.reminder_name}`,
-        });
-      });
-
+      loadReminders(guildID);
       loadHeartbeats(guildID);
+    });
+    // DMs with the bot's owner are servers of their own, with their own reminders and heartbeats, which post in the DM
+    getDMServers().forEach((dm) => {
+      loadReminders(dm.server_id);
+      loadHeartbeats(dm.server_id);
     });
 
     const conversations = getAllConversations();
@@ -116,11 +245,23 @@ function clientEvents(discordClient: Client) {
     }
     // modal submissions are picked up by the command that showed the modal, with awaitModalSubmit
     if (!interaction.isCommand() && !interaction.isAutocomplete()) return;
-    if (!interaction.guild) return;
 
-    const serverID: string = interaction.guild.id;
-
-    const command: Command = commandMap.get(interaction.commandName)!;
+    // a DM's commands change that DM's own settings, and only work for the bot's owner. its server id is their user id
+    let serverID: string;
+    let command: Command | undefined;
+    if (interaction.guild) {
+      serverID = interaction.guild.id;
+      command = commandMap.get(interaction.commandName);
+    } else {
+      if (!isDMUser(interaction.user.id)) {
+        if (interaction.isAutocomplete()) await interaction.respond([]).catch(() => undefined);
+        else await interaction.reply({ content: 'These commands aren\'t available to you.', flags: MessageFlags.Ephemeral }).catch(() => undefined);
+        return;
+      }
+      serverID = interaction.user.id;
+      ensureDMServer(serverID);
+      command = dmCommandMap.get(interaction.commandName);
+    }
 
     if (!command) { console.error(`No command found! Command Name: ${interaction.commandName}`); return; }
 
@@ -143,14 +284,20 @@ function clientEvents(discordClient: Client) {
 
   // grok functionality, when message was sent
   discordClient.on(Events.MessageCreate, async (message) => {
+    // a DM, which only the bot's owner gets an answer to
+    if (!message.guildId) {
+      await handleDirectMessage(message).catch((error) => console.error(error));
+      return;
+    }
+
     const { author, channel, guildId: serverID } = message;
 
     // if we can't send messages, we don't care about the message
     if (!serverID || !channel.isTextBased()) return;
 
-    // Check AutomaticResponses
+    // Check AutomaticResponses. never for bots, the bot itself included, so a response matching its own activation can't loop forever
     const messageContent = message.content;
-    const serverResponses = getAutomaticResponsesByServer(serverID);
+    const serverResponses = author.bot ? [] : getAutomaticResponsesByServer(serverID);
 
     serverResponses.forEach((response) => {
       // continue to next if response isn't enabled, or activation phrase isn't found
@@ -167,10 +314,11 @@ function clientEvents(discordClient: Client) {
         return groups[i] ?? '';
       });
 
+      // caught, since a channel the bot can't send or react in would otherwise crash it
       message.reply({ content: responseStr }).then((responseMessage) => {
-        responseMessage.react('🗑️');
         addResponseMessage(serverID, responseMessage.id);
-      });
+        return responseMessage.react('🗑️');
+      }).catch((error) => console.error(error));
     });
 
     // ChatbotResponse Handling
@@ -196,69 +344,7 @@ function clientEvents(discordClient: Client) {
       )
     && Math.random() >= 1 / 4096) return; // ...and we don't roll a small chance to respond anyway
 
-    let messageReference = message.reference ? await message.fetchReference() : undefined; // fetch response, if it exists
-    const fetchContext = async (before: Message<true>) => Array.from((await channel.messages.fetch(({ limit: 5, cache: true, before: before.id }))).values()); // the 5 most recent messages
-    let context: Message<boolean>[] = await fetchContext(message);
-
-    // sent first, so the user sees a sign of a reply right away. edited as it uses tools, then deleted once the reply is sent.
-    // it has Stop (no more tools, answer now) and Cancel (throw it all away) buttons, which only work while it's tracked
-    let status = THINKING_STATUS;
-    let pending: PendingReply | undefined;
-    const statusMessage = await safeFetch(async () => {
-      const sent = await message.channel.send({ content: status });
-      pending = trackReply(sent.id, author.id);
-      await sent.edit({ components: statusButtons(pending) }).catch((err) => console.error(err)); // added once tracked, so a press always finds its reply
-      return sent;
-    });
-    // edits take turns, and each shows the latest status when it goes, so an older one can never land after a newer one
-    let shown = status;
-    let finished = false; // once the reply is sent or fails, nothing more is edited in
-    let editing = Promise.resolve();
-    const onStatus = (newStatus: string) => {
-      status = newStatus;
-      editing = editing.then(async () => {
-        if (status === shown || finished || !statusMessage || pending?.cancel.signal.aborted) return;
-        shown = status;
-        await statusMessage.edit({ content: status, components: pending ? statusButtons(pending) : [] });
-      }).catch((err) => console.error(err));
-    };
-
-    // get response from LLM, and reply. nothing is sent until the whole reply is ready
-    try {
-      let replyTo: Message<true> = message;
-      let chunks: string[];
-      for (;;) {
-        try {
-          ({ chunks } = await generateReply(serverID, { channel: message.channel, context, message: replyTo, reference: messageReference, onStatus, control: pending?.control }));
-          if (!pending?.restart.signal.aborted) break;
-        } catch (error) {
-          if (!pending?.restart.signal.aborted || pending.cancel.signal.aborted) throw error;
-        }
-        // its author added a message to it: start over answering that, as a follow-up to what they first said. what its tools did is kept
-        const next = nextAttempt(pending!);
-        if (!next) throw new Error('The reply started over, but lost the message it was starting over for.');
-        messageReference = replyTo;
-        replyTo = next;
-        context = await fetchContext(next);
-      }
-      if (pending) pending.sending = true; // too late to start over now, so a new message from its author gets its own reply
-      finished = true;
-      const sent = await sendReply(replyTo, chunks!, pending);
-      if (!pending?.cancel.signal.aborted) statusMessage?.delete().catch((err) => console.error(err));
-      // a Cancel that came too late to stop it keeps the reply's tool results as they are, since the reply is there
-      else if (!sent) discardToolResults(pending, 'cancelled');
-    } catch (error: any) {
-      if (pending) discardToolResults(pending, pending.cancel.signal.aborted ? 'cancelled' : 'failed');
-      // cancelled with its button, which already deleted the status message
-      if (pending?.cancel.signal.aborted) return;
-
-      finished = true;
-      console.error(error);
-      const errorText = `There was an issue... Please try again later...\n\`\`\`${error?.message ?? ''}\`\`\``;
-      (statusMessage ? statusMessage.edit({ content: errorText, components: [] }) : message.reply(errorText)).catch((err) => console.error(err));
-    } finally {
-      if (statusMessage) untrackReply(statusMessage.id);
-    }
+    await respondTo(message, serverID);
   });
 
   const handleMessageDelete = (serverID: string, messageID: string) => {
@@ -275,7 +361,9 @@ function clientEvents(discordClient: Client) {
 
   // NOTE: messages may be partial (only id, channel, and guild), if they weren't cached
   discordClient.on(Events.MessageDelete, async (message) => {
-    const serverID = message.guildId;
+    // a DM with the bot's owner counts as a server of its own, keyed by its owner's user id
+    const dmOwner = message.channel?.type === ChannelType.DM ? await dmRecipient(message.channel) : undefined;
+    const serverID = message.guildId ?? (dmOwner && isDMServer(dmOwner) ? dmOwner : undefined);
     if (!serverID) return; // only care if it's in a server
 
     handleMessageDelete(serverID, message.id);
@@ -333,15 +421,9 @@ function clientEvents(discordClient: Client) {
     const totalReactions = reaction.count ?? 0;
 
     if (emojiString === '🗑️' && !user.bot && isResponseMessage(serverID, messageID)) {
-      try {
-        deleteResponseMessage(serverID, messageID);
-        message.delete();
-
-        return;
-      } catch (error) {
-        console.error(error);
-        return;
-      }
+      deleteResponseMessage(serverID, messageID);
+      await message.delete().catch((error) => console.error(error)); // e.g. a moderator deleted it first
+      return;
     }
 
     const refMessage = message.reference ? await message.fetchReference() : undefined;
@@ -363,7 +445,7 @@ function clientEvents(discordClient: Client) {
     heartBoards.forEach(async (heartBoard) => {
       if (!heartBoard.enabled) return;
       if (heartBoard.deny_author && user.id === message.author?.id) {
-        reaction.users.remove(user.id);
+        reaction.users.remove(user.id).catch((error) => console.error(error));
         return;
       }
 
@@ -394,7 +476,7 @@ function clientEvents(discordClient: Client) {
         if (heartboardMessage && embedMessage) {
           // if the message no longer has enough reactions, we should delete the HeartBoardMessage
           if (totalReactions < heartBoard.threshold || reaction.partial) {
-            embedMessage.delete();
+            embedMessage.delete().catch((error) => console.error(error));
             deleteHeartBoardMessage(serverID, heartBoard.board_name, messageID);
             return;
           }
@@ -403,7 +485,7 @@ function clientEvents(discordClient: Client) {
           const authorMember = await guild.members.fetch(message.author?.id ?? 'unknown');
           const messageOptions = heartboardEmbedBuilder(authorMember, message, reaction);
 
-          embedMessage.edit(messageOptions);
+          embedMessage.edit(messageOptions).catch((error) => console.error(error));
           heartboardMessage.total_emojis = totalReactions;
           updateHeartBoardMessage(heartboardMessage);
 
@@ -433,6 +515,8 @@ function clientEvents(discordClient: Client) {
 
   discordClient.on(Events.MessageReactionAdd, async (reaction: MessageReaction | PartialMessageReaction, user: User | PartialUser) => {
     try {
+      // only adding a 🗑️ deletes a DM message, so this isn't in handleReaction, which removing one runs too
+      if (!reaction.message.guildId) await handleDMReaction(reaction, user);
       await handleReaction(reaction, user);
     } catch (error) {
       console.error(error);

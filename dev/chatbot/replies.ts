@@ -2,7 +2,7 @@
 // only a channel's latest reply has buttons. once another replaces it, it keeps whichever version was on screen.
 // versions are kept in memory, so the buttons on replies from before a restart stop working.
 // while a reply is being written, its status message has Stop (no more tools, answer now) and Cancel (throw it all away) buttons, and so does a retry
-import { ActionRowBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, GuildTextBasedChannel, Message, MessageFlags, PermissionFlagsBits, Snowflake } from 'discord.js';
+import { ActionRowBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, Message, MessageFlags, PermissionFlagsBits, SendableChannels, Snowflake } from 'discord.js';
 
 import { setToolResultsDiscarded, updateConversationMessageContent } from '../data';
 import { ToolResultDiscard } from '../types/schema';
@@ -15,7 +15,7 @@ interface PendingReply {
   stop: AbortController,
   cancel: AbortController,
   restart: AbortController, // replaced with a new one each time the reply starts over
-  restartWith?: Message<true>, // the author's new message it's starting over for
+  restartWith?: Message, // the author's new message it's starting over for
   sending?: boolean, // it's being sent, so it's too late to start over
   control: ReplyControl, // what generateReply is given
 }
@@ -68,7 +68,7 @@ function untrackReply(statusMessageID: Snowflake): void {
  * A message replying to a status message, from the author of what's being replied to: the reply starts over with it added,
  * keeping what its tools already did. Returns whether it did, so the message isn't answered separately as well
  */
-function restartReply(message: Message<true>): boolean {
+function restartReply(message: Message): boolean {
   const pending = message.reference?.messageId ? pendingReplies.get(message.reference.messageId) : undefined;
   if (!pending || message.author.id !== pending.authorID || pending.cancel.signal.aborted || pending.sending) return false;
 
@@ -77,7 +77,7 @@ function restartReply(message: Message<true>): boolean {
   return true;
 }
 // called by whatever's writing the reply, once it's noticed it was restarted, for the next attempt
-function nextAttempt(pending: PendingReply): Message<true> | undefined {
+function nextAttempt(pending: PendingReply): Message | undefined {
   const message = pending.restartWith;
   pending.restartWith = undefined;
   pending.restart = new AbortController();
@@ -113,7 +113,7 @@ const MAX_VERSIONS = 5; // per reply, since each retry is a full model call
 
 interface ReplyState {
   serverID: Snowflake,
-  channel: GuildTextBasedChannel,
+  channel: SendableChannels, // a server's channel, or a DM
   userMessageID: Snowflake, // the message being replied to
   authorID: Snowflake, // its author, the only one who can use the buttons
   messageIDs: Snowflake[], // the reply's messages, in order. the buttons are on the last one
@@ -130,6 +130,30 @@ interface ReplyState {
 // only each channel's latest reply, since older ones have no buttons left to press
 const replies = new Map<Snowflake, ReplyState>(); // by every one of a reply's message ids
 const latestReplies = new Map<Snowflake, ReplyState>(); // by channel id
+
+// every reply's messages, older ones too, by each of their ids, so deleting one part of a reply can delete all of it.
+// the reply's own list, so messages a longer version adds are included. in memory, and only the most recent are kept
+const MAX_REPLY_GROUPS = 5_000;
+const replyGroups = new Map<Snowflake, Snowflake[]>();
+function rememberReplyMessage(messageID: Snowflake, messageIDs: Snowflake[]): void {
+  replyGroups.set(messageID, messageIDs);
+  while (replyGroups.size > MAX_REPLY_GROUPS) replyGroups.delete(replyGroups.keys().next().value!);
+}
+
+/**
+ * The messages to delete when someone deletes one message of a reply: the whole reply, so half an answer isn't left behind.
+ * Its buttons stop working too, since there's nothing left to edit. Just the message itself, for one that isn't part of a reply
+ */
+function forgetReply(messageID: Snowflake): Snowflake[] {
+  const messageIDs = [...(replyGroups.get(messageID) ?? [messageID])];
+  messageIDs.forEach((id) => {
+    replyGroups.delete(id);
+    const state = replies.get(id);
+    replies.delete(id);
+    if (state && isLatest(state)) latestReplies.delete(state.channel.id);
+  });
+  return messageIDs;
+}
 
 function isLatest(state: ReplyState): boolean {
   return latestReplies.get(state.channel.id) === state;
@@ -207,6 +231,7 @@ async function showVersion(state: ReplyState): Promise<void> {
     const sent = await state.channel.send({ content, allowedMentions: chatbotMentions(state.serverID, content) });
     state.messageIDs.push(sent.id);
     state.shown.push(content);
+    rememberReplyMessage(sent.id, state.messageIDs);
     if (isLatest(state)) replies.set(sent.id, state); // a retry can finish after a newer reply replaced it
     await state.channel.messages.edit(previousLast, { components: [] });
   }
@@ -241,12 +266,13 @@ async function refreshButtons(state: ReplyState): Promise<void> {
  * so the previous one loses its buttons, and keeps whichever version was on screen.
  * If it's cancelled partway, what was already sent is deleted, and the previous reply stays the latest
  */
-async function sendReply(message: Message<true>, chunks: string[], pending?: PendingReply): Promise<boolean> {
+async function sendReply(serverID: Snowflake, message: Message, chunks: string[], pending?: PendingReply): Promise<boolean> {
   const cancel = pending?.cancel.signal;
   if (chunks.length === 0 || !message.channel.isSendable() || cancel?.aborted) return false;
 
   const state: ReplyState = {
-    serverID: message.guildId,
+    serverID, // a DM with the bot's owner is a server of its own, keyed by their user id
+
     channel: message.channel,
     userMessageID: message.id,
     authorID: message.author.id,
@@ -267,6 +293,7 @@ async function sendReply(message: Message<true>, chunks: string[], pending?: Pen
     const sent = i === 0 ? await message.reply(options) : await message.channel.send(options); // one at a time, so they arrive in order
     state.messageIDs.push(sent.id);
     state.shown.push(chunk);
+    rememberReplyMessage(sent.id, state.messageIDs);
   }
 
   if (cancel?.aborted) {
@@ -415,4 +442,4 @@ async function handleReplyButton(interaction: ButtonInteraction): Promise<void> 
   }
 }
 
-export { PendingReply, sendReply, restartReply, nextAttempt, handleReplyButton, statusButtons, trackReply, untrackReply, discardToolResults, handleStatusButton };
+export { PendingReply, sendReply, forgetReply, restartReply, nextAttempt, handleReplyButton, statusButtons, trackReply, untrackReply, discardToolResults, handleStatusButton };

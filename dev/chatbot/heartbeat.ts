@@ -5,9 +5,10 @@ import { Snowflake, SnowflakeUtil } from 'discord.js';
 import { discordClient } from '..';
 import { deleteConversation, deleteHeartbeat, getChatbot, getConversationMessages, getHeartbeat, getHeartbeatsByServer, insertConversationMessage } from '../data';
 import { HeartbeatTable } from '../types/schema';
-import { estimateTokens, safeFetch } from '../utils';
+import { estimateTokens } from '../utils';
 import { chatbotMentions, generateReply, isAllowedServer } from './chatbot';
 import { getVisibleToolResults, summarizeConversation } from './conversation';
+import { fetchServerChannel } from './dm';
 
 const MAX_BOT_HEARTBEATS = 5; // per server, for ones the bot scheduled itself, since each beat is a model call
 
@@ -73,8 +74,8 @@ async function runHeartbeat(serverID: Snowflake, heartbeatName: string): Promise
     const chatbot = getChatbot(serverID);
     if (!chatbot?.chatbot_enabled || !chatbot.tools_enabled || !isAllowedServer(serverID)) return;
 
-    const guild = await safeFetch(() => discordClient.guilds.fetch(serverID));
-    const channel = await safeFetch(() => guild!.channels.fetch(heartbeat.channel_id));
+    // a channel in its server, or for a DM with the bot's owner, the DM itself
+    const channel = await fetchServerChannel(serverID, heartbeat.channel_id);
     if (!channel || !channel.isTextBased() || !channel.isSendable()) {
       console.error(`Heartbeat "${heartbeat.heartbeat_name}" (server ${serverID}): channel ${heartbeat.channel_id} not found or not sendable`);
       return;
