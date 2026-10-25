@@ -2,6 +2,7 @@ import { Snowflake } from 'discord.js';
 
 interface ServerTable {
   server_id: Snowflake;
+  dm_user_id?: Snowflake; // set for a DM with the bot, treated as a server of its own: whose DM it is, which is also its server_id
 }
 interface ChannelTable {
   server_id: Snowflake,

@@ -1,11 +1,11 @@
 import { tool } from 'ai';
 import { z as zod } from 'zod';
 import cron from 'node-cron';
-import { AnyThreadChannel, ChannelType, Embed, GuildBasedChannel, GuildMember, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
+import { AnyThreadChannel, ChannelType, DMChannel, Embed, Guild, GuildBasedChannel, GuildMember, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
 
 import { discordClient } from '..';
 import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getIndexChannel, getNextChannelRef, insertIndexChannel, getIndexUser, getNextUserRef, insertIndexUser, resolveRoleRef, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
-import { MemoryTable, ReminderTable } from '../types/schema';
+import { HeartbeatTable, MemoryTable, ReminderTable } from '../types/schema';
 import { estimateTokens, safeFetch, sendReminder } from '../utils';
 import { chatbotMentions, formatReactions, formatResponse } from './chatbot';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './context';
@@ -13,6 +13,7 @@ import { MAX_BOT_HEARTBEATS, removeHeartbeat, scheduleHeartbeat } from './heartb
 import { MAX_TIMEOUT, sandboxExec } from './sandbox';
 import { captionImage } from './vision';
 import { fromSummarySource, getVisibleSummaries } from './conversation';
+import { fetchServerChannel } from './dm';
 
 // filled in by the bot for each reply, rather than by the model, so the model can't get it wrong (or reach another server's memories)
 const replyContextSchema = zod.object({
@@ -21,8 +22,13 @@ const replyContextSchema = zod.object({
   conversation_id: zod.string(), // the current conversation, whose refs ([#3], [@2]) the model uses
   shareable: zod.boolean(), // whether everyone in the conversation is fine with it reaching other servers
   reference_message_id: zod.string().optional(), // the message the user is replying to, which the model sees as [$0]
+  // a DM with the bot's owner, who has full control: channel and server tools can reach any server the bot is in, private channels included
+  dm: zod.boolean().optional(),
 });
 type ReplyContext = zod.infer<typeof replyContextSchema>;
+
+// for tools about a server's members, counters, or nickname, which in a DM have to be told which server
+const SERVER_FIELD = zod.string().optional().describe('Only in a DM with your owner: which server, by its id or name');
 
 // [$0] isn't saved like other message refs, since it's whichever message the user is replying to this time
 const REPLY_REFS = ['[$0]', '$0', '0'];
@@ -53,44 +59,16 @@ const reactToMessage = tool({
     conversation_id: zod.string().describe('ID of the current conversation'),
     server_id: zod.string().describe('ID of the message\'s server'),
     channel_ref: zod.string().describe('Reference of the message\'s channel'),
-    message_ref: zod.string().describe('Reference of the message'),
+    message_ref: zod.string().describe('Reference of the message. In a DM with your owner, a message link works too'),
     emoji: zod.string().describe('Character of the emoji'),
   }),
   contextSchema: replyContextSchema,
   execute: async (input: { conversation_id: string, server_id: Snowflake, channel_ref: Snowflake, message_ref: string, emoji: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
-    const guild = await discordClient.guilds.fetch(input.server_id);
-    if (!guild) {
-      return {
-        result: 'failure',
-        message: `There is no guild with id '${input.server_id}'!`,
-      };
-    }
+    // found through this server, or in a DM with the bot's owner, any of them. the server_id the model gives isn't needed for that
+    const channel = await resolveTextChannel(context, channelOfMessage(context, input.message_ref, input.channel_ref));
+    if (typeof channel === 'string') return { result: 'failure', message: channel };
 
-    const channelID = resolveChannelRef(input.conversation_id, input.channel_ref) ?? resolveChannelRef(input.conversation_id, `[${input.channel_ref}]`) ?? resolveChannelRef(input.conversation_id, `[#${input.channel_ref}]`);
-    if (!channelID) {
-      return {
-        result: 'failure',
-        message: `There is no channel with ref ${input.channel_ref}`,
-      };
-    }
-    const channel = await guild.channels.fetch(channelID);
-    if (!channel) {
-      return {
-        result: 'failure',
-        message: `There is no channel with id ${channelID}`,
-      };
-    }
-    if (!channel.isTextBased()) {
-      return {
-        result: 'failure',
-        message: 'This channel is not text based!',
-      };
-    }
-
-    // [$0] is the message the user is replying to, which the bot passes in. every other ref is saved, so look it up
-    const messageID = REPLY_REFS.includes(input.message_ref.trim())
-      ? context.reference_message_id
-      : resolveMessageRef(input.conversation_id, input.message_ref) ?? resolveMessageRef(input.conversation_id, `[${input.message_ref}]`) ?? resolveMessageRef(input.conversation_id, `[$${input.message_ref}]`);
+    const messageID = resolveMessageID(context, input.message_ref);
     if (!messageID) {
       return {
         result: 'failure',
@@ -98,7 +76,7 @@ const reactToMessage = tool({
       };
     }
 
-    const message = await channel.messages.fetch(messageID);
+    const message = await safeFetch(() => channel.messages.fetch(messageID));
     if (!message) {
       return {
         result: 'failure',
@@ -131,9 +109,10 @@ const changeNickname = tool({
   ],
   inputSchema: zod.object({
     nickname: zod.string().describe(`New nickname, at most ${MAX_NICKNAME_LENGTH} characters. Empty to reset it`),
+    server: SERVER_FIELD,
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { nickname: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
+  execute: async (input: { nickname: string, server?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
     const nickname = input.nickname.trim();
     if (nickname.length > MAX_NICKNAME_LENGTH) {
       return {
@@ -143,8 +122,9 @@ const changeNickname = tool({
     }
 
     try {
-      // the server comes from the bot, so the model can only rename itself where it's replying
-      const guild = await discordClient.guilds.fetch(context.server_id);
+      // the server comes from the bot, so the model can only rename itself where it's replying. a DM names one instead
+      const guild = await resolveGuild(context, input.server);
+      if (typeof guild === 'string') return { result: 'failure', message: guild };
       const me = guild.members.me ?? await guild.members.fetchMe();
       await me.setNickname(nickname || null);
       return {
@@ -184,19 +164,12 @@ const createReminder = tool({
     },
   ],
   execute: async (input: ReminderTable): Promise<{ result: 'success' | 'failure', message: string }> => {
-    const server = await discordClient.guilds.fetch(input.server_id);
-    if (!server) {
-      return {
-        result: 'failure',
-        message: `There is no server with ID: ${input.server_id}.`,
-      };
-    }
-
-    const outputChannel = await server.channels.fetch(input.channel_id);
+    // a channel in that server, or for a DM with the bot's owner, the DM itself
+    const outputChannel = await fetchServerChannel(input.server_id, input.channel_id);
     if (!outputChannel) {
       return {
         result: 'failure',
-        message: `There is no message with ID: ${input.channel_id}.`,
+        message: `There is no channel ${input.channel_id} in server ${input.server_id}.`,
       };
     }
     if (!outputChannel.isSendable()) {
@@ -244,19 +217,12 @@ const editReminder = tool({
     message_content: zod.string().describe('Content of the reminder to send'),
   }),
   execute: async (input: ReminderTable): Promise<{ result: 'success' | 'failure', message: string }> => {
-    const server = await discordClient.guilds.fetch(input.server_id);
-    if (!server) {
-      return {
-        result: 'failure',
-        message: `There is no server with ID: ${input.server_id}.`,
-      };
-    }
-
-    const outputChannel = await server.channels.fetch(input.channel_id);
+    // a channel in that server, or for a DM with the bot's owner, the DM itself
+    const outputChannel = await fetchServerChannel(input.server_id, input.channel_id);
     if (!outputChannel) {
       return {
         result: 'failure',
-        message: `There is no message with ID: ${input.channel_id}.`,
+        message: `There is no channel ${input.channel_id} in server ${input.server_id}.`,
       };
     }
     if (!outputChannel.isSendable()) {
@@ -1342,7 +1308,7 @@ const blueskyAct = tool({
   contextSchema: replyContextSchema,
   execute: async (input: BlueskyActInput, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', posts?: string[], message: string }> => {
     // only offered to attached servers, but checked here too, so a made-up tool call can't get around it
-    if (!isAttached(context.server_id)) return { result: 'failure', message: BLUESKY_DETACHED_MESSAGE };
+    if (!isAttached(context.server_id) && !context.dm) return { result: 'failure', message: BLUESKY_DETACHED_MESSAGE }; // a DM with the bot's owner always can
 
     const { action } = input;
     const target = input.target?.trim() || undefined;
@@ -1531,7 +1497,7 @@ const blueskyDMs = tool({
   }),
   contextSchema: replyContextSchema,
   execute: async (input: { action: 'list' | 'read' | 'send', with?: string, text?: string, more?: boolean, count?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', conversations?: Record<string, unknown>[], messages?: Record<string, unknown>[], has_more?: boolean, message: string }> => {
-    if (!isAttached(context.server_id)) return { result: 'failure', message: BLUESKY_DETACHED_MESSAGE };
+    if (!isAttached(context.server_id) && !context.dm) return { result: 'failure', message: BLUESKY_DETACHED_MESSAGE }; // a DM with the bot's owner always can
 
     const { action } = input;
     const target = input.with?.trim() || undefined;
@@ -1623,30 +1589,51 @@ const blueskyDMs = tool({
 });
 
 // one tool with an action, rather than five, to keep the tool list short. same counters as the /counter command
+// the server a counter tool works on: this one, or in a DM, the DM's own, unless it names another server
+async function counterServer(context: ReplyContext, serverInput?: string): Promise<{ serverID: Snowflake } | { error: string }> {
+  if (!context.dm || !serverInput) return { serverID: context.server_id }; // from the bot, so it can only touch this server's counters
+  const guild = await resolveGuild(context, serverInput);
+  return typeof guild === 'string' ? { error: guild } : { serverID: guild.id };
+}
+
+// separate from counter, so that one's name can be required: listing is the only thing that doesn't need one
+const listCounters = tool({
+  description: 'List the server\'s counters: named numbers people keep track of (e.g. how many times something happened), with their values.',
+  inputSchema: zod.object({
+    server: SERVER_FIELD.describe('Only in a DM with your owner: another server whose counters to list, by its id or name. Leave out for the DM\'s own'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { server?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', counters?: { name: string, value: number }[], message: string }> => {
+    const server = await counterServer(context, input.server);
+    if ('error' in server) return { result: 'failure', message: server.error };
+
+    const counters = getCountersByServer(server.serverID).map((c) => ({ name: c.counter_name, value: c.value }));
+    return { result: 'success', counters, message: counters.length === 0 ? 'There are no counters in this server.' : `Found ${counters.length} counters.` };
+  },
+});
+
 const counter = tool({
-  description: 'Use the server\'s counters: named numbers people keep track of (e.g. how many times something happened). '
-    + 'Actions: "list" all counters, "create" a new one, "add" to one (negative to subtract), "set" one to a value, or "delete" one. Names aren\'t case-sensitive.',
+  description: 'Change one of the server\'s counters: named numbers people keep track of (e.g. how many times something happened). '
+    + 'Actions: "create" a new one, "add" to one (negative to subtract), "set" one to a value, or "delete" one. Names aren\'t case-sensitive. '
+    + 'To see the counters, use list_counters.',
   inputExamples: [
-    { input: { action: 'list' } },
     { input: { action: 'add', name: 'Deaths', amount: 1 } },
     { input: { action: 'create', name: 'Pizza Nights', value: 0 } },
   ],
   inputSchema: zod.object({
-    action: zod.enum(['list', 'create', 'add', 'set', 'delete']),
-    name: zod.string().optional().describe('Name of the counter. Needed for every action except list'),
+    action: zod.enum(['create', 'add', 'set', 'delete']),
+    name: zod.string().describe('Name of the counter'),
     amount: zod.number().int().optional().describe('For add: how much to add. Negative to subtract. Defaults to 1'),
     value: zod.number().int().optional().describe('For create: the starting value, defaulting to 0. For set: the new value'),
+    server: SERVER_FIELD.describe('Only in a DM with your owner: another server whose counters to use, by its id or name. Leave out for the DM\'s own'),
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { action: 'list' | 'create' | 'add' | 'set' | 'delete', name?: string, amount?: number, value?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', counters?: { name: string, value: number }[], value?: number, message: string }> => {
-    const serverID = context.server_id; // from the bot, so it can only touch this server's counters
+  execute: async (input: { action: 'create' | 'add' | 'set' | 'delete', name: string, amount?: number, value?: number, server?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', value?: number, message: string }> => {
+    const server = await counterServer(context, input.server);
+    if ('error' in server) return { result: 'failure', message: server.error };
+    const { serverID } = server;
 
-    if (input.action === 'list') {
-      const counters = getCountersByServer(serverID).map((c) => ({ name: c.counter_name, value: c.value }));
-      return { result: 'success', counters, message: counters.length === 0 ? 'There are no counters in this server.' : `Found ${counters.length} counters.` };
-    }
-
-    if (!input.name) return { result: 'failure', message: `A name is needed to ${input.action} a counter.` };
+    if (!input.name?.trim()) return { result: 'failure', message: `A name is needed to ${input.action} a counter.` };
     const existing = getCounter(serverID, input.name);
 
     if (input.action === 'create') {
@@ -1659,7 +1646,7 @@ const counter = tool({
     }
 
     // every other action needs the counter to exist
-    if (!existing) return { result: 'failure', message: `There's no counter named "${input.name}". Use the list action to see them.` };
+    if (!existing) return { result: 'failure', message: `There's no counter named "${input.name}". Use list_counters to see them.` };
 
     if (input.action === 'add') {
       const amount = input.amount ?? 1;
@@ -1683,11 +1670,31 @@ const SEARCH_SCAN_LIMIT = 500; // how far back search_channel looks, since bots 
 const MAX_SEARCH_RESULTS = 20;
 const MAX_CHANNEL_MESSAGE_LENGTH = 1000; // characters of each message given back, so a few long ones can't fill the prompt
 
+// a server's channel, or in a DM with the bot's owner, possibly the DM itself
+type ToolChannel = GuildBasedChannel | DMChannel;
+type ToolTextChannel = GuildTextBasedChannel | DMChannel;
+
+// how a channel is named in what tools give back
+function channelLabel(channel: ToolChannel): string {
+  return channel.isDMBased() ? 'the DM' : `#${channel.name}`;
+}
+// the server a channel is in, for who its messages may ping. a DM is a server of its own
+function serverOf(channel: ToolChannel, context: ReplyContext): Snowflake {
+  return channel.isDMBased() ? context.server_id : channel.guildId;
+}
+
+// a Discord message link, https://discord.com/channels/<server, or @me for a DM>/<channel>/<message>. only used in DMs with the bot's owner
+function parseMessageLink(raw: string): { channelID: string, messageID?: string } | undefined {
+  const match = /discord(?:app)?\.com\/channels\/(?:\d{17,20}|@me)\/(\d{17,20})(?:\/(\d{17,20}))?/.exec(raw);
+  return match ? { channelID: match[1], messageID: match[2] } : undefined;
+}
+
 /**
  * A channel in this server, from a ref like [#3], a <#id> mention, or a plain id. Defaults to the channel being replied in.
+ * In a DM with the bot's owner, any channel the bot can see, in any server, and message links work too.
  * Returns why not instead, worded to give to the model as-is
  */
-async function resolveChannel(context: ReplyContext, channelInput?: string): Promise<GuildBasedChannel | string> {
+async function resolveChannel(context: ReplyContext, channelInput?: string): Promise<ToolChannel | string> {
   const raw = channelInput?.trim();
   let channelID: string | undefined = context.channel_id;
   // [#0] is always the current channel, and isn't saved like other refs
@@ -1695,9 +1702,20 @@ async function resolveChannel(context: ReplyContext, channelInput?: string): Pro
     const idMatch = /^<?#?(\d{17,20})>?$/.exec(raw);
     channelID = idMatch
       ? idMatch[1]
-      : resolveChannelRef(context.conversation_id, raw) ?? resolveChannelRef(context.conversation_id, `[${raw}]`) ?? resolveChannelRef(context.conversation_id, `[#${raw}]`);
+      : (context.dm ? parseMessageLink(raw)?.channelID : undefined)
+        ?? resolveChannelRef(context.conversation_id, raw) ?? resolveChannelRef(context.conversation_id, `[${raw}]`) ?? resolveChannelRef(context.conversation_id, `[#${raw}]`);
   }
   if (!channelID) return `There is no channel with ref ${raw}.`;
+
+  if (context.dm) {
+    const channel = await safeFetch(() => discordClient.channels.fetch(channelID));
+    if (!channel) return `There is no channel ${raw ?? channelID} that I can see.`;
+    if (channel.isDMBased()) {
+      if (channel.type !== ChannelType.DM) return 'That kind of channel isn\'t supported.';
+      return channel.partial ? channel.fetch() : channel;
+    }
+    return channel;
+  }
 
   // fetched through this server, so a channel in another server is never found
   const guild = await safeFetch(() => discordClient.guilds.fetch(context.server_id));
@@ -1706,8 +1724,46 @@ async function resolveChannel(context: ReplyContext, channelInput?: string): Pro
 
   return channel;
 }
+
+/**
+ * A message's id, from a ref like [$4], [$0] for the message being replied to, or a plain id. In a DM with the bot's owner, a message link too
+ */
+function resolveMessageID(context: ReplyContext, messageInput: string): string | undefined {
+  const ref = messageInput.trim();
+  // [$0] is the message the user is replying to, which the bot passes in. every other ref is saved, so look it up
+  if (REPLY_REFS.includes(ref)) return context.reference_message_id;
+  return /^\d{17,20}$/.exec(ref)?.[0]
+    ?? (context.dm ? parseMessageLink(ref)?.messageID : undefined)
+    ?? resolveMessageRef(context.conversation_id, ref) ?? resolveMessageRef(context.conversation_id, `[${ref}]`) ?? resolveMessageRef(context.conversation_id, `[$${ref}]`);
+}
+// in a DM, a message link says which channel it's in, so the channel doesn't have to be given separately
+function channelOfMessage(context: ReplyContext, messageInput: string, channelInput?: string): string | undefined {
+  return (context.dm ? parseMessageLink(messageInput)?.channelID : undefined) ?? channelInput;
+}
+
+/**
+ * The server a server tool works on: this one, or in a DM with the bot's owner, the one it names, by id or name.
+ * Returns why not instead, worded to give to the model as-is
+ */
+async function resolveGuild(context: ReplyContext, serverInput?: string): Promise<Guild | string> {
+  if (!context.dm) return (await safeFetch(() => discordClient.guilds.fetch(context.server_id))) ?? 'This server couldn\'t be found.';
+
+  const raw = serverInput?.trim();
+  if (!raw) return 'This is a DM, so say which server, by its id or name.';
+  const guilds = [...discordClient.guilds.cache.values()];
+  const lower = raw.toLowerCase();
+  const exact = guilds.find((guild) => guild.id === raw) ?? guilds.find((guild) => guild.name.toLowerCase() === lower);
+  if (exact) return exact;
+
+  const partial = guilds.filter((guild) => guild.name.toLowerCase().includes(lower));
+  if (partial.length === 1) return partial[0];
+  return partial.length === 0
+    ? `I'm not in a server called "${raw}".`
+    : `More than one server matches "${raw}": ${partial.map((guild) => `${guild.name} (${guild.id})`).join(', ')}. Use its id.`;
+}
+
 // same, but only text channels (including threads and voice channels' chats)
-async function resolveTextChannel(context: ReplyContext, channelInput?: string): Promise<GuildTextBasedChannel | string> {
+async function resolveTextChannel(context: ReplyContext, channelInput?: string): Promise<ToolTextChannel | string> {
   const channel = await resolveChannel(context, channelInput);
   if (typeof channel === 'string') return channel;
   if (!channel.isTextBased()) return 'This channel is not text based!';
@@ -1752,9 +1808,11 @@ function channelRef(context: ReplyContext, channelID: string): string {
   return shorthand;
 }
 
-// the current channel, or one everyone in the server can see, so a private channel's messages can't be read out to people who couldn't see them
-function isPublicOrCurrent(channel: GuildBasedChannel, context: ReplyContext): boolean {
-  if (channel.id === context.channel_id) return true;
+// the current channel, or one everyone in the server can see, so a private channel's messages can't be read out to people who couldn't see them.
+// a DM with the bot's owner has full control, private channels included
+function isPublicOrCurrent(channel: ToolChannel, context: ReplyContext): boolean {
+  if (context.dm || channel.id === context.channel_id) return true;
+  if (channel.isDMBased()) return false; // someone else's DM
   if (channel.type === ChannelType.PrivateThread) return false; // takes its parent's permissions, even though only its members can see it
 
   return !!channel.permissionsFor(channel.guild.roles.everyone)?.has(PermissionFlagsBits.ViewChannel);
@@ -1778,10 +1836,10 @@ function toChannelMessage(message: Message<boolean>) {
 type ChannelMessage = ReturnType<typeof toChannelMessage>;
 
 // what a channel is for: its name, its description (topic), and for a thread, the channel it's in
-function describeChannel(channel: GuildTextBasedChannel): { name: string, description?: string, thread_in?: string } {
+function describeChannel(channel: ToolTextChannel): { name: string, description?: string, thread_in?: string } {
   const topic = 'topic' in channel ? channel.topic : undefined;
   return {
-    name: channel.name,
+    name: channel.isDMBased() ? 'DM' : channel.name,
     description: topic || undefined,
     thread_in: channel.isThread() ? channel.parent?.name : undefined,
   };
@@ -1807,7 +1865,7 @@ const fetchChannel = tool({
     try {
       const count = Math.min(Math.max(input.count ?? 20, 1), MAX_FETCH_MESSAGES);
       const messages = [...(await channel.messages.fetch({ limit: count })).values()].reverse().map(toChannelMessage);
-      return { result: 'success', channel: describeChannel(channel), messages, message: `Fetched ${messages.length} messages from #${channel.name}.` };
+      return { result: 'success', channel: describeChannel(channel), messages, message: `Fetched ${messages.length} messages from ${channelLabel(channel)}.` };
     } catch (error: any) {
       return { result: 'failure', message: String(error?.message ?? error) };
     }
@@ -1865,7 +1923,7 @@ const searchChannel = tool({
         result: 'success',
         messages,
         scanned,
-        message: messages.length === 0 ? `No matches in the last ${scanned} messages of #${channel.name}.` : `Found ${messages.length} matches in the last ${scanned} messages of #${channel.name}.`,
+        message: messages.length === 0 ? `No matches in the last ${scanned} messages of ${channelLabel(channel)}.` : `Found ${messages.length} matches in the last ${scanned} messages of ${channelLabel(channel)}.`,
       };
     } catch (error: any) {
       return { result: 'failure', message: String(error?.message ?? error) };
@@ -1902,22 +1960,19 @@ const fetchEmbed = tool({
     { input: { channel: '[#2]', message: '1234567890123456789' } },
   ],
   inputSchema: zod.object({
-    message: zod.string().describe('Reference of the message, e.g. [$4], or its id'),
+    message: zod.string().describe('Reference of the message, e.g. [$4], or its id. In a DM with your owner, a message link works too'),
     channel: zod.string().optional().describe('Reference of the message\'s channel, e.g. [#2], or its id. Defaults to this channel'),
   }),
   contextSchema: replyContextSchema,
   execute: async (input: { message: string, channel?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', content?: string, embeds?: EmbedInfo[], message: string }> => {
-    const channel = await resolveTextChannel(context, input.channel);
+    const channel = await resolveTextChannel(context, channelOfMessage(context, input.message, input.channel));
     if (typeof channel === 'string') return { result: 'failure', message: channel };
     if (!isPublicOrCurrent(channel, context)) return { result: 'failure', message: PRIVATE_CHANNEL_MESSAGE };
 
     const ref = input.message.trim();
-    // [$0] is the message the user is replying to, which the bot passes in. every other ref is saved, so look it up
-    const messageID = REPLY_REFS.includes(ref)
-      ? context.reference_message_id
-      : /^\d{17,20}$/.exec(ref)?.[0] ?? resolveMessageRef(context.conversation_id, ref) ?? resolveMessageRef(context.conversation_id, `[${ref}]`) ?? resolveMessageRef(context.conversation_id, `[$${ref}]`);
+    const messageID = resolveMessageID(context, ref);
     const message = messageID ? await safeFetch(() => channel.messages.fetch(messageID)) : undefined;
-    if (!message) return { result: 'failure', message: `There is no message ${ref} in #${channel.name}.` };
+    if (!message) return { result: 'failure', message: `There is no message ${ref} in ${channelLabel(channel)}.` };
     if (message.embeds.length === 0) return { result: 'failure', message: 'That message has no embeds.' };
 
     const embeds = message.embeds.map(toEmbedInfo);
@@ -1964,15 +2019,17 @@ const searchUsers = tool({
   inputSchema: zod.object({
     query: zod.string().describe('Start of their username or nickname'),
     limit: zod.number().int().optional().describe(`How many matches, from 1 to ${MAX_USER_SEARCH_RESULTS}. Defaults to 10`),
+    server: SERVER_FIELD,
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { query: string, limit?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', users?: UserCard[], message: string }> => {
+  execute: async (input: { query: string, limit?: number, server?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', users?: UserCard[], message: string }> => {
     const query = input.query.trim();
     if (!query) return { result: 'failure', message: 'Give some text to search for.' };
 
     try {
-      // the server comes from the bot, so only this server's members can be found
-      const guild = await discordClient.guilds.fetch(context.server_id);
+      // the server comes from the bot, so only this server's members can be found. a DM names one instead
+      const guild = await resolveGuild(context, input.server);
+      if (typeof guild === 'string') return { result: 'failure', message: guild };
       const limit = Math.min(Math.max(input.limit ?? 10, 1), MAX_USER_SEARCH_RESULTS);
       const users = (await guild.members.search({ query, limit })).map((member) => toUserCard(context, member));
       return {
@@ -1999,20 +2056,27 @@ const listUsers = tool({
     scope: zod.enum(['server', 'channel']).describe('Whether to list the whole server, or one channel'),
     channel: zod.string().optional().describe('With the channel scope: reference of the channel, e.g. [#2], or its id. Defaults to this channel'),
     role: zod.string().optional().describe('Only members with this role: a reference like [&1], or its id'),
+    server: SERVER_FIELD.describe('Only in a DM with your owner, for the server scope: which server, by its id or name'),
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { scope: 'server' | 'channel', channel?: string, role?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', users?: UserCard[], total?: number, truncated?: boolean, message: string }> => {
+  execute: async (input: { scope: 'server' | 'channel', channel?: string, role?: string, server?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', users?: UserCard[], total?: number, truncated?: boolean, message: string }> => {
     try {
-      const guild = await discordClient.guilds.fetch(context.server_id);
+      // a channel's server is the one it's in, which in a DM can be any of them. otherwise it's this server, or the one a DM names
+      let channel: GuildBasedChannel | undefined;
+      if (input.scope === 'channel') {
+        const found = await resolveChannel(context, input.channel);
+        if (typeof found === 'string') return { result: 'failure', message: found };
+        if (found.isDMBased()) return { result: 'failure', message: 'A DM\'s only members are you and your owner.' };
+        if (!isPublicOrCurrent(found, context)) return { result: 'failure', message: 'This channel is private, so its members can only be listed from inside it.' };
+        channel = found;
+      }
+      const guild = channel ? channel.guild : await resolveGuild(context, input.server);
+      if (typeof guild === 'string') return { result: 'failure', message: guild };
       await guild.members.fetch(); // fills the cache, which channels' member lists are read from
 
       let members: GuildMember[];
-      let where = 'this server';
-      if (input.scope === 'channel') {
-        const channel = await resolveChannel(context, input.channel);
-        if (typeof channel === 'string') return { result: 'failure', message: channel };
-        if (!isPublicOrCurrent(channel, context)) return { result: 'failure', message: 'This channel is private, so its members can only be listed from inside it.' };
-
+      let where = context.dm ? guild.name : 'this server';
+      if (channel) {
         // a thread's members are the people who joined it, rather than everyone who can see it
         members = channel.isThread()
           ? [...(await channel.members.fetch({ withMember: true })).values()].map((threadMember) => threadMember.guildMember).filter((member): member is GuildMember => !!member)
@@ -2056,16 +2120,18 @@ const viewUser = tool({
   ],
   inputSchema: zod.object({
     user: zod.string().describe('Reference of the user, e.g. [@3], or their id'),
+    server: SERVER_FIELD,
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { user: string }, { context }: { context: ReplyContext }) => {
+  execute: async (input: { user: string, server?: string }, { context }: { context: ReplyContext }) => {
     const raw = input.user.trim();
     const userID = /^<?@?!?(\d{17,20})>?$/.exec(raw)?.[1] ?? resolveUserRef(context.conversation_id, raw) ?? resolveUserRef(context.conversation_id, `[${raw}]`) ?? resolveUserRef(context.conversation_id, `[@${raw}]`);
     if (!userID) return { result: 'failure' as const, message: `There is no user with ref ${raw}.` };
 
-    const guild = await safeFetch(() => discordClient.guilds.fetch(context.server_id));
-    const member = await safeFetch(() => guild!.members.fetch(userID));
-    if (!member) return { result: 'failure' as const, message: `${raw} isn't a member of this server.` };
+    const guild = await resolveGuild(context, input.server);
+    if (typeof guild === 'string') return { result: 'failure' as const, message: guild };
+    const member = await safeFetch(() => guild.members.fetch(userID));
+    if (!member) return { result: 'failure' as const, message: `${raw} isn't a member of ${context.dm ? guild.name : 'this server'}.` };
 
     const time = (timestamp: number) => new Date(timestamp).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
     return {
@@ -2088,7 +2154,7 @@ const MAX_SENDS_PER_REPLY = 5;
 const sendCounts = new WeakMap<ReplyContext, number>(); // send_message calls so far, per reply
 
 const sendMessage = tool({
-  description: 'Send a message to a channel in this server, separate from your reply. Use it to post somewhere else, or to post more than one message. '
+  description: 'Send a message to a channel in this server (in a DM with your owner, any server), separate from your reply. Use it to post somewhere else, or to post more than one message. '
     + `Refs like [@2] and [#3] work the same as in your replies. At most ${MAX_SENDS_PER_REPLY} per reply.`,
   inputExamples: [
     { input: { channel: '[#3]', content: 'Movie night starts in 10 minutes! 🍿' } },
@@ -2111,12 +2177,13 @@ const sendMessage = tool({
       const chunks = await formatResponse(context.conversation_id, input.content);
       const messageIDs: string[] = [];
       for (const chunk of chunks) {
-        const sent = await channel.send({ content: chunk, allowedMentions: chatbotMentions(context.server_id, chunk) }); // one at a time, so they arrive in order
+        // pings follow the subscribers of the server it's sent in, which from a DM can be any of them
+        const sent = await channel.send({ content: chunk, allowedMentions: chatbotMentions(serverOf(channel, context), chunk) }); // one at a time, so they arrive in order
         messageIDs.push(sent.id);
         saveSentMessage(context, sent);
       }
 
-      return { result: 'success', message_ids: messageIDs, message: `Sent ${messageIDs.length} message${messageIDs.length === 1 ? '' : 's'} in #${channel.name}.` };
+      return { result: 'success', message_ids: messageIDs, message: `Sent ${messageIDs.length} message${messageIDs.length === 1 ? '' : 's'} in ${channelLabel(channel)}.` };
     } catch (error: any) {
       return { result: 'failure', message: String(error?.message ?? error) };
     }
@@ -2148,8 +2215,10 @@ const createThread = tool({
     if (name.length > MAX_THREAD_NAME_LENGTH) return { result: 'failure', message: `Thread names can be at most ${MAX_THREAD_NAME_LENGTH} characters.` };
     if (!countUse(threadCounts, context, MAX_THREADS_PER_REPLY)) return { result: 'failure', message: `You've already made ${MAX_THREADS_PER_REPLY} threads this reply, the most allowed.` };
 
-    const channel = await resolveChannel(context, input.channel);
+    // in a DM, a message link says which channel to start it in
+    const channel = await resolveChannel(context, input.message ? channelOfMessage(context, input.message, input.channel) : input.channel);
     if (typeof channel === 'string') return { result: 'failure', message: channel };
+    const serverID = serverOf(channel, context); // pings follow the subscribers of the server it's made in
 
     try {
       const chunks = input.content?.trim() ? await formatResponse(context.conversation_id, input.content) : [];
@@ -2159,17 +2228,14 @@ const createThread = tool({
       if (channel.type === ChannelType.GuildForum) {
         if (chunks.length === 0) return { result: 'failure', message: 'A forum post needs a first message, as its content.' };
 
-        thread = await channel.threads.create({ name, message: { content: chunks[0], allowedMentions: chatbotMentions(context.server_id, chunks[0]) } });
+        thread = await channel.threads.create({ name, message: { content: chunks[0], allowedMentions: chatbotMentions(serverID, chunks[0]) } });
         rest = chunks.slice(1);
         const starter = await thread.fetchStarterMessage().catch(() => null);
         if (starter) saveSentMessage(context, starter);
       } else if (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildAnnouncement) {
         if (input.message) {
           const ref = input.message.trim();
-          // [$0] is the message the user is replying to, which the bot passes in. every other ref is saved, so look it up
-          const messageID = REPLY_REFS.includes(ref)
-            ? context.reference_message_id
-            : /^\d{17,20}$/.exec(ref)?.[0] ?? resolveMessageRef(context.conversation_id, ref) ?? resolveMessageRef(context.conversation_id, `[${ref}]`) ?? resolveMessageRef(context.conversation_id, `[$${ref}]`);
+          const messageID = resolveMessageID(context, ref);
           const message = messageID ? await safeFetch(() => channel.messages.fetch(messageID)) : undefined;
           if (!message) return { result: 'failure', message: `There is no message ${ref} in #${channel.name}.` };
           if (message.thread) return { result: 'failure', message: `That message already has a thread: ${channelRef(context, message.thread.id)}.` };
@@ -2184,7 +2250,7 @@ const createThread = tool({
         return { result: 'failure', message: 'Threads can only be made in text, announcement, and forum channels.' };
       }
 
-      for (const chunk of rest) saveSentMessage(context, await thread.send({ content: chunk, allowedMentions: chatbotMentions(context.server_id, chunk) })); // one at a time, so they arrive in order
+      for (const chunk of rest) saveSentMessage(context, await thread.send({ content: chunk, allowedMentions: chatbotMentions(serverID, chunk) })); // one at a time, so they arrive in order
 
       const ref = channelRef(context, thread.id);
       return { result: 'success', thread: ref, message: `Created thread "${thread.name}" (${ref}) in #${channel.name}.` };
@@ -2202,81 +2268,137 @@ function isAtMostHourly(cronSchedule: string): boolean {
 }
 
 // one tool with an action, like counter. the bot can only change the heartbeats it scheduled itself, not ones an admin made
-const heartbeat = tool({
+// separate from heartbeat, so that one's name can be required: listing is the only thing that doesn't need one
+const listHeartbeats = tool({
+  description: 'List this server\'s heartbeats: prompts you\'re given on a schedule, with their schedule, prompt, and whether you made them.',
+  inputSchema: zod.object({}),
+  contextSchema: replyContextSchema,
+  execute: async (_input: Record<string, never>, { context }: { context: ReplyContext }): Promise<{ result: 'success', heartbeats: { name: string, schedule: string, repeats: boolean, silent: boolean, channel_id: string, prompt: string, context?: string, made_by_you: boolean }[], message: string }> => {
+    const botID = discordClient.user!.id;
+    // from the bot, so it can only see this server's heartbeats
+    const heartbeats = getHeartbeatsByServer(context.server_id).map((hb) => ({
+      name: hb.heartbeat_name, schedule: hb.cron_schedule, repeats: !!hb.repeats, silent: !!hb.silent, channel_id: hb.channel_id, prompt: hb.prompt, context: hb.context ?? undefined, made_by_you: hb.created_by === botID,
+    }));
+    return { result: 'success', heartbeats, message: heartbeats.length === 0 ? 'There are no heartbeats in this server.' : `Found ${heartbeats.length} heartbeats.` };
+  },
+});
+
+// what a schedule has to be for a heartbeat the bot makes. undefined if it's fine
+function heartbeatScheduleProblem(schedule: string): string | undefined {
+  if (!cron.validate(schedule)) return `Cron schedule is invalid: ${schedule}.`;
+  if (!isAtMostHourly(schedule)) return 'Heartbeats can run at most hourly: the minute must be a fixed number, not * or a range.';
+  return undefined;
+}
+
+// a heartbeat the bot can change: one it made itself. returns why not instead, worded to give to the model as-is
+function ownHeartbeat(serverID: Snowflake, name: string): HeartbeatTable | string {
+  const existing = getHeartbeat(serverID, name);
+  if (!existing) return `There's no heartbeat named "${name}". Use list_heartbeats to see them.`;
+  if (existing.created_by !== discordClient.user!.id) return `"${existing.heartbeat_name}" was made by an admin, so only they can change it, with /heartbeat.`;
+  return existing;
+}
+
+const HEARTBEAT_PROMPT_DESCRIPTION = 'What you\'ll be told when it runs. Write it as a note to your future self, with everything you\'ll need. Refs like [@2] won\'t mean anything by then, so use names and ids';
+const HEARTBEAT_CONTEXT_DESCRIPTION = 'Background you\'ll be shown with the prompt, e.g. what was said that it\'s following up on. You won\'t see the channel unless you fetch it';
+
+// create, edit, and delete are separate tools, rather than one with an action, so each one's required fields are actually required
+const createHeartbeat = tool({
   description: 'Schedule a heartbeat: a prompt you\'ll be given on a cron schedule, in this channel, so you can post on your own later (e.g. check back on something, or a daily check-in). '
-    + `Actions: "list" this server's heartbeats, "create" one, "edit" one, or "delete" one. You can only edit or delete ones you made, and have at most ${MAX_BOT_HEARTBEATS}. `
-    + 'Schedules are cron, at most hourly (the minute must be a fixed number). Set repeats to false for one that runs once, then deletes itself. '
+    + `You can have at most ${MAX_BOT_HEARTBEATS}. Schedules are cron, at most hourly (the minute must be a fixed number). `
     + 'Set silent to true for one whose reply is never posted, for when it only needs to use tools (e.g. browsing Bluesky). It can still send_message if something\'s worth saying.',
   inputExamples: [
-    { input: { action: 'create', name: 'Check exam results', prompt: 'Sam (user id 1087654321098765432) gets their exam results today. Ping them with <@1087654321098765432> and ask how it went.', schedule: '0 17 21 10 *', repeats: false } },
-    { input: { action: 'create', name: 'Morning check-in', prompt: 'Post a short good morning, and mention any reminders due today.', schedule: '0 9 * * *', repeats: true } },
-    { input: { action: 'create', name: 'Bluesky', prompt: 'Check your Bluesky notifications and timeline, and reply to or like anything you want to.', schedule: '0 * * * *', repeats: true, silent: true } },
-    { input: { action: 'list' } },
+    { input: { name: 'Check exam results', prompt: 'Sam (user id 1087654321098765432) gets their exam results today. Ping them with <@1087654321098765432> and ask how it went.', schedule: '0 17 21 10 *', repeats: false } },
+    { input: { name: 'Morning check-in', prompt: 'Post a short good morning, and mention any reminders due today.', schedule: '0 9 * * *', repeats: true } },
+    { input: { name: 'Bluesky', prompt: 'Check your Bluesky notifications and timeline, and reply to or like anything you want to.', schedule: '0 * * * *', repeats: true, silent: true } },
   ],
   inputSchema: zod.object({
-    action: zod.enum(['list', 'create', 'edit', 'delete']),
-    name: zod.string().optional().describe('Name of the heartbeat. Needed for every action except list. Not case-sensitive'),
-    prompt: zod.string().optional().describe('For create and edit: what you\'ll be told when it runs. Write it as a note to your future self, with everything you\'ll need. Refs like [@2] won\'t mean anything by then, so use names and ids'),
-    context: zod.string().optional().describe('For create and edit: background you\'ll be shown with the prompt, e.g. what was said that it\'s following up on. You won\'t see the channel unless you fetch it'),
-    schedule: zod.string().optional().describe('For create and edit: cron schedule it runs on. Hour is 0-23'),
-    repeats: zod.boolean().optional().describe('For create and edit: whether it keeps running on the schedule (true), or runs once then deletes itself (false). Defaults to false'),
-    silent: zod.boolean().optional().describe('For create and edit: whether its reply is never posted (true), or posted in this channel (false). Defaults to false'),
+    name: zod.string().describe('Name of the heartbeat, at most 40 characters. Not case-sensitive'),
+    prompt: zod.string().describe(HEARTBEAT_PROMPT_DESCRIPTION),
+    schedule: zod.string().describe('Cron schedule it runs on. Hour is 0-23'),
+    repeats: zod.boolean().describe('Whether it keeps running on the schedule (true), or runs once then deletes itself (false)'),
+    context: zod.string().optional().describe(HEARTBEAT_CONTEXT_DESCRIPTION),
+    silent: zod.boolean().optional().describe('Whether its reply is never posted (true), or posted in this channel (false). Defaults to false'),
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { action: 'list' | 'create' | 'edit' | 'delete', name?: string, prompt?: string, context?: string, schedule?: string, repeats?: boolean, silent?: boolean }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', heartbeats?: { name: string, schedule: string, repeats: boolean, silent: boolean, channel_id: string, prompt: string, context?: string, made_by_you: boolean }[], message: string }> => {
+  execute: async (input: { name: string, prompt: string, schedule: string, repeats: boolean, context?: string, silent?: boolean }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
     const serverID = context.server_id; // from the bot, so it can only touch this server's heartbeats
     const botID = discordClient.user!.id;
 
-    if (input.action === 'list') {
-      const heartbeats = getHeartbeatsByServer(serverID).map((hb) => ({
-        name: hb.heartbeat_name, schedule: hb.cron_schedule, repeats: !!hb.repeats, silent: !!hb.silent, channel_id: hb.channel_id, prompt: hb.prompt, context: hb.context ?? undefined, made_by_you: hb.created_by === botID,
-      }));
-      return { result: 'success', heartbeats, message: heartbeats.length === 0 ? 'There are no heartbeats in this server.' : `Found ${heartbeats.length} heartbeats.` };
+    const name = input.name?.trim();
+    if (!name) return { result: 'failure', message: 'A name is needed to create a heartbeat.' };
+    if (name.length > 40) return { result: 'failure', message: 'Heartbeat names can be at most 40 characters.' };
+    if (!input.prompt?.trim() || !input.schedule?.trim()) return { result: 'failure', message: 'A prompt and a schedule are needed to create a heartbeat.' };
+    const scheduleProblem = heartbeatScheduleProblem(input.schedule);
+    if (scheduleProblem) return { result: 'failure', message: scheduleProblem };
+
+    const existing = getHeartbeat(serverID, name);
+    if (existing) return { result: 'failure', message: `There's already a heartbeat named "${existing.heartbeat_name}".` };
+    if (getHeartbeatsByServer(serverID).filter((hb) => hb.created_by === botID).length >= MAX_BOT_HEARTBEATS) {
+      return { result: 'failure', message: `You already have ${MAX_BOT_HEARTBEATS} heartbeats in this server. Delete one first.` };
     }
 
-    if (!input.name) return { result: 'failure', message: `A name is needed to ${input.action} a heartbeat.` };
-    const existing = getHeartbeat(serverID, input.name);
+    const created = { server_id: serverID, heartbeat_name: name, channel_id: context.channel_id, created_by: botID, repeats: !!input.repeats, silent: input.silent ?? false, cron_schedule: input.schedule, prompt: input.prompt, context: input.context };
+    insertHeartbeat(created);
+    scheduleHeartbeat(created);
+    return { result: 'success', message: `Scheduled heartbeat "${name}" (${input.schedule}${created.repeats ? ', repeating' : ', once'}${created.silent ? ', silent' : ''}).` };
+  },
+});
 
+const editHeartbeat = tool({
+  description: 'Change a heartbeat you made: its prompt, background, schedule, whether it repeats, or whether it\'s silent. Only what you give is changed. To see them, use list_heartbeats.',
+  inputExamples: [
+    { input: { name: 'Morning check-in', schedule: '0 8 * * *' } },
+    { input: { name: 'Bluesky', silent: false } },
+  ],
+  inputSchema: zod.object({
+    name: zod.string().describe('Name of the heartbeat to change. Not case-sensitive'),
+    prompt: zod.string().optional().describe(`New prompt. ${HEARTBEAT_PROMPT_DESCRIPTION}`),
+    context: zod.string().optional().describe(`New background. ${HEARTBEAT_CONTEXT_DESCRIPTION}`),
+    schedule: zod.string().optional().describe('New cron schedule. Hour is 0-23'),
+    repeats: zod.boolean().optional().describe('Whether it keeps running on the schedule (true), or runs once then deletes itself (false)'),
+    silent: zod.boolean().optional().describe('Whether its reply is never posted (true), or posted in this channel (false)'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { name: string, prompt?: string, context?: string, schedule?: string, repeats?: boolean, silent?: boolean }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
+    if (!input.name?.trim()) return { result: 'failure', message: 'A name is needed to edit a heartbeat.' };
+    const existing = ownHeartbeat(context.server_id, input.name.trim()); // from the bot, so it can only touch this server's heartbeats
+    if (typeof existing === 'string') return { result: 'failure', message: existing };
+
+    if (input.prompt === undefined && input.context === undefined && input.schedule === undefined && input.repeats === undefined && input.silent === undefined) {
+      return { result: 'failure', message: 'Give a new prompt, context, schedule, repeats, or silent to edit.' };
+    }
     if (input.schedule !== undefined) {
-      if (!cron.validate(input.schedule)) return { result: 'failure', message: `Cron schedule is invalid: ${input.schedule}.` };
-      if (!isAtMostHourly(input.schedule)) return { result: 'failure', message: 'Heartbeats can run at most hourly: the minute must be a fixed number, not * or a range.' };
+      const scheduleProblem = heartbeatScheduleProblem(input.schedule);
+      if (scheduleProblem) return { result: 'failure', message: scheduleProblem };
     }
 
-    if (input.action === 'create') {
-      if (existing) return { result: 'failure', message: `There's already a heartbeat named "${existing.heartbeat_name}".` };
-      if (input.name.length > 40) return { result: 'failure', message: 'Heartbeat names can be at most 40 characters.' };
-      if (!input.prompt || !input.schedule) return { result: 'failure', message: 'A prompt and a schedule are needed to create a heartbeat.' };
-      if (getHeartbeatsByServer(serverID).filter((hb) => hb.created_by === botID).length >= MAX_BOT_HEARTBEATS) {
-        return { result: 'failure', message: `You already have ${MAX_BOT_HEARTBEATS} heartbeats in this server. Delete one first.` };
-      }
+    const edited = {
+      ...existing,
+      prompt: input.prompt ?? existing.prompt,
+      context: input.context ?? existing.context,
+      cron_schedule: input.schedule ?? existing.cron_schedule,
+      repeats: input.repeats ?? !!existing.repeats,
+      silent: input.silent ?? !!existing.silent,
+    };
+    updateHeartbeat(edited);
+    scheduleHeartbeat(edited);
+    return { result: 'success', message: `Edited heartbeat "${existing.heartbeat_name}".` };
+  },
+});
 
-      const created = { server_id: serverID, heartbeat_name: input.name, channel_id: context.channel_id, created_by: botID, repeats: input.repeats ?? false, silent: input.silent ?? false, cron_schedule: input.schedule, prompt: input.prompt, context: input.context };
-      insertHeartbeat(created);
-      scheduleHeartbeat(created);
-      return { result: 'success', message: `Scheduled heartbeat "${input.name}" (${input.schedule}${created.repeats ? ', repeating' : ', once'}${created.silent ? ', silent' : ''}).` };
-    }
-
-    // every other action needs a heartbeat this bot made
-    if (!existing) return { result: 'failure', message: `There's no heartbeat named "${input.name}". Use the list action to see them.` };
-    if (existing.created_by !== botID) return { result: 'failure', message: `"${existing.heartbeat_name}" was made by an admin, so only they can change it, with /heartbeat.` };
-
-    if (input.action === 'edit') {
-      if (input.prompt === undefined && input.context === undefined && input.schedule === undefined && input.repeats === undefined && input.silent === undefined) {
-        return { result: 'failure', message: 'Give a new prompt, context, schedule, repeats, or silent to edit.' };
-      }
-
-      const edited = {
-        ...existing,
-        prompt: input.prompt ?? existing.prompt,
-        context: input.context ?? existing.context,
-        cron_schedule: input.schedule ?? existing.cron_schedule,
-        repeats: input.repeats ?? !!existing.repeats,
-        silent: input.silent ?? !!existing.silent,
-      };
-      updateHeartbeat(edited);
-      scheduleHeartbeat(edited);
-      return { result: 'success', message: `Edited heartbeat "${existing.heartbeat_name}".` };
-    }
+const deleteHeartbeat = tool({
+  description: 'Delete a heartbeat you made, so it stops running. To see them, use list_heartbeats.',
+  inputExamples: [
+    { input: { name: 'Morning check-in' } },
+  ],
+  inputSchema: zod.object({
+    name: zod.string().describe('Name of the heartbeat to delete. Not case-sensitive'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { name: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
+    if (!input.name?.trim()) return { result: 'failure', message: 'A name is needed to delete a heartbeat.' };
+    const existing = ownHeartbeat(context.server_id, input.name.trim()); // from the bot, so it can only touch this server's heartbeats
+    if (typeof existing === 'string') return { result: 'failure', message: existing };
 
     removeHeartbeat(existing);
     return { result: 'success', message: `Deleted heartbeat "${existing.heartbeat_name}".` };
@@ -2313,7 +2435,7 @@ const runCommand = tool({
   contextSchema: replyContextSchema,
   execute: async (input: { command: string, timeout?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', exit_code?: number, stdout?: string, stderr?: string, truncated?: boolean, message: string }> => {
     // only offered to attached servers, but checked here too, so a made-up tool call can't get around it
-    if (!isAttached(context.server_id)) return { result: 'failure', message: DETACHED_MESSAGE };
+    if (!isAttached(context.server_id) && !context.dm) return { result: 'failure', message: DETACHED_MESSAGE }; // a DM with the bot's owner always can
 
     try {
       const { exit_code, stdout, stderr, timed_out, truncated } = await sandboxExec(input.command, { timeout: input.timeout });
@@ -2343,7 +2465,7 @@ const writeFile = tool({
   }),
   contextSchema: replyContextSchema,
   execute: async (input: { path: string, content: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
-    if (!isAttached(context.server_id)) return { result: 'failure', message: DETACHED_MESSAGE };
+    if (!isAttached(context.server_id) && !context.dm) return { result: 'failure', message: DETACHED_MESSAGE }; // a DM with the bot's owner always can
 
     try {
       // the path goes in as a variable and the content through stdin, so neither is ever parsed as bash
@@ -2357,4 +2479,4 @@ const writeFile = tool({
   },
 });
 
-export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, counter, heartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };
+export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };

@@ -116,6 +116,183 @@ function rejectModal(submit: ModalSubmitInteraction, message: string, draft?: st
 const SCHEDULE_DESCRIPTION = 'Cron (e.g. 0 9 * * * for 9am daily), or a Discord timestamp like <t:1767225600:f>';
 const INVALID_SCHEDULE_MESSAGE = 'That schedule isn\'t a valid cron schedule or Discord timestamp!';
 
+// ==================== chatbot settings ====================
+// shared by /chatbot in servers and the commands of the same name in a DM with the bot's owner (dmCommands.ts), which use the same option names.
+// a DM's server id is its owner's user id
+
+const NO_CHATBOT_MESSAGE = 'There is no chatbot here! Try making one with /chatbot create';
+
+// option "query": a model id, filled in by modelChoices
+async function setModel(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+  const chatbot = getChatbot(serverID);
+  if (!chatbot) {
+    interaction.reply({ content: NO_CHATBOT_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // autocomplete fills in the exact id. checked against OpenRouter, so a typo can't leave the bot on a model that doesn't exist
+  const query = interaction.options.getString('query')!;
+  const model = findModel(query);
+  if (!model) {
+    interaction.reply({ content: `There's no model with the ID \`${query}\` on OpenRouter. Pick one from the suggestions as you type!`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  chatbot.model = model.id === DEFAULT_MODEL ? undefined : model.id; // the default is stored as empty, so it follows DEFAULT_MODEL if that changes
+  upsertChatbot(chatbot);
+
+  const hasTools = supportsTools(model.id);
+  // efforts differ between models, so say if the current one won't do anything here
+  const effort = chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT;
+  const efforts = getSupportedEfforts(model.id);
+  const effortNote = efforts.length === 0 ? 'This model doesn\'t reason, so the reasoning effort is ignored.'
+    : !efforts.includes(effort) ? `This model doesn't support the current \`${effort}\` reasoning effort. It supports ${efforts.join(', ')}.`
+      : '';
+
+  interaction.reply({
+    content: `Switched to **${model.name}** (\`${model.id}\`)\n`
+      + `-# ${formatPricing(model)} tokens · ${model.context_length.toLocaleString()} token context · tools ${hasTools ? 'supported' : 'not supported, so they\'ll be off while this model is in use'}`
+      + (effortNote ? `\n${effortNote}` : ''),
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+// option "query": an effort level, filled in by effortChoices
+async function setReasoningEffort(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+  const chatbot = getChatbot(serverID);
+  if (!chatbot) {
+    interaction.reply({ content: NO_CHATBOT_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const effort = interaction.options.getString('query')!.toLowerCase();
+  const modelID = chatbot.model ?? DEFAULT_MODEL;
+  const efforts = getSupportedEfforts(modelID);
+  if (efforts.length === 0) {
+    interaction.reply({ content: `\`${modelID}\` doesn't reason, so there's no effort to set. Try a different model!`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!efforts.includes(effort)) {
+    interaction.reply({ content: `\`${modelID}\` doesn't support \`${effort}\`. It supports: ${efforts.join(', ')}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  chatbot.reasoning_effort = effort === DEFAULT_REASONING_EFFORT ? undefined : effort; // the default is stored as empty, like the model
+  upsertChatbot(chatbot);
+  interaction.reply({ content: `Reasoning effort set to **${effort}**!`, flags: MessageFlags.Ephemeral });
+}
+
+// option "value": a number from 0 to MAX_TEMPERATURE, or blank to reset
+async function setTemperature(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+  const chatbot = getChatbot(serverID);
+  if (!chatbot) {
+    interaction.reply({ content: NO_CHATBOT_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // blank resets it. the default is stored as empty, like the model, so it follows DEFAULT_TEMPERATURE if that changes
+  const value = interaction.options.getNumber('value');
+  chatbot.temperature = value === null || value === DEFAULT_TEMPERATURE ? undefined : value;
+  upsertChatbot(chatbot);
+
+  // some models ignore it, so say so rather than let it seem to do nothing
+  const modelID = chatbot.model ?? DEFAULT_MODEL;
+  const max = maxTemperature(modelID);
+  const note = !supportsTemperature(modelID) ? `\n-# \`${modelID}\` ignores temperature, so this won't change anything until you switch to a model that uses it.`
+    : (chatbot.temperature ?? DEFAULT_TEMPERATURE) > max ? `\n-# \`${modelID}\` only goes up to ${max}, so it'll use ${max} while this model is in use.`
+      : '';
+  interaction.reply({ content: `Temperature set to **${chatbot.temperature ?? `${DEFAULT_TEMPERATURE} (default)`}**!${note}`, flags: MessageFlags.Ephemeral });
+}
+
+// option "enable": whether tools are on
+async function setTools(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+  const enabledOption = interaction.options.getBoolean('enable')!;
+  const chatbot = getChatbot(serverID);
+  if (!chatbot) {
+    interaction.reply({ content: NO_CHATBOT_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (enabledOption === chatbot.tools_enabled) {
+    interaction.reply({ content: `Tools are already ${enabledOption ? 'enabled' : 'disabled'} here!`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  chatbot.tools_enabled = enabledOption;
+  upsertChatbot(chatbot);
+  interaction.reply({ content: `Tools ${enabledOption ? 'enabled' : 'disabled'}!`, flags: MessageFlags.Ephemeral });
+}
+
+/**
+ * Sets the persona (layered on top of the system prompt), or the system prompt override (replacing SYSTEM.md), in a modal.
+ * The override starts from the current system prompt, so it can be tweaked rather than written from scratch
+ */
+async function setPrompt(interaction: ChatInputCommandInteraction, serverID: Snowflake, kind: 'persona' | 'system-prompt'): Promise<void> {
+  const chatbot = getChatbot(serverID);
+  if (!chatbot) {
+    interaction.reply({ content: NO_CHATBOT_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const isPersona = kind === 'persona';
+  const promptName = isPersona ? 'persona' : 'system prompt override';
+  const promptModal = new ModalBuilder().setTitle(isPersona ? 'Set Persona' : 'Override System Prompt');
+
+  const currentPrompt = isPersona ? chatbot.chatbot_prompt : getSystemPrompt(chatbot);
+  const note = overflowNote(currentPrompt, isPersona ? 'persona' : 'system prompt');
+  if (note) promptModal.addTextDisplayComponents(note);
+  promptModal.addLabelComponents(isPersona
+    ? textField('prompt', 'Persona', {
+      paragraph: true,
+      value: currentPrompt,
+      required: false,
+      placeholder: 'e.g. You\'re a laid-back pirate who loves puns, and calls everyone "matey".',
+      description: 'Who the chatbot is here, added on top of the system prompt. Empty for none',
+    })
+    : textField('prompt', 'System prompt', {
+      paragraph: true,
+      value: currentPrompt,
+      required: false,
+      description: 'Replaces SYSTEM.md here. Empty to go back to SYSTEM.md',
+    }));
+
+  const submit = await askModal(interaction, promptModal);
+  if (!submit) return;
+
+  const newPrompt = submit.fields.getTextInputValue('prompt').trim();
+  if (isPersona) chatbot.chatbot_prompt = newPrompt;
+  else chatbot.system_prompt_override = newPrompt || undefined;
+  upsertChatbot(chatbot);
+
+  const result = newPrompt ? `updated ${promptName}` : `cleared ${promptName}${isPersona ? '' : ', so SYSTEM.md is used again'}`;
+  submit.reply({ content: `Successfully ${result}!`, flags: MessageFlags.Ephemeral });
+}
+
+// models matching what's typed, by id or name. ids starting with it come first, e.g. "anthropic/" lists anthropic's models
+async function modelChoices(interaction: AutocompleteInteraction): Promise<void> {
+  const focusedValue = interaction.options.getFocused().toLowerCase();
+  const matches = getModels()
+    .filter((model) => model.id.toLowerCase().includes(focusedValue) || model.name.toLowerCase().includes(focusedValue))
+    .sort((a, b) => Number(b.id.toLowerCase().startsWith(focusedValue)) - Number(a.id.toLowerCase().startsWith(focusedValue)))
+    .slice(0, 25);
+
+  await interaction.respond(matches.map((model) => ({
+    name: `${model.name} · tools ${supportsTools(model.id) ? '✓' : '✗'} · ${formatPricing(model)}`.substring(0, 100),
+    value: model.id.substring(0, 100),
+  })));
+}
+
+// only the effort levels the current model supports, marking its own default
+async function effortChoices(interaction: AutocompleteInteraction, serverID: Snowflake): Promise<void> {
+  const focusedValue = interaction.options.getFocused().toLowerCase();
+  const modelID = getChatbot(serverID)?.model ?? DEFAULT_MODEL;
+  const modelDefault = findModel(modelID)?.reasoning?.default_effort;
+
+  await interaction.respond(getSupportedEfforts(modelID)
+    .filter((effort) => effort.includes(focusedValue))
+    .map((effort) => ({ name: effort === modelDefault ? `${effort} (model's default)` : effort, value: effort })));
+}
+
 const ChatbotCommand: ConfigCommand = {
   data: new SlashCommandBuilder()
     .setName('chatbot').setDescription('Chatbot for the server.').setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -460,37 +637,7 @@ const ChatbotCommand: ConfigCommand = {
       const promptName = isPersona ? 'persona' : 'system prompt override';
 
       if (subcommand === 'set') {
-        const promptModal = new ModalBuilder().setTitle(isPersona ? 'Set Persona' : 'Override System Prompt');
-
-        // an override starts from the current system prompt, so it can be tweaked rather than written from scratch
-        const currentPrompt = isPersona ? chatbot.chatbot_prompt : getSystemPrompt(chatbot);
-        const note = overflowNote(currentPrompt, isPersona ? 'persona' : 'system prompt');
-        if (note) promptModal.addTextDisplayComponents(note);
-        promptModal.addLabelComponents(isPersona
-          ? textField('prompt', 'Persona', {
-            paragraph: true,
-            value: currentPrompt,
-            required: false,
-            placeholder: 'e.g. You\'re a laid-back pirate who loves puns, and calls everyone "matey".',
-            description: 'Who the chatbot is in this server, added on top of the system prompt. Empty for none',
-          })
-          : textField('prompt', 'System prompt', {
-            paragraph: true,
-            value: currentPrompt,
-            required: false,
-            description: 'Replaces SYSTEM.md in this server. Empty to go back to SYSTEM.md',
-          }));
-
-        const submit = await askModal(interaction, promptModal);
-        if (!submit) return;
-
-        const newPrompt = submit.fields.getTextInputValue('prompt').trim();
-        if (isPersona) chatbot.chatbot_prompt = newPrompt;
-        else chatbot.system_prompt_override = newPrompt || undefined;
-        upsertChatbot(chatbot);
-
-        const result = newPrompt ? `updated ${promptName}` : `cleared ${promptName}${isPersona ? '' : ', so SYSTEM.md is used again'}`;
-        submit.reply({ content: `Successfully ${result}!`, flags: MessageFlags.Ephemeral });
+        await setPrompt(interaction, serverID, isPersona ? 'persona' : 'system-prompt');
         return;
       }
       if (subcommand === 'delete') {
@@ -503,82 +650,15 @@ const ChatbotCommand: ConfigCommand = {
       }
     }
     if (subcommand === 'model') {
-      const chatbot = getChatbot(serverID);
-      if (!chatbot) {
-        interaction.reply({ content: 'There is no chatbot in this server! Try making one with /chatbot create', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      // autocomplete fills in the exact id. checked against OpenRouter, so a typo can't leave the bot on a model that doesn't exist
-      const query = interaction.options.getString('query')!;
-      const model = findModel(query);
-      if (!model) {
-        interaction.reply({ content: `There's no model with the ID \`${query}\` on OpenRouter. Pick one from the suggestions as you type!`, flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      chatbot.model = model.id === DEFAULT_MODEL ? undefined : model.id; // the default is stored as empty, so it follows DEFAULT_MODEL if that changes
-      upsertChatbot(chatbot);
-
-      const hasTools = supportsTools(model.id);
-      // efforts differ between models, so say if the current one won't do anything here
-      const effort = chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT;
-      const efforts = getSupportedEfforts(model.id);
-      const effortNote = efforts.length === 0 ? 'This model doesn\'t reason, so the reasoning effort is ignored.'
-        : !efforts.includes(effort) ? `This model doesn't support the current \`${effort}\` reasoning effort. Try /chatbot reasoning-effort: it supports ${efforts.join(', ')}.`
-          : '';
-
-      interaction.reply({
-        content: `Switched to **${model.name}** (\`${model.id}\`)\n`
-          + `-# ${formatPricing(model)} tokens · ${model.context_length.toLocaleString()} token context · tools ${hasTools ? 'supported' : 'not supported, so they\'ll be off while this model is in use'}`
-          + (effortNote ? `\n${effortNote}` : ''),
-        flags: MessageFlags.Ephemeral,
-      });
+      await setModel(interaction, serverID);
       return;
     }
     if (subcommand === 'reasoning-effort') {
-      const chatbot = getChatbot(serverID);
-      if (!chatbot) {
-        interaction.reply({ content: 'There is no chatbot in this server! Try making one with /chatbot create', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      const effort = interaction.options.getString('query')!.toLowerCase();
-      const modelID = chatbot.model ?? DEFAULT_MODEL;
-      const efforts = getSupportedEfforts(modelID);
-      if (efforts.length === 0) {
-        interaction.reply({ content: `\`${modelID}\` doesn't reason, so there's no effort to set. Try a different model with /chatbot model!`, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (!efforts.includes(effort)) {
-        interaction.reply({ content: `\`${modelID}\` doesn't support \`${effort}\`. It supports: ${efforts.join(', ')}`, flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      chatbot.reasoning_effort = effort === DEFAULT_REASONING_EFFORT ? undefined : effort; // the default is stored as empty, like the model
-      upsertChatbot(chatbot);
-      interaction.reply({ content: `Reasoning effort set to **${effort}**!`, flags: MessageFlags.Ephemeral });
+      await setReasoningEffort(interaction, serverID);
       return;
     }
     if (subcommand === 'temperature') {
-      const chatbot = getChatbot(serverID);
-      if (!chatbot) {
-        interaction.reply({ content: 'There is no chatbot in this server! Try making one with /chatbot create', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      // blank resets it. the default is stored as empty, like the model, so it follows DEFAULT_TEMPERATURE if that changes
-      const value = interaction.options.getNumber('value');
-      chatbot.temperature = value === null || value === DEFAULT_TEMPERATURE ? undefined : value;
-      upsertChatbot(chatbot);
-
-      // some models ignore it, so say so rather than let it seem to do nothing
-      const modelID = chatbot.model ?? DEFAULT_MODEL;
-      const max = maxTemperature(modelID);
-      const note = !supportsTemperature(modelID) ? `\n-# \`${modelID}\` ignores temperature, so this won't change anything until you switch to a model that uses it.`
-        : (chatbot.temperature ?? DEFAULT_TEMPERATURE) > max ? `\n-# \`${modelID}\` only goes up to ${max}, so it'll use ${max} while this model is in use.`
-          : '';
-      interaction.reply({ content: `Temperature set to **${chatbot.temperature ?? `${DEFAULT_TEMPERATURE} (default)`}**!${note}`, flags: MessageFlags.Ephemeral });
+      await setTemperature(interaction, serverID);
       return;
     }
     if (subcommand === 'detach') {
@@ -639,26 +719,7 @@ const ChatbotCommand: ConfigCommand = {
       return;
     }
     if (subcommand === 'tools') {
-      const enabledOption = interaction.options.getBoolean('enable')!;
-      const chatbot = getChatbot(serverID);
-
-      if (!chatbot) {
-        interaction.reply({ content: 'There is no chatbot in this server! Try making one with /chatbot create', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      if (enabledOption && chatbot.tools_enabled) {
-        interaction.reply({ content: 'Tools are already enabled in this server!', flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (!enabledOption && !chatbot.tools_enabled) {
-        interaction.reply({ content: 'Tools are already disabled in this server!', flags: MessageFlags.Ephemeral });
-        return;
-      }
-
-      chatbot.tools_enabled = enabledOption;
-      upsertChatbot(chatbot);
-      interaction.reply({ content: 'Successfully updated the chatbot!', flags: MessageFlags.Ephemeral });
+      await setTools(interaction, serverID);
       return;
     }
     if (subcommand === 'create') {
@@ -714,26 +775,11 @@ const ChatbotCommand: ConfigCommand = {
     const focusedValue = interaction.options.getFocused().toLowerCase();
 
     if (interaction.options.getSubcommand() === 'model') {
-      // matches on the id or name. ids starting with the query come first, e.g. "anthropic/" lists anthropic's models
-      const matches = getModels()
-        .filter((model) => model.id.toLowerCase().includes(focusedValue) || model.name.toLowerCase().includes(focusedValue))
-        .sort((a, b) => Number(b.id.toLowerCase().startsWith(focusedValue)) - Number(a.id.toLowerCase().startsWith(focusedValue)))
-        .slice(0, 25);
-
-      await interaction.respond(matches.map((model) => ({
-        name: `${model.name} · tools ${supportsTools(model.id) ? '✓' : '✗'} · ${formatPricing(model)}`.substring(0, 100),
-        value: model.id.substring(0, 100),
-      })));
+      await modelChoices(interaction);
       return;
     }
     if (interaction.options.getSubcommand() === 'reasoning-effort') {
-      // only the levels the current model supports, marking its own default
-      const modelID = getChatbot(serverID)?.model ?? DEFAULT_MODEL;
-      const modelDefault = findModel(modelID)?.reasoning?.default_effort;
-
-      await interaction.respond(getSupportedEfforts(modelID)
-        .filter((effort) => effort.includes(focusedValue))
-        .map((effort) => ({ name: effort === modelDefault ? `${effort} (model's default)` : effort, value: effort })));
+      await effortChoices(interaction, serverID);
       return;
     }
 
@@ -1818,4 +1864,5 @@ commandMap.set(ReminderCommand.data.name, ReminderCommand);
 commandMap.set(HeartbeatCommand.data.name, HeartbeatCommand);
 commandMap.set(CounterCommand.data.name, CounterCommand);
 
+export { setModel, setReasoningEffort, setTemperature, setTools, setPrompt, modelChoices, effortChoices };
 export { commandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, HeartbeatCommand, CounterCommand, HeartboardCommand, VoicePingCommand };
