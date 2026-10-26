@@ -4,7 +4,7 @@ import { Message } from 'discord.js';
 
 import { anthropicClient } from '..';
 
-const CAPTION_MODEL = 'z-ai/glm-5.3-flash';
+const CAPTION_MODEL = 'deepseek/deepseek-v4.1-flash-1017';
 const MAX_IMAGES = 4; // per message. any more are ignored
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB, the most an image block allows
 const SUPPORTED_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
