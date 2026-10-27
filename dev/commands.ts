@@ -27,7 +27,7 @@ import { removeHeartbeat, scheduleHeartbeat } from './chatbot/heartbeat';
 import { getEmbedding, getSystemPrompt } from './chatbot/chatbot';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
-import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, findModel, formatPricing, getModels, getSupportedEfforts, maxTemperature, supportsTemperature, supportsTools } from './chatbot/models';
+import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, findModel, formatPricing, getModels, getSupportedEfforts, maxTemperature, supportsImages, supportsTemperature, supportsTools } from './chatbot/models';
 import { inputToSchedule, sendReminder } from './utils';
 
 const commandMap: Map<string, Command> = new Map();
@@ -277,7 +277,7 @@ async function modelChoices(interaction: AutocompleteInteraction): Promise<void>
     .slice(0, 25);
 
   await interaction.respond(matches.map((model) => ({
-    name: `${model.name} · tools ${supportsTools(model.id) ? '✓' : '✗'} · ${formatPricing(model)}`.substring(0, 100),
+    name: `${model.name} · tools ${supportsTools(model.id) ? '✓' : '✗'} · vision ${supportsImages(model.id) ? '✓' : '✗'} · ${formatPricing(model)}`.substring(0, 100),
     value: model.id.substring(0, 100),
   })));
 }

@@ -1,6 +1,7 @@
 import { tool } from 'ai';
 import { z as zod } from 'zod';
 import cron from 'node-cron';
+import { Base64ImageSource } from '@anthropic-ai/sdk/resources';
 import { AnyThreadChannel, ChannelType, DMChannel, Embed, Guild, GuildBasedChannel, GuildMember, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
 
 import { discordClient } from '..';
@@ -11,7 +12,7 @@ import { chatbotMentions, formatReactions, formatResponse } from './chatbot';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './context';
 import { MAX_BOT_HEARTBEATS, removeHeartbeat, scheduleHeartbeat } from './heartbeat';
 import { MAX_TIMEOUT, sandboxExec } from './sandbox';
-import { captionImage } from './vision';
+import { captionImage, fetchImage } from './vision';
 import { fromSummarySource, getVisibleSummaries } from './conversation';
 import { fetchServerChannel } from './dm';
 
@@ -636,6 +637,30 @@ const captionImageTool = tool({
     try {
       const caption = await captionImage(input.url, input.question);
       return { result: 'success', caption, message: 'Captioned image.' };
+    } catch (error: any) {
+      return {
+        result: 'failure',
+        message: error?.name === 'TimeoutError' ? 'Fetching the image timed out after 15 seconds.' : String(error?.message ?? error),
+      };
+    }
+  },
+});
+
+// only offered to models with vision. the image goes back to the model as an image block, and is left out of the saved result
+const viewImageTool = tool({
+  description: 'Look at an image at a URL yourself. It\'s attached to the result, so you see the image itself rather than a description of it. '
+    + 'Use it on images you find mid-response (e.g. from a web search or a fetched page), or to look again at an older image in the conversation, which are shown as "(url) [image: caption]". '
+    + 'Only works on JPEG, PNG, GIF, and WebP images up to 5MB.',
+  inputExamples: [
+    { input: { url: 'https://example.com/images/chart.png' } },
+  ],
+  inputSchema: zod.object({
+    url: zod.string().describe('Full URL of the image, including https://'),
+  }),
+  execute: async (input: { url: string }): Promise<{ result: 'success' | 'failure', message: string, image?: Base64ImageSource }> => {
+    try {
+      const image = await fetchImage(input.url);
+      return { result: 'success', message: 'The image is attached.', image };
     } catch (error: any) {
       return {
         result: 'failure',
@@ -2479,4 +2504,4 @@ const writeFile = tool({
   },
 });
 
-export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };
+export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };

@@ -5,20 +5,20 @@ import cron from 'node-cron';
 import { z as zod } from 'zod';
 import { Anthropic } from '@anthropic-ai/sdk';
 
-import { MessageParam, OutputConfig, ServerToolUseBlock, ToolResultBlockParam, ToolUnion, ToolUseBlock } from '@anthropic-ai/sdk/resources';
+import { ContentBlockParam, MessageParam, OutputConfig, ServerToolUseBlock, ToolResultBlockParam, ToolUnion, ToolUseBlock } from '@anthropic-ai/sdk/resources';
 
 import { existsSync, readFileSync } from 'fs';
 
-import { getChatbot, getConversationByChannel, getConversationMessages, getConversationTokenCount, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, getSubscribersAmong, insertConversationMessage, insertConversationToolResult, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
+import { getChatbot, getConversationByChannel, getConversationMessages, getConversationTokenCount, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, getSubscribersAmong, insertConversationMessage, insertConversationToolResult, updateConversationMessageContent, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
 import { ChatbotTable, ConversationMessageTable, ConversationTable, ConversationToolResultTable, HeartbeatTable } from '../types/schema';
 import { estimateTokens, millisToCronSchedule, safeFetch, splitPoint, trackFence } from '../utils';
 import { anthropicClient, discordClient, openAIClient } from '..';
 import { endConversation, getRelevantSummaries, getVisibleToolResults, summarizeConversation } from './conversation';
 import localTools from './tools';
 import { getVisibleMemories, isAttached, isShareable } from './context';
-import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, supportsTools, temperatureFor } from './models';
+import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, supportsImages, supportsTools, temperatureFor } from './models';
 import { isSandboxEnabled, readNotes } from './sandbox';
-import { withCaptions } from './vision';
+import { withCaptions, withImagePlaceholders, withImages } from './vision';
 import { isDMServer } from './dm';
 
 const promptPath = path.join(__dirname, '../../data/SYSTEM.md'); // two levels up: this file is in dev/chatbot/ (src/chatbot/ once built)
@@ -36,6 +36,7 @@ const MAX_PROMPT_TOOL_RESULTS = 10; // most recent tool results given back to th
 const MAX_PROMPT_TOOL_RESULT_LENGTH = 4000; // characters of each one. the full result stays in the database
 const MAX_CONVERSATION_TOKENS = 10_000; // ~125 messages. past this, the conversation is summarized and a new one starts
 const MESSAGE_BREAK_GAP = 60 * 60_000; // 1 hour. a longer silence between two messages is marked, so the model knows time has passed
+const MAX_IMAGE_MESSAGES = 8; // a model with vision sees the images in this many of the latest messages. older ones are given by their captions
 
 // shown as each channel's type in the index, so the model knows what it can do there (e.g. threads can't hold threads)
 const CHANNEL_TYPE_NAMES: Partial<Record<ChannelType, string>> = {
@@ -141,8 +142,9 @@ function formatElapsed(millis: number): string {
 /**
  * Given short term memories, return a formatted chatbot input
  * Resolves user, channel, and role mentions.
+ * With vision, the latest messages' images are attached, along with the out-of-context reference's
 */
-async function formatInput(guild: Guild | undefined, currentChannel: SendableChannels, conversation: ConversationTable, referenceMessage: ConversationMessageTable | undefined, toolList: ConversationToolResultTable[], convoContext: ConversationMessageTable[]): Promise<ModelMessage[]> {
+async function formatInput(guild: Guild | undefined, currentChannel: SendableChannels, conversation: ConversationTable, referenceMessage: ConversationMessageTable | undefined, toolList: ConversationToolResultTable[], convoContext: ConversationMessageTable[], vision: boolean): Promise<ModelMessage[]> {
   if (!convoContext) return [];
 
   const MENTION_RE = /<(?:@!?(\d{17,20})|#(\d{17,20})|@&(\d{17,20}))>/g; // 3 capture groups for users, channels, & role mentions respectively
@@ -283,6 +285,11 @@ async function formatInput(guild: Guild | undefined, currentChannel: SendableCha
   // reactions to the bot's own messages go in the index instead, since a tag in its own turns would invite it to write one
   const reactionsToBot: string[] = [];
 
+  // the bot's own messages are left out, since an assistant turn can't hold images
+  const imageMessages = vision ? [...new Set([...(outOfContextReference ? [stm[0]] : []), ...stm.slice(-MAX_IMAGE_MESSAGES)])]
+    .filter((msg) => msg.author_id !== discordClient.user!.id) : [];
+  const withImagesByID = new Map(await Promise.all(imageMessages.map(async (msg) => [msg.message_id, await withImages(msg.message_content)] as const)));
+
   // format the message to include message number, and reference message number
   const modelMessages: ModelMessage[] = stm.flatMap((msg, i): ModelMessage[] => {
     const messageShorthand = referenceMap.get(msg.message_id) ?? '[$unknown]';
@@ -298,10 +305,13 @@ async function formatInput(guild: Guild | undefined, currentChannel: SendableCha
       return [...messageBreak, { role: 'assistant', content: `${messageShorthand} ${msg.message_content}` }];
     }
 
-    return [...messageBreak, {
-      role: 'user',
-      content: `${messageShorthand} ${referenceMap.get(msg.reference_id ?? '') !== undefined ? `↪ ${referenceMap.get(msg.reference_id!)} ` : ''}${msg.author_name}: ${msg.message_content}${reactions ? ` <reactions>${reactions}</reactions>` : ''}`,
-    }];
+    const shown = withImagesByID.get(msg.message_id);
+    const text = `${messageShorthand} ${referenceMap.get(msg.reference_id ?? '') !== undefined ? `↪ ${referenceMap.get(msg.reference_id!)} ` : ''}${msg.author_name}: ${shown?.text ?? msg.message_content}${reactions ? ` <reactions>${reactions}</reactions>` : ''}`;
+    if (!shown?.images.length) return [...messageBreak, { role: 'user', content: text }];
+
+    // in the Anthropic SDK's shape rather than the AI SDK's, since that's what the messages are sent with
+    const content: ContentBlockParam[] = [{ type: 'text', text }, ...shown.images.map((source) => ({ type: 'image' as const, source }))];
+    return [...messageBreak, { role: 'user', content } as unknown as ModelMessage];
   });
 
   const indexMsg: ModelMessage = {
@@ -486,6 +496,7 @@ function isDirtyCall(name: string, input: any): boolean {
     case 'list_heartbeats':
     case 'search_summaries':
     case 'caption_image':
+    case 'view_image':
     case 'x_search':
     case 'bluesky':
     case 'web_search':
@@ -549,7 +560,8 @@ function describeToolCall(name: string, input: any): [string, string] {
       if (input.action === 'read') return ['read Bluesky DMs with', clip(input.with)];
       return ['checked Bluesky DMs', ''];
     case 'fetch_url': return ['fetched', host(input.url)];
-    case 'caption_image': return ['looked at images', ''];
+    case 'caption_image':
+    case 'view_image': return ['looked at images', ''];
     case 'shell':
     case 'run_command': return ['ran', quote(input.command ?? (Array.isArray(input.commands) ? input.commands.join('; ') : ''))];
     case 'write_file': return ['wrote', clip(input.path)];
@@ -617,6 +629,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   const heartbeatConversationID = 'heartbeat' in trigger ? trigger.conversation_id : undefined;
 
   const chatbot = getChatbot(serverID)!;
+  const model = chatbot.model ?? DEFAULT_MODEL;
+  const vision = supportsImages(model);
   // a DM with the bot's owner is a server of its own, with no guild behind it. it gets full control over every server instead
   const isDM = isDMServer(serverID);
   const guild = isDM ? undefined : await discordClient.guilds.fetch(serverID);
@@ -660,10 +674,18 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   }
 
   const conversationContext = getConversationMessages(conversation.conversation_id);
+  // with vision, the model is shown the images themselves, so their captions are made alongside the reply, and saved once they're done.
+  // the bot's own messages are captioned first as usual, since an assistant turn can't hold images
+  const pendingCaptions = new Map<string, Promise<string>>();
+  const describe = async (message: Message): Promise<string> => {
+    if (!vision || message.author.id === discordClient.user?.id) return withCaptions(message);
+    pendingCaptions.set(message.id, withCaptions(message));
+    return withImagePlaceholders(message);
+  };
   // filtered before captioning, so messages already saved (with their captions) aren't captioned again
   const uniqueContext: ConversationMessageTable[] = await Promise.all(recentMessages.filter((txt) => !conversationContext.find((convoTxt) => convoTxt.message_id === txt.id))
     .map(async (ctx) => {
-      const content = writingMessages.has(ctx.id) ? WRITING_PLACEHOLDER : await withCaptions(ctx);
+      const content = writingMessages.has(ctx.id) ? WRITING_PLACEHOLDER : await describe(ctx);
 
       return {
         conversation_id: conversation.conversation_id,
@@ -682,7 +704,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     }));
   // a retried reply's message is already saved, with its captions, so it's reused rather than captioned and added again
   const savedUserMessage = userMessage && conversationContext.find((msg) => msg.message_id === userMessage.id);
-  const userContent = userMessage && !savedUserMessage ? await withCaptions(userMessage) : '';
+  const userContent = userMessage && !savedUserMessage ? await describe(userMessage) : '';
   const userConvoMessage: ConversationMessageTable | undefined = savedUserMessage ?? (userMessage && {
     conversation_id: conversation.conversation_id,
     role: 'user',
@@ -732,7 +754,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         timestamp: messageReference.createdTimestamp,
         author_id: messageReference.author.id,
         author_name: messageReference.author.displayName,
-        message_content: writingMessages.has(messageReference.id) ? WRITING_PLACEHOLDER : await withCaptions(messageReference),
+        message_content: writingMessages.has(messageReference.id) ? WRITING_PLACEHOLDER : await describe(messageReference), // saved with the rest, so it's captioned too
         message_id: messageReference.id,
       };
     }
@@ -743,7 +765,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
   // only the latest results, so a long conversation's prompt doesn't keep growing. all of them are still kept for the summary
   const toolContext = getVisibleToolResults(conversation.conversation_id).slice(-MAX_PROMPT_TOOL_RESULTS);
-  const agentInput = await formatInput(guild, channel, conversation, referenceMessage, toolContext, conversationContext);
+  const agentInput = await formatInput(guild, channel, conversation, referenceMessage, toolContext, conversationContext, vision);
   const indexMsg = agentInput.shift()!;
   // dated, so the model can tell how long ago it was
   const summaryStr = relevantSummaries.map((summary) => `<summary date="${new Date(summary.timestamp).toLocaleDateString('en-US', { dateStyle: 'medium' })}">${summary.summary}</summary>`).join('\n');
@@ -786,7 +808,6 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
       ${indexMsg.content}
     </index>`;
 
-  const model = chatbot.model ?? DEFAULT_MODEL;
   // models without tool support get none, rather than an error
   const tools: ToolUnion[] | undefined = chatbot.tools_enabled && supportsTools(model) ? [
     {
@@ -836,6 +857,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toAnthropicTool('search_summaries', localTools.searchSummaries),
     toAnthropicTool('fetch_url', localTools.fetchURL),
     toAnthropicTool('caption_image', localTools.captionImage),
+    ...(vision ? [toAnthropicTool('view_image', localTools.viewImage)] : []),
     toAnthropicTool('list_counters', localTools.listCounters),
     toAnthropicTool('counter', localTools.counter),
     // only offered once the key is in .env, so the model doesn't reach for a tool that can't work
@@ -881,6 +903,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
     fetch_url: localTools.fetchURL,
     caption_image: localTools.captionImage,
+    view_image: localTools.viewImage,
     list_counters: localTools.listCounters,
     counter: localTools.counter,
     x_search: localTools.xSearch,
@@ -1050,7 +1073,9 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         const output = localTool?.execute
           ? await localTool.execute(toolUse.input, { toolCallId: toolUse.id, messages: [], context: replyContext })
           : { result: 'failure', message: `There is no tool named ${toolUse.name}` };
-        const outputStr = typeof output === 'string' ? output : JSON.stringify(output);
+        // view_image's image is given to the model as an image block, and left out of what's saved, since it's huge
+        const image = typeof output === 'object' ? output?.image : undefined;
+        const outputStr = typeof output === 'string' ? output : JSON.stringify(image ? { ...output, image: undefined } : output);
 
         saveToolResult({
           conversation_id: conversation.conversation_id,
@@ -1060,7 +1085,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
           output: outputStr,
         }, toolUse.input);
         list();
-        return { type: 'tool_result', tool_use_id: toolUse.id, content: outputStr };
+        return { type: 'tool_result', tool_use_id: toolUse.id, content: image ? [{ type: 'text', text: outputStr }, { type: 'image', source: image }] : outputStr };
       })();
       run.catch((error) => console.error(error)); // a tool given up on can still fail later, with nothing waiting on it
 
@@ -1076,6 +1101,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
   // skip any message deleted while the reply was generating, since its delete event found nothing to delete yet
   conversationContext.filter((ctx) => !recentlyDeleted.has(ctx.message_id)).forEach((ctx) => insertConversationMessage(ctx));
+  // filled in once they're done, rather than holding up the reply. a message deleted by then isn't saved, so nothing is updated
+  pendingCaptions.forEach((caption, message_id) => caption.then((content) => updateConversationMessageContent(message_id, content, estimateTokens(content))));
 
   // every reply resends the whole conversation, so once it's this big, wrap it up into a summary and start fresh.
   // a heartbeat's conversation is summarized as soon as it's sent anyway
