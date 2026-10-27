@@ -23,6 +23,7 @@ interface OpenRouterModel {
   pricing: { prompt: string, completion: string }, // usd per token, as strings
   supported_parameters?: string[],
   reasoning?: { supported_efforts?: string[], default_effort?: string },
+  architecture?: { input_modalities?: string[] }, // e.g. ['text', 'image']
 }
 
 let models: OpenRouterModel[] = [];
@@ -70,6 +71,11 @@ function supportsTemperature(id: string): boolean {
   return !model || !!model.supported_parameters?.includes('temperature');
 }
 
+// unlike supportsTools, assumes no if the list couldn't be loaded, since images sent to a model without vision would fail every reply, while captions always work
+function supportsImages(id: string): boolean {
+  return !!findModel(id)?.architecture?.input_modalities?.includes('image');
+}
+
 // the most temperature a model takes, so a setting above it can't make every reply fail
 function maxTemperature(id: string): number {
   return TEMPERATURE_LIMITS.find(([prefix]) => id.startsWith(prefix))?.[1] ?? MAX_TEMPERATURE;
@@ -97,4 +103,4 @@ function formatPricing(model: OpenRouterModel): string {
   return `${perMillion(model.pricing.prompt)}/${perMillion(model.pricing.completion)} per M`;
 }
 
-export { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, REASONING_EFFORTS, OpenRouterModel, loadModels, getModels, findModel, supportsTools, supportsTemperature, maxTemperature, temperatureFor, getSupportedEfforts, formatPricing };
+export { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, REASONING_EFFORTS, OpenRouterModel, loadModels, getModels, findModel, supportsTools, supportsImages, supportsTemperature, maxTemperature, temperatureFor, getSupportedEfforts, formatPricing };
