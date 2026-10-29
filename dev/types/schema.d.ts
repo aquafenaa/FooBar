@@ -67,6 +67,7 @@ interface ChatbotTable {
   temperature?: number, // 0-2, how random its replies are. the default temperature if unset
   system_prompt_override?: string, // replaces SYSTEM.md for this server, if set
   chatbot_prompt: string, // the server's persona, layered on top of the system prompt. Empty for none
+  disabled_tools?: string[], // tool groups turned off here (see TOOL_GROUPS in chatbot.ts). stored as JSON. every group is on if unset
 }
 interface MemoryTable {
   name: string,

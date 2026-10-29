@@ -40,9 +40,8 @@ const PersonaCommand: Command = {
 };
 
 const ToolsCommand: Command = {
-  data: new SlashCommandBuilder().setName('tools').setDescription('Whether the chatbot can use tools in this DM')
-    .addBooleanOption((enableOption) => enableOption.setName('enable').setDescription('True = Enable, False = Disable')
-      .setRequired(true)),
+  data: new SlashCommandBuilder().setName('tools').setDescription('Turn tool use on or off here, or leave out "enable" to choose which tools are on')
+    .addBooleanOption((enableOption) => enableOption.setName('enable').setDescription('True = Enable, False = Disable')),
   execute: (interaction, serverID) => setTools(interaction as ChatInputCommandInteraction, serverID),
 };
 

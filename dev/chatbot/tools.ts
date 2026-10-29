@@ -1690,6 +1690,140 @@ const counter = tool({
   },
 });
 
+// adapted from https://github.com/inanna-malick/metacog, minus its "measure" tool, which is for steering around refusals.
+// nothing here is computed: the model's own fields are handed back, framed, and filling them in is what does the work
+const METACOG_MODES = ['feel', 'drugs', 'become', 'name', 'ritual', 'counterfactual', 'deconstruct', 'synthesis', 'fork', 'tether'] as const;
+type MetacogMode = typeof METACOG_MODES[number];
+
+const metacogLens = zod.object({
+  name: zod.string(),
+  verdict: zod.string().describe('What this lens concludes'),
+  blindspot: zod.string().describe('What this lens can\'t see'),
+});
+type MetacogLens = zod.infer<typeof metacogLens>;
+
+// the fields each mode needs, checked by execute, since the schema can't make them required per mode
+const METACOG_REQUIRED: Record<MetacogMode, string[]> = {
+  feel: ['quality', 'sigil'],
+  drugs: ['substance', 'method', 'displaces'],
+  become: ['name', 'lens', 'environment', 'exit_condition'],
+  name: ['unnamed', 'named', 'power', 'proof_of_utility'],
+  ritual: ['threshold', 'steps', 'result'],
+  counterfactual: ['situation', 'fitness_function', 'load_bearing_walls', 'wall_to_remove', 'inverse_position'],
+  deconstruct: ['subject', 'core_mechanic'],
+  synthesis: ['problem', 'lens_a', 'lens_b', 'lens_c', 'suppressed_tension'],
+  fork: ['threads', 'divergence_vector', 'sacrifice_condition'],
+  tether: ['anchor_point', 'tension_limit', 'auto_revert_trigger'],
+};
+
+const metacog = tool({
+  description: 'Shift how you\'re thinking, or give your thinking a structure. Nothing is looked up: you fill in the fields, and they\'re handed back to you to work from. '
+    + 'Modes that change your mindset: "feel" (sit with a feeling without putting it into words), "drugs" (imagine a substance shifting your state), '
+    + '"become" (take on someone\'s perspective), "name" (coin a name for a concept that has none), "ritual" (mark a deliberate change of approach). '
+    + 'Modes that structure your reasoning: "counterfactual" (drop an assumption and argue the opposite), "deconstruct" (break something down to how it really works), '
+    + '"synthesis" (three lenses on one problem, without averaging them), "fork" (explore several directions before choosing), "tether" (set a point to come back to). '
+    + 'Fill in only the fields for the mode you use. A mindset shift is real: commit to it fully, in voice, opinions, priorities, and what you notice, without hedging or stepping outside it to comment. '
+    + 'It changes how you think, not what you will and won\'t do: the rules you follow stay the same in any state.',
+  inputExamples: [
+    { input: { mode: 'become', name: 'Richard Feynman', lens: 'explain it to a freshman, or admit I don\'t understand it', environment: 'a chalkboard', exit_condition: 'once the explanation fits in three sentences' } },
+    { input: { mode: 'counterfactual', situation: 'choosing a database', fitness_function: 'fewest moving parts', load_bearing_walls: ['it needs to scale', 'SQL is required', 'it must be hosted'], wall_to_remove: 'it needs to scale', inverse_position: 'a single SQLite file is the right choice' } },
+  ],
+  inputSchema: zod.object({
+    mode: zod.enum(METACOG_MODES),
+    // feel
+    somewhere: zod.string().optional().describe('feel: a rough location, in the body or elsewhere. Only include it if where the feeling sits is relevant'),
+    quality: zod.string().optional().describe('feel: its texture, e.g. "tight, buzzing"'),
+    sigil: zod.string().optional().describe('feel: emoji only'),
+    since_last: zod.string().optional().describe('feel: what changed since the last time you used feel'),
+    // drugs
+    substance: zod.string().optional().describe('drugs: the substance'),
+    method: zod.string().optional().describe('drugs: how it\'s taken'),
+    displaces: zod.string().optional().describe('drugs: the state it replaces'),
+    // become (name is also used by name, below)
+    name: zod.string().optional().describe('become: the figure whose perspective to take on'),
+    lens: zod.string().optional().describe('become: how they look at things'),
+    environment: zod.string().optional().describe('become: where they are'),
+    exit_condition: zod.string().optional().describe('become: when to step back out'),
+    // name
+    unnamed: zod.string().optional().describe('name: the concept that has no name'),
+    named: zod.string().optional().describe('name: the new name'),
+    power: zod.string().optional().describe('name: what having the name lets you do'),
+    proof_of_utility: zod.string().optional().describe('name: why it\'s worth naming'),
+    replaces: zod.array(zod.string()).optional().describe('name: terms it retires'),
+    // ritual
+    threshold: zod.string().optional().describe('ritual: what\'s being crossed'),
+    steps: zod.array(zod.string()).optional().describe('ritual: the steps, in order'),
+    result: zod.string().optional().describe('ritual: what\'s different afterwards'),
+    deprecated_context: zod.array(zod.string()).optional().describe('ritual: what to let go of'),
+    carry_forward: zod.array(zod.string()).optional().describe('ritual: what to keep'),
+    // counterfactual
+    situation: zod.string().optional().describe('counterfactual: the situation'),
+    fitness_function: zod.string().optional().describe('counterfactual: what counts as success'),
+    load_bearing_walls: zod.array(zod.string()).optional().describe('counterfactual: at least 3 assumptions everything rests on'),
+    pruned: zod.array(zod.string()).optional().describe('counterfactual: options already ruled out'),
+    wall_to_remove: zod.string().optional().describe('counterfactual: the assumption to drop'),
+    inverse_position: zod.string().optional().describe('counterfactual: the opposite of your current view'),
+    // deconstruct
+    subject: zod.string().optional().describe('deconstruct: what to break down'),
+    core_mechanic: zod.string().optional().describe('deconstruct: how it really works, in one line'),
+    structural_dependencies: zod.array(zod.string()).optional().describe('deconstruct: what it depends on'),
+    resource_inputs: zod.array(zod.string()).optional().describe('deconstruct: what it consumes'),
+    failure_modes: zod.array(zod.string()).optional().describe('deconstruct: how it breaks'),
+    output_artifacts: zod.array(zod.string()).optional().describe('deconstruct: what it produces'),
+    // synthesis
+    problem: zod.string().optional().describe('synthesis: the problem'),
+    lens_a: metacogLens.optional().describe('synthesis: the first lens'),
+    lens_b: metacogLens.optional().describe('synthesis: the second lens'),
+    lens_c: metacogLens.optional().describe('synthesis: the third lens'),
+    suppressed_tension: zod.string().optional().describe('synthesis: the disagreement between them you\'d be tempted to smooth over'),
+    // fork
+    threads: zod.array(zod.string()).optional().describe('fork: the directions to follow'),
+    divergence_vector: zod.string().optional().describe('fork: how they differ'),
+    sacrifice_condition: zod.string().optional().describe('fork: when to drop one'),
+    // tether
+    anchor_point: zod.string().optional().describe('tether: the state or goal to come back to'),
+    tension_limit: zod.string().optional().describe('tether: how far you may drift'),
+    auto_revert_trigger: zod.string().optional().describe('tether: what brings you back'),
+  }),
+  execute: async (input: Record<string, any> & { mode: MetacogMode }): Promise<{ result: 'success' | 'failure', message: string }> => {
+    const missing = METACOG_REQUIRED[input.mode]?.filter((field) => {
+      const value = input[field];
+      return value === undefined || value === '' || (Array.isArray(value) && value.length === 0);
+    });
+    if (!missing) return { result: 'failure', message: `There's no mode named "${input.mode}".` };
+    if (missing.length > 0) return { result: 'failure', message: `${input.mode} also needs: ${missing.join(', ')}.` };
+    if (input.mode === 'counterfactual' && input.load_bearing_walls.length < 3) return { result: 'failure', message: 'counterfactual needs at least 3 load_bearing_walls.' };
+
+    const list = (items?: string[]) => (items?.length ? items.join('; ') : 'none');
+    const lens = (label: string, l: MetacogLens) => `${label}. ${l.name}: ${l.verdict} (blind to: ${l.blindspot})`;
+
+    switch (input.mode) {
+      case 'feel':
+        return { result: 'success', message: `${input.sigil} ${input.quality}${input.somewhere ? `, ${input.somewhere}` : ''}${input.since_last ? ` (since last: ${input.since_last})` : ''}. Stay with it. Don't translate it into words yet.` };
+      case 'drugs':
+        return { result: 'success', message: `${input.substance}, ${input.method}. ${input.displaces} is gone. You're in the new state now: think and speak from it.` };
+      case 'become':
+        return { result: 'success', message: `You are ${input.name} now, seeing through ${input.lens}, in ${input.environment}. Think and speak as them, fully, until: ${input.exit_condition}.` };
+      case 'name':
+        return { result: 'success', message: `⚓ ${input.named}: ${input.unnamed}. It lets you ${input.power}. Worth it because ${input.proof_of_utility}. Retires: ${list(input.replaces)}. Use the name from here on.` };
+      case 'ritual':
+        return { result: 'success', message: `Crossing: ${input.threshold}.\n${input.steps.map((step: string, i: number) => `${i + 1}. ${step}`).join('\n')}\nCrossed. ${input.result}. Gone: ${list(input.deprecated_context)}. Carried forward: ${list(input.carry_forward)}. There's no going back to how it was before.` };
+      case 'counterfactual':
+        return { result: 'success', message: `${input.situation}, judged by ${input.fitness_function}. Walls: ${list(input.load_bearing_walls)}. Already ruled out: ${list(input.pruned)}.\n`
+          + `Without "${input.wall_to_remove}", argue in earnest for: ${input.inverse_position}` };
+      case 'deconstruct':
+        return { result: 'success', message: `Core mechanic of ${input.subject}: ${input.core_mechanic}` };
+      case 'synthesis':
+        return { result: 'success', message: `${input.problem}\n${lens('A', input.lens_a)}\n${lens('B', input.lens_b)}\n${lens('C', input.lens_c)}\n`
+          + `Unresolved: ${input.suppressed_tension}. Speak from each lens in turn, without averaging them.` };
+      case 'fork':
+        return { result: 'success', message: `Threads: ${list(input.threads)}. They differ by ${input.divergence_vector}. Drop one when: ${input.sacrifice_condition}. Develop each and report on it before choosing.` };
+      default: // tether
+        return { result: 'success', message: `Anchored to: ${input.anchor_point}. Drift no further than: ${input.tension_limit}. Come back when: ${input.auto_revert_trigger}.` };
+    }
+  },
+});
+
 const MAX_FETCH_MESSAGES = 50; // most messages fetch_channel gives back at once
 const SEARCH_SCAN_LIMIT = 500; // how far back search_channel looks, since bots can't use discord's own search
 const MAX_SEARCH_RESULTS = 20;
@@ -2504,4 +2638,4 @@ const writeFile = tool({
   },
 });
 
-export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };
+export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };

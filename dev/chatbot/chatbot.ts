@@ -476,6 +476,32 @@ ${heartbeat.silent
 }
 
 /**
+ * The groups /chatbot tools turns on and off, in the two lists its modal shows them in (a checkbox group holds at most 10).
+ * Tools are named as the model sees them, with openrouter's server tools (web_search, shell) by their name after "openrouter:"
+ */
+const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, description: string, tools: string[] }[] = [
+  { list: 'discord', key: 'channels', label: 'Channels & messages', description: 'Read and search channels, send messages, create threads', tools: ['fetch_channel', 'search_channel', 'fetch_embed', 'send_message', 'create_thread'] },
+  { list: 'discord', key: 'users', label: 'Users', description: 'Look up members of the server', tools: ['search_users', 'list_users', 'view_user'] },
+  { list: 'discord', key: 'reactions', label: 'Reactions & nickname', description: 'React to messages, change its own nickname', tools: ['react_to_message', 'change_nickname'] },
+  { list: 'discord', key: 'memories', label: 'Memories & summaries', description: 'Save and read memories, search past conversations', tools: ['create_memory', 'edit_memory', 'list_memories', 'view_memory', 'remove_memory', 'search_summaries'] },
+  { list: 'discord', key: 'reminders', label: 'Reminders', description: 'Create and manage reminders', tools: ['create_reminder', 'edit_reminder', 'list_reminders', 'view_reminder', 'remove_reminder'] },
+  { list: 'discord', key: 'heartbeats', label: 'Heartbeats', description: 'Schedule prompts for itself to run later', tools: ['list_heartbeats', 'create_heartbeat', 'edit_heartbeat', 'delete_heartbeat'] },
+  { list: 'discord', key: 'counters', label: 'Counters', description: 'Change the server\'s counters', tools: ['list_counters', 'counter'] },
+  { list: 'other', key: 'web_search', label: 'Web search', description: 'Search the web', tools: ['web_search'] },
+  { list: 'other', key: 'fetch_url', label: 'Fetch URLs', description: 'Read web pages and call APIs', tools: ['fetch_url'] },
+  { list: 'other', key: 'workspace', label: 'Workspace', description: 'Run commands and write files in its sandbox', tools: ['shell', 'run_command', 'write_file'] },
+  { list: 'other', key: 'images', label: 'Images', description: 'Caption and look at images from URLs', tools: ['caption_image', 'view_image'] },
+  { list: 'other', key: 'x_search', label: 'X search', description: 'Search posts on X (costs about 5 cents a search)', tools: ['x_search'] },
+  { list: 'other', key: 'bluesky', label: 'Bluesky', description: 'Read Bluesky, and post or DM where it\'s logged in', tools: ['bluesky', 'bluesky_act', 'bluesky_dms'] },
+  { list: 'other', key: 'metacog', label: 'Metacog', description: 'Shift its own mindset, or structure its reasoning', tools: ['metacog'] },
+];
+
+// every tool in a server's disabled groups. a group that no longer exists is ignored
+function disabledToolNames(chatbot: ChatbotTable): Set<string> {
+  return new Set(TOOL_GROUPS.filter((group) => chatbot.disabled_tools?.includes(group.key)).flatMap((group) => group.tools));
+}
+
+/**
  * Whether a tool call could have changed something (sent a message, saved a memory, ran a command...), rather than only looked something up.
  * A dirty result is never forgotten, even when its reply is cancelled or regenerated, since what it did still happened.
  * Anything not listed counts as dirty, so a new tool is never silently forgotten
@@ -497,6 +523,7 @@ function isDirtyCall(name: string, input: any): boolean {
     case 'search_summaries':
     case 'caption_image':
     case 'view_image':
+    case 'metacog':
     case 'x_search':
     case 'bluesky':
     case 'web_search':
@@ -562,6 +589,7 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'fetch_url': return ['fetched', host(input.url)];
     case 'caption_image':
     case 'view_image': return ['looked at images', ''];
+    case 'metacog': return ['reflected', clip(input.mode)];
     case 'shell':
     case 'run_command': return ['ran', quote(input.command ?? (Array.isArray(input.commands) ? input.commands.join('; ') : ''))];
     case 'write_file': return ['wrote', clip(input.path)];
@@ -631,6 +659,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   const chatbot = getChatbot(serverID)!;
   const model = chatbot.model ?? DEFAULT_MODEL;
   const vision = supportsImages(model);
+  const disabledTools = disabledToolNames(chatbot);
   // a DM with the bot's owner is a server of its own, with no guild behind it. it gets full control over every server instead
   const isDM = isDMServer(serverID);
   const guild = isDM ? undefined : await discordClient.guilds.fetch(serverID);
@@ -808,8 +837,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
       ${indexMsg.content}
     </index>`;
 
-  // models without tool support get none, rather than an error
-  const tools: ToolUnion[] | undefined = chatbot.tools_enabled && supportsTools(model) ? [
+  // models without tool support get none, rather than an error. tools in groups turned off with /chatbot tools are filtered out below
+  const offeredTools: ToolUnion[] | undefined = chatbot.tools_enabled && supportsTools(model) ? [
     {
       type: 'openrouter:web_search',
       parameters: { engine: 'native', max_results: 20 }, // "native" on Grok includes X search
@@ -860,6 +889,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     ...(vision ? [toAnthropicTool('view_image', localTools.viewImage)] : []),
     toAnthropicTool('list_counters', localTools.listCounters),
     toAnthropicTool('counter', localTools.counter),
+    toAnthropicTool('metacog', localTools.metacog),
     // only offered once the key is in .env, so the model doesn't reach for a tool that can't work
     ...(process.env.TWITTER_API_KEY ? [toAnthropicTool('x_search', localTools.xSearch)] : []),
     toAnthropicTool('bluesky', localTools.bluesky), // always offered, since most of it works through the public API without a login
@@ -869,6 +899,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
       // toAnthropicTool('bluesky_dms', localTools.blueskyDMs),
     ] : []),
   ] : undefined;
+  // server tools have no name, only a type like openrouter:web_search
+  const tools = offeredTools?.filter((t) => !disabledTools.has('name' in t ? t.name : String(t.type).replace(/^openrouter:/, '')));
 
   // tools we execute ourselves. web search runs on OpenRouter's side
   const localToolMap: Record<string, Tool<any, any>> = {
@@ -906,6 +938,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     view_image: localTools.viewImage,
     list_counters: localTools.listCounters,
     counter: localTools.counter,
+    metacog: localTools.metacog,
     x_search: localTools.xSearch,
     bluesky: localTools.bluesky,
     bluesky_act: localTools.blueskyAct,
@@ -1069,7 +1102,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         showStatus();
       };
       const run = (async (): Promise<ToolResultBlockParam> => {
-        const localTool = localToolMap[toolUse.name];
+        const localTool = disabledTools.has(toolUse.name) ? undefined : localToolMap[toolUse.name]; // in case it calls one it wasn't offered
         const output = localTool?.execute
           ? await localTool.execute(toolUse.input, { toolCallId: toolUse.id, messages: [], context: replyContext })
           : { result: 'failure', message: `There is no tool named ${toolUse.name}` };
@@ -1118,4 +1151,4 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   return { conversation_id: conversation.conversation_id, chunks };
 }
 
-export { ReplyControl, THINKING_STATUS, TYPING_STATUS, STOPPED_STATUS, setWriting, getBaseSystemPrompt, getDefaultSystemPrompt, getSystemPrompt, getEmbedding, formatReactions, formatResponse, chatbotMentions, generateReply, isAllowedServer, markMessageDeleted };
+export { ReplyControl, TOOL_GROUPS, THINKING_STATUS, TYPING_STATUS, STOPPED_STATUS, setWriting, getBaseSystemPrompt, getDefaultSystemPrompt, getSystemPrompt, getEmbedding, formatReactions, formatResponse, chatbotMentions, generateReply, isAllowedServer, markMessageDeleted };

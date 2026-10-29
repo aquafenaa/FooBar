@@ -24,7 +24,7 @@ import { addChatbotSubscriber, addReminder, deleteAllHeartBoardEmojis, deleteAll
   getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat } from './data';
 import { AutomaticResponseTable, ChatbotTable, ConversationSummaryTable, ReminderTable, HeartbeatTable, HeartBoardTable, VoicePingTable } from './types/schema';
 import { removeHeartbeat, scheduleHeartbeat } from './chatbot/heartbeat';
-import { getEmbedding, getSystemPrompt } from './chatbot/chatbot';
+import { TOOL_GROUPS, getEmbedding, getSystemPrompt } from './chatbot/chatbot';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
 import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, findModel, formatPricing, getModels, getSupportedEfforts, maxTemperature, supportsImages, supportsTemperature, supportsTools } from './chatbot/models';
@@ -204,12 +204,34 @@ async function setTemperature(interaction: ChatInputCommandInteraction, serverID
   interaction.reply({ content: `Temperature set to **${chatbot.temperature ?? `${DEFAULT_TEMPERATURE} (default)`}**!${note}`, flags: MessageFlags.Ephemeral });
 }
 
-// option "enable": whether tools are on
+// option "enable": whether tools are on. without it, a modal picks which groups of tools are on
 async function setTools(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
-  const enabledOption = interaction.options.getBoolean('enable')!;
+  const enabledOption = interaction.options.getBoolean('enable');
   const chatbot = getChatbot(serverID);
   if (!chatbot) {
     interaction.reply({ content: NO_CHATBOT_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (enabledOption === null) {
+    const groupOptions = (list: string) => TOOL_GROUPS.filter((group) => group.list === list)
+      .map((group) => ({ value: group.key, label: group.label, description: group.description, checked: !chatbot.disabled_tools?.includes(group.key) }));
+    const toolsModal = new ModalBuilder().setTitle('Chatbot Tools');
+    if (!chatbot.tools_enabled) toolsModal.addTextDisplayComponents(new TextDisplayBuilder().setContent('⚠️ Tools are off here right now, so none of these are used until they\'re enabled again (`enable: True`).'));
+    toolsModal.addLabelComponents(
+      checkboxGroupField('discord', 'Discord', groupOptions('discord')),
+      checkboxGroupField('other', 'Web, workspace, and other', groupOptions('other')),
+    );
+
+    const submit = await askModal(interaction, toolsModal);
+    if (!submit) return;
+
+    const enabled = [...submit.fields.getCheckboxGroup('discord'), ...submit.fields.getCheckboxGroup('other')];
+    chatbot.disabled_tools = TOOL_GROUPS.map((group) => group.key).filter((key) => !enabled.includes(key));
+    upsertChatbot(chatbot);
+
+    const disabled = TOOL_GROUPS.filter((group) => chatbot.disabled_tools!.includes(group.key)).map((group) => group.label);
+    submit.reply({ content: disabled.length > 0 ? `Saved! Turned off: ${disabled.join(', ')}.` : 'Saved! Every tool is on.', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -300,9 +322,8 @@ const ChatbotCommand: ConfigCommand = {
       .setDescription('Create the chatbot for a server that doesn\'t currently have one.'))
     .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete')
       .setDescription('Remove the chatbot for a server that already has one.'))
-    .addSubcommand((toolSubcommand) => toolSubcommand.setName('tools').setDescription('Whether the bot is able to use tools or not')
-      .addBooleanOption((enabledOption) => enabledOption.setName('enable').setDescription('Enable or disable tool use. True = Enable, False = Disable')
-        .setRequired(true)))
+    .addSubcommand((toolSubcommand) => toolSubcommand.setName('tools').setDescription('Turn tool use on or off, or leave out "enable" to choose which tools are on')
+      .addBooleanOption((enabledOption) => enabledOption.setName('enable').setDescription('Enable or disable tool use. True = Enable, False = Disable')))
     .addSubcommand((modelSubcommand) => modelSubcommand.setName('model')
       .setDescription('Change the AI model the chatbot uses, from any model on OpenRouter')
       .addStringOption((queryOption) => queryOption.setName('query')
@@ -763,6 +784,7 @@ const ChatbotCommand: ConfigCommand = {
       .addFields(
         { name: 'Enabled', value: (chatbot?.chatbot_enabled ? 'Yes' : 'No') },
         { name: 'Tools Enabled', value: (chatbot?.tools_enabled ? 'Yes' : 'No') },
+        { name: 'Tools Turned Off', value: TOOL_GROUPS.filter((group) => chatbot?.disabled_tools?.includes(group.key)).map((group) => group.label).join(', ') || 'None' },
         { name: 'Context', value: (chatbot?.detached ? 'Detached (this server only)' : 'Shared with other servers (for opted-in users)') },
         { name: 'System Prompt', value: (chatbot?.system_prompt_override ? 'Overridden for this server' : 'Default (SYSTEM.md)') },
         { name: 'Persona', value: (chatbot?.chatbot_prompt ? 'Set' : 'None') },
