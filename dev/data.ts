@@ -39,6 +39,7 @@ function getChatbot(server_id: Snowflake): ChatbotTable | null {
   chatbot.reasoning_effort = chatbot.reasoning_effort ?? undefined;
   chatbot.temperature = chatbot.temperature ?? undefined;
   chatbot.system_prompt_override = chatbot.system_prompt_override ?? undefined;
+  chatbot.disabled_tools = chatbot.disabled_tools ? JSON.parse(chatbot.disabled_tools as unknown as string) : undefined;
   return chatbot;
 }
 // servers whose chatbot shares the 'main' context
@@ -47,8 +48,8 @@ function getAttachedServers(): Snowflake[] {
 }
 function upsertChatbot(chatbot: ChatbotTable): void {
   db.prepare(`
-    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, temperature, system_prompt_override, chatbot_prompt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, temperature, system_prompt_override, chatbot_prompt, disabled_tools)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(server_id) DO UPDATE SET
       chatbot_enabled = excluded.chatbot_enabled,
       tools_enabled = excluded.tools_enabled,
@@ -57,7 +58,8 @@ function upsertChatbot(chatbot: ChatbotTable): void {
       reasoning_effort = excluded.reasoning_effort,
       temperature = excluded.temperature,
       system_prompt_override = excluded.system_prompt_override,
-      chatbot_prompt = excluded.chatbot_prompt
+      chatbot_prompt = excluded.chatbot_prompt,
+      disabled_tools = excluded.disabled_tools
   `).run(
     chatbot.server_id,
     chatbot.chatbot_enabled ? 1 : 0,
@@ -68,6 +70,7 @@ function upsertChatbot(chatbot: ChatbotTable): void {
     chatbot.temperature ?? null,
     chatbot.system_prompt_override ?? null,
     chatbot.chatbot_prompt,
+    chatbot.disabled_tools?.length ? JSON.stringify(chatbot.disabled_tools) : null,
   );
 }
 function deleteChatbot(server_id: Snowflake) {
@@ -846,6 +849,10 @@ const updateDatabase = db.transaction(() => {
   if (currentVersion < 13) {
     if (!hasColumn('Server', 'dm_user_id')) db.prepare('ALTER TABLE Server ADD COLUMN dm_user_id VARCHAR(20)').run(); // empty, so every existing server stays a server
     db.pragma('user_version = 13');
+  }
+  if (currentVersion < 14) {
+    if (!hasColumn('Chatbot', 'disabled_tools')) db.prepare('ALTER TABLE Chatbot ADD COLUMN disabled_tools TEXT').run(); // empty, so every server keeps every tool
+    db.pragma('user_version = 14');
   }
 });
 

@@ -85,7 +85,8 @@ CREATE TABLE IF NOT EXISTS Chatbot(
   reasoning_effort TEXT,
   temperature REAL,
   system_prompt_override TEXT,
-  chatbot_prompt TEXT
+  chatbot_prompt TEXT,
+  disabled_tools TEXT
 );
 CREATE TABLE IF NOT EXISTS ChatbotSubscriber(
   server_id VARCHAR(20) REFERENCES Server(server_id) ON DELETE CASCADE,
