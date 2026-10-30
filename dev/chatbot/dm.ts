@@ -1,7 +1,7 @@
 // direct messages with the bot's owner: only users listed in DM_USERS (in .env) can DM it, and they get full control.
 // each DM is treated as a server of its own, keyed by its owner's user id, so everything per-server (settings, memories, summaries) just works.
 // it starts attached, sharing the main context both ways, and the /private text command detaches it. /clear-summaries forgets its conversations.
-// those two are text, rather than slash commands, so nobody else ever sees them. the DM's other settings have slash commands, in dmCommands.ts
+// those two are text, rather than slash commands, so nobody else ever sees them. everything else uses the same slash commands as a server (dmCommandMap in commands.ts)
 import { Channel, ChannelType, DMChannel, Message, PartialDMChannel, Snowflake } from 'discord.js';
 import cron from 'node-cron';
 

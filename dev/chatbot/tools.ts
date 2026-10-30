@@ -1,7 +1,5 @@
-import { tool } from 'ai';
 import { z as zod } from 'zod';
 import cron from 'node-cron';
-import { Base64ImageSource } from '@anthropic-ai/sdk/resources';
 import { AnyThreadChannel, ChannelType, DMChannel, Embed, Guild, GuildBasedChannel, GuildMember, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
 
 import { discordClient } from '..';
@@ -17,6 +15,16 @@ import { fromSummarySource, getVisibleSummaries } from './conversation';
 import { fetchServerChannel } from './dm';
 
 // filled in by the bot for each reply, rather than by the model, so the model can't get it wrong (or reach another server's memories)
+// a tool we run ourselves. context is what the bot, never the model, tells it about the reply
+interface LocalTool {
+  description?: string,
+  inputExamples?: { input: unknown }[],
+  inputSchema: zod.ZodType,
+  contextSchema?: zod.ZodType,
+  execute(input: any, options: { context: any }): unknown,
+}
+const tool = <T extends LocalTool>(definition: T): T => definition;
+
 const replyContextSchema = zod.object({
   server_id: zod.string(),
   channel_id: zod.string(), // the channel being replied in
@@ -657,7 +665,7 @@ const viewImageTool = tool({
   inputSchema: zod.object({
     url: zod.string().describe('Full URL of the image, including https://'),
   }),
-  execute: async (input: { url: string }): Promise<{ result: 'success' | 'failure', message: string, image?: Base64ImageSource }> => {
+  execute: async (input: { url: string }): Promise<{ result: 'success' | 'failure', message: string, image?: string }> => {
     try {
       const image = await fetchImage(input.url);
       return { result: 'success', message: 'The image is attached.', image };
@@ -737,7 +745,7 @@ const xSearch = tool({
 const BLUESKY_PUBLIC_API = 'https://public.api.bsky.app'; // Bluesky's read-only API, for when there's no login
 const BLUESKY_DISCOVER_FEED = 'at://did:plc:z72i7hdynmk6r22z27h6tvur/app.bsky.feed.generator/whats-hot';
 const BLUESKY_LOGIN_RETRY = 10 * 60 * 1000; // 10 minutes. Bluesky rate limits logins, so a bad password can't be retried every call
-const MAX_BLUESKY_POSTS = 30;
+const MAX_BLUESKY_POSTS = 40;
 const MAX_BLUESKY_CURSORS = 1000; // oldest are dropped past this, so the map can't grow forever
 
 type BlueskySession = { accessJwt: string, refreshJwt: string, did: string, handle: string, service: string };
@@ -2419,13 +2427,6 @@ const createThread = tool({
   },
 });
 
-// at most hourly: the minute (and second, if given) must be one fixed number, so a beat can't fire every minute
-function isAtMostHourly(cronSchedule: string): boolean {
-  const fields = cronSchedule.trim().split(/\s+/);
-  const timeFields = fields.length === 6 ? fields.slice(0, 2) : fields.slice(0, 1);
-  return timeFields.every((field) => /^\d+$/.test(field));
-}
-
 // one tool with an action, like counter. the bot can only change the heartbeats it scheduled itself, not ones an admin made
 // separate from heartbeat, so that one's name can be required: listing is the only thing that doesn't need one
 const listHeartbeats = tool({
@@ -2445,7 +2446,6 @@ const listHeartbeats = tool({
 // what a schedule has to be for a heartbeat the bot makes. undefined if it's fine
 function heartbeatScheduleProblem(schedule: string): string | undefined {
   if (!cron.validate(schedule)) return `Cron schedule is invalid: ${schedule}.`;
-  if (!isAtMostHourly(schedule)) return 'Heartbeats can run at most hourly: the minute must be a fixed number, not * or a range.';
   return undefined;
 }
 
@@ -2463,7 +2463,7 @@ const HEARTBEAT_CONTEXT_DESCRIPTION = 'Background you\'ll be shown with the prom
 // create, edit, and delete are separate tools, rather than one with an action, so each one's required fields are actually required
 const createHeartbeat = tool({
   description: 'Schedule a heartbeat: a prompt you\'ll be given on a cron schedule, in this channel, so you can post on your own later (e.g. check back on something, or a daily check-in). '
-    + `You can have at most ${MAX_BOT_HEARTBEATS}. Schedules are cron, at most hourly (the minute must be a fixed number). `
+    + `You can have at most ${MAX_BOT_HEARTBEATS}. Schedules are cron. `
     + 'Set silent to true for one whose reply is never posted, for when it only needs to use tools (e.g. browsing Bluesky). It can still send_message if something\'s worth saying.',
   inputExamples: [
     { input: { name: 'Check exam results', prompt: 'Sam (user id 1087654321098765432) gets their exam results today. Ping them with <@1087654321098765432> and ask how it went.', schedule: '0 17 21 10 *', repeats: false } },
@@ -2614,7 +2614,7 @@ const runCommand = tool({
 
 // separate from run_command, since writing a file through a bash heredoc breaks on quotes and special characters
 const writeFile = tool({
-  description: `Write a file in your workspace, replacing it if it exists. Folders are created as needed. ${SANDBOX_DESCRIPTION}`,
+  description: `Write a file in your workspace, replacing it if it exists. Folders are created as needed. To change part of a file that already exists, use edit_file instead. ${SANDBOX_DESCRIPTION}`,
   inputExamples: [
     { input: { path: 'NOTES.md', content: '# Notes\n- Working on: a dice roller in dice.py\n' } },
   ],
@@ -2638,4 +2638,65 @@ const writeFile = tool({
   },
 });
 
-export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile };
+// done inside the container, since the output of a command is cut short, so a long file could never be read out here and written back whole.
+// newline='' keeps the file's line endings as they are
+const EDIT_SCRIPT = `
+import json, os, sys
+
+edit = json.loads(sys.stdin.buffer.read())
+path = os.environ['FILE']
+
+try:
+    with open(path, encoding='utf-8', newline='') as file:
+        content = file.read()
+except (OSError, UnicodeDecodeError) as error:
+    sys.exit(f'Could not read {path}: {error}')
+
+matches = content.count(edit['old_text'])
+if matches == 0:
+    sys.exit(f'old_text was not found in {path}, so nothing was changed. It has to match exactly, including whitespace.')
+if matches > 1 and not edit['replace_all']:
+    sys.exit(f'old_text matches {matches} places in {path}, so nothing was changed. Include more of the surrounding text, or set replace_all.')
+
+with open(path, 'w', encoding='utf-8', newline='') as file:
+    file.write(content.replace(edit['old_text'], edit['new_text']))
+print(matches)
+`;
+
+const editFile = tool({
+  description: 'Change part of a file in your workspace by replacing exact text, leaving the rest of the file as it is. '
+    + 'Use this rather than write_file for existing files, so nothing gets lost in rewriting them. old_text has to match the file exactly, including whitespace, and only once unless replace_all is set: '
+    + 'if it doesn\'t, the file isn\'t changed. Command output is cut to the last 4000 characters, so to see the exact text in a long file, read it in parts with sed -n \'100,200p\' file or find it with grep -n.',
+  inputExamples: [
+    { input: { path: 'NOTES.md', old_text: '- Working on: a dice roller', new_text: '- Finished: a dice roller' } },
+    { input: { path: 'scripts/stats.py', old_text: 'old_name', new_text: 'new_name', replace_all: true } },
+  ],
+  inputSchema: zod.object({
+    path: zod.string().describe('Path of the file, relative to /workspace'),
+    old_text: zod.string().min(1).describe('The exact text to replace. Include enough of the surrounding text to match only one place'),
+    new_text: zod.string().describe('The text to put in its place. Empty to delete it'),
+    replace_all: zod.boolean().optional().describe('Replace every match, rather than requiring exactly one'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { path: string, old_text: string, new_text: string, replace_all?: boolean }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
+    if (!isAttached(context.server_id) && !context.dm) return { result: 'failure', message: DETACHED_MESSAGE }; // a DM with the bot's owner always can
+    if (!input.old_text) return { result: 'failure', message: 'old_text can\'t be empty.' };
+
+    try {
+      // like write_file, the path goes in as a variable and the text through stdin, so neither is ever parsed as bash
+      const { exit_code, stdout, stderr } = await sandboxExec('python3 -c "$EDIT_SCRIPT"', {
+        stdin: JSON.stringify({ old_text: input.old_text, new_text: input.new_text, replace_all: !!input.replace_all }),
+        env: { FILE: input.path, EDIT_SCRIPT },
+        timeout: 10,
+      });
+      return exit_code === 0
+        ? { result: 'success', message: `Replaced ${stdout.trim()} match${stdout.trim() === '1' ? '' : 'es'} in ${input.path}.` }
+        : { result: 'failure', message: stderr.trim() || `Editing the file failed with code ${exit_code}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: `The workspace isn't available: ${error?.message ?? error}` };
+    }
+  },
+});
+
+export { LocalTool };
+export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile, editFile };

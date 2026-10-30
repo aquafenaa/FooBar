@@ -2,13 +2,13 @@
 // the caption is added to the message's content, so it's saved with the message and never needs captioning again.
 // models with vision are given recent images themselves instead, with the saved captions standing in for older ones
 import { Message } from 'discord.js';
-import { Base64ImageSource } from '@anthropic-ai/sdk/resources';
 
-import { anthropicClient } from '..';
+import { openRouter } from '..';
+import { responseText } from './models';
 
 const CAPTION_MODEL = 'deepseek/deepseek-v4.1-flash-1017';
 const MAX_IMAGES = 4; // per message. any more are ignored
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB, the most an image block allows
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB, about the most any provider allows
 const SUPPORTED_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 
 // a "(url) [image: caption]" line, or "(url) [image]" for one not captioned yet. the caption can span lines, so it ends at a "]" that ends a line
@@ -56,10 +56,10 @@ function getImages(message: Message): { fetch: string, shown: string, size?: num
 }
 
 /**
- * The image at a url, as an image block's source.
+ * The image at a url, as a base64 data url, which is how the model is given it.
  * Throws UnviewableImageError if it's an image that can't be viewed
  */
-async function fetchImage(url: string): Promise<Base64ImageSource> {
+async function fetchImage(url: string): Promise<string> {
   // some sites (e.g. wikimedia) refuse requests without a user agent
   const response = await fetch(url, { headers: { 'User-Agent': 'FooBar Discord bot' }, signal: AbortSignal.timeout(15_000) });
   if (!response.ok) throw new Error(`Image fetch responded with status ${response.status}`);
@@ -68,7 +68,7 @@ async function fetchImage(url: string): Promise<Base64ImageSource> {
   if (!SUPPORTED_TYPES.includes(mediaType)) throw new UnviewableImageError(`unsupported format (${mediaType || 'unknown'}), couldn't be viewed`);
 
   const data = await readImage(response);
-  return { type: 'base64', media_type: mediaType as Base64ImageSource['media_type'], data: data.toString('base64') };
+  return `data:${mediaType};base64,${data.toString('base64')}`;
 }
 
 /**
@@ -76,21 +76,23 @@ async function fetchImage(url: string): Promise<Base64ImageSource> {
  * Throws UnviewableImageError if it's an image that can't be viewed
  */
 async function captionImage(url: string, question?: string): Promise<string> {
-  const source = await fetchImage(url);
+  const imageUrl = await fetchImage(url);
 
-  const result = await anthropicClient.messages.create({
-    model: CAPTION_MODEL,
-    max_tokens: 1024, // room for any reasoning before the caption itself
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', source },
-        { type: 'text', text: question ? `${captionPrompt}\nAlso answer this about the image: ${question}` : captionPrompt },
-      ],
-    }],
-  }, { timeout: CAPTION_TIMEOUT, maxRetries: 0 }); // the reply waits on this, so give up rather than keep the user waiting
+  const result = await openRouter.beta.responses.send({
+    responsesRequest: {
+      model: CAPTION_MODEL,
+      maxOutputTokens: 1024, // room for any reasoning before the caption itself
+      input: [{
+        role: 'user',
+        content: [
+          { type: 'input_image', detail: 'auto', imageUrl },
+          { type: 'input_text', text: question ? `${captionPrompt}\nAlso answer this about the image: ${question}` : captionPrompt },
+        ],
+      }],
+    },
+  }, { timeoutMs: CAPTION_TIMEOUT, retries: { strategy: 'none' } }); // the reply waits on this, so give up rather than keep the user waiting
 
-  const caption =result.content.flatMap((block) => (block.type === 'text' ? [block.text] : [])).join(' ').trim();
+  const caption = responseText(result);
   if (!caption) throw new Error('The caption model returned no text');
   return caption;
 }
@@ -126,20 +128,20 @@ function withImagePlaceholders(message: Message): string {
  * The images in a saved message's "(url) [image...]" lines, for a model with vision, and the text to go with them,
  * where each line says it's shown instead of giving its caption. One that can't be fetched keeps its caption, or says why if it has none
  */
-async function withImages(content: string): Promise<{ text: string, images: Base64ImageSource[] }> {
+async function withImages(content: string): Promise<{ text: string, images: string[] }> {
   const lines = [...content.matchAll(IMAGE_LINE_RE)];
   if (lines.length === 0) return { text: content, images: [] };
 
   const fetched = await Promise.all(lines.map(([, url]) => fetchImage(url).catch((error) => {
     if (!(error instanceof UnviewableImageError)) console.error('Failed to fetch image:', error);
-    return error instanceof UnviewableImageError ? error.message : 'couldn\'t be viewed';
+    return { failure: error instanceof UnviewableImageError ? error.message : 'couldn\'t be viewed' };
   })));
 
-  const images: Base64ImageSource[] = [];
+  const images: string[] = [];
   let i = 0;
   const text = content.replace(IMAGE_LINE_RE, (line, url, caption) => {
     const image = fetched[i++];
-    if (typeof image === 'string') return caption ? line : `(${url}) [image: ${image}]`;
+    if (typeof image !== 'string') return caption ? line : `(${url}) [image: ${image.failure}]`;
     images.push(image);
     return `(${url}) [image ${images.length}, shown below]`; // numbered, so a message with several can be told apart
   });

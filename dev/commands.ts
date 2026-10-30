@@ -27,6 +27,7 @@ import { removeHeartbeat, scheduleHeartbeat } from './chatbot/heartbeat';
 import { TOOL_GROUPS, getEmbedding, getSystemPrompt } from './chatbot/chatbot';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
+import { fetchServerChannel } from './chatbot/dm';
 import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, findModel, formatPricing, getModels, getSupportedEfforts, maxTemperature, supportsImages, supportsTemperature, supportsTools } from './chatbot/models';
 import { inputToSchedule, sendReminder } from './utils';
 
@@ -117,8 +118,7 @@ const SCHEDULE_DESCRIPTION = 'Cron (e.g. 0 9 * * * for 9am daily), or a Discord 
 const INVALID_SCHEDULE_MESSAGE = 'That schedule isn\'t a valid cron schedule or Discord timestamp!';
 
 // ==================== chatbot settings ====================
-// shared by /chatbot in servers and the commands of the same name in a DM with the bot's owner (dmCommands.ts), which use the same option names.
-// a DM's server id is its owner's user id
+// a DM with the bot's owner runs these too, with its owner's user id as its server id
 
 const NO_CHATBOT_MESSAGE = 'There is no chatbot here! Try making one with /chatbot create';
 
@@ -1550,7 +1550,7 @@ const ReminderCommand: ConfigCommand = {
 
       // checked before the modal, so a bad channel doesn't throw away what was typed
       const channelOption = interaction.options.getChannel('output-channel');
-      const outputChannel = await interaction.guild!.channels.fetch(channelOption?.id ?? existing?.channel_id ?? interaction.channelId);
+      const outputChannel = await fetchServerChannel(serverID, channelOption?.id ?? existing?.channel_id ?? interaction.channelId);
       if (!outputChannel?.isSendable()) {
         interaction.reply({ content: 'The bot can\'t send messages in that channel!', flags: MessageFlags.Ephemeral });
         return;
@@ -1561,7 +1561,7 @@ const ReminderCommand: ConfigCommand = {
       reminderModal.addLabelComponents(
         textField('schedule', 'Schedule', { value: existing?.cron_schedule, maxLength: 40, placeholder: '0 22 * * *', description: SCHEDULE_DESCRIPTION }),
         textField('message', 'Message', {
-          paragraph: true, value: existing?.message_content, maxLength: 2000, placeholder: 'e.g. It\'s time to take your meds!', description: `What's sent in #${outputChannel.name}`,
+          paragraph: true, value: existing?.message_content, maxLength: 2000, placeholder: 'e.g. It\'s time to take your meds!', description: `What's sent in ${'name' in outputChannel ? `#${outputChannel.name}` : 'this DM'}`,
         }),
         checkboxField('repeats', 'Repeats', 'Keep sending it on the schedule. Otherwise it\'s sent once, then deleted', !!existing?.repeats),
       );
@@ -1886,5 +1886,8 @@ commandMap.set(ReminderCommand.data.name, ReminderCommand);
 commandMap.set(HeartbeatCommand.data.name, HeartbeatCommand);
 commandMap.set(CounterCommand.data.name, CounterCommand);
 
-export { setModel, setReasoningEffort, setTemperature, setTools, setPrompt, modelChoices, effortChoices };
-export { commandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, HeartbeatCommand, CounterCommand, HeartboardCommand, VoicePingCommand };
+// the commands a DM with the bot's owner has too. the rest are built around things only servers have: members, voice channels, reactions on a board
+const dmCommandMap: Map<string, Command> = new Map();
+[ChatbotCommand, ReminderCommand, HeartbeatCommand, CounterCommand].forEach((command) => dmCommandMap.set(command.data.name, command));
+
+export { commandMap, dmCommandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, HeartbeatCommand, CounterCommand, HeartboardCommand, VoicePingCommand };

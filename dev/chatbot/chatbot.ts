@@ -1,22 +1,19 @@
 import path from 'node:path';
 import { ChannelType, Guild, GuildChannel, Message, MessageMentionOptions, SendableChannels, Snowflake, User } from 'discord.js';
-import { ModelMessage, Tool } from 'ai';
 import cron from 'node-cron';
 import { z as zod } from 'zod';
-import { Anthropic } from '@anthropic-ai/sdk';
-
-import { ContentBlockParam, MessageParam, OutputConfig, ServerToolUseBlock, ToolResultBlockParam, ToolUnion, ToolUseBlock } from '@anthropic-ai/sdk/resources';
+import { OpenResponsesResult, ResponsesRequest } from '@openrouter/sdk/models';
 
 import { existsSync, readFileSync } from 'fs';
 
 import { getChatbot, getConversationByChannel, getConversationMessages, getConversationTokenCount, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, getSubscribersAmong, insertConversationMessage, insertConversationToolResult, updateConversationMessageContent, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
 import { ChatbotTable, ConversationMessageTable, ConversationTable, ConversationToolResultTable, HeartbeatTable } from '../types/schema';
 import { estimateTokens, millisToCronSchedule, safeFetch, splitPoint, trackFence } from '../utils';
-import { anthropicClient, discordClient, openAIClient } from '..';
+import { discordClient, openRouter } from '..';
 import { endConversation, getRelevantSummaries, getVisibleToolResults, summarizeConversation } from './conversation';
-import localTools from './tools';
+import localTools, { LocalTool } from './tools';
 import { getVisibleMemories, isAttached, isShareable } from './context';
-import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, supportsImages, supportsTools, temperatureFor } from './models';
+import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, reasoningFor, supportsImages, supportsTemperature, supportsTools, temperatureFor } from './models';
 import { isSandboxEnabled, readNotes } from './sandbox';
 import { withCaptions, withImagePlaceholders, withImages } from './vision';
 import { isDMServer } from './dm';
@@ -84,17 +81,41 @@ function markMessageDeleted(message_id: string): void {
   setTimeout(() => recentlyDeleted.delete(message_id), DELETED_MEMORY_DURATION).unref(); // unref, so it never holds up shutdown
 }
 
-// converts one of our AI SDK tools into the shape the Anthropic SDK expects
-function toAnthropicTool(name: string, localTool: Tool<any, any>): Anthropic.Tool {
-  // the Anthropic format has no field for examples, so they're added to the end of the description
+// what the model is given: its conversation, then the output of each round and its tools' results
+type ModelInput = Exclude<ResponsesRequest['input'], string | undefined>[number];
+type ModelTool = NonNullable<ResponsesRequest['tools']>[number];
+// a message from formatInput, which has an extra system one for the index
+type ModelMessage = { role: 'user' | 'assistant' | 'system', content: string | ({ type: 'input_text', text: string } | { type: 'input_image', detail: 'auto', imageUrl: string })[] };
+
+// converts one of our tools into the shape OpenRouter expects
+function toModelTool(name: string, localTool: LocalTool): ModelTool {
+  // the format has no field for examples, so they're added to the end of the description
   const examples = (localTool.inputExamples ?? []).map((example) => JSON.stringify(example.input)).join('\n');
-  const description = typeof localTool.description === 'string' ? localTool.description : '';
+  const description = localTool.description ?? '';
 
   return {
+    type: 'function',
     name,
     description: (examples ? `${description}\n\nExample inputs:\n${examples}` : description) || undefined,
-    input_schema: zod.toJSONSchema(localTool.inputSchema as unknown as zod.ZodType) as Anthropic.Tool.InputSchema,
+    parameters: zod.toJSONSchema(localTool.inputSchema),
+    strict: false, // our schemas have optional fields, which strict mode doesn't allow
   };
+}
+
+// the name of a tool that ran on OpenRouter's side, from its item in a response. undefined for any other item
+function serverToolName(item: { type: string }): string | undefined {
+  if (item.type === 'web_search_call') return 'web_search'; // some models' own search
+  if (item.type === 'shell_call') return 'shell';
+  return item.type.startsWith('openrouter:') ? item.type.replace(/^openrouter:/, '') : undefined; // e.g. openrouter:web_search -> web_search
+}
+
+// a tool call's arguments, which the model writes as JSON. a broken call gets no input, so the tool itself says what's missing
+function parseToolInput(args: string): any {
+  try {
+    return JSON.parse(args);
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -114,13 +135,12 @@ function getSystemPrompt(chatbot: ChatbotTable): string {
 }
 
 async function getEmbedding(text: string): Promise<number[]> {
-  const embedding = await openAIClient.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: text,
-    encoding_format: 'float',
+  const embedding = await openRouter.embeddings.generate({
+    requestBody: { model: 'openai/text-embedding-3-small', input: text, encodingFormat: 'float' },
   });
+  if (typeof embedding === 'string') throw new Error('Expected an embedding, not a string');
 
-  return embedding.data[0].embedding;
+  return embedding.data[0].embedding as number[];
 }
 
 // a message's reactions, e.g. "😭 3 (you) · :pepeLaugh: 2". empty if it has none
@@ -309,9 +329,10 @@ async function formatInput(guild: Guild | undefined, currentChannel: SendableCha
     const text = `${messageShorthand} ${referenceMap.get(msg.reference_id ?? '') !== undefined ? `↪ ${referenceMap.get(msg.reference_id!)} ` : ''}${msg.author_name}: ${shown?.text ?? msg.message_content}${reactions ? ` <reactions>${reactions}</reactions>` : ''}`;
     if (!shown?.images.length) return [...messageBreak, { role: 'user', content: text }];
 
-    // in the Anthropic SDK's shape rather than the AI SDK's, since that's what the messages are sent with
-    const content: ContentBlockParam[] = [{ type: 'text', text }, ...shown.images.map((source) => ({ type: 'image' as const, source }))];
-    return [...messageBreak, { role: 'user', content } as unknown as ModelMessage];
+    return [...messageBreak, {
+      role: 'user',
+      content: [{ type: 'input_text', text }, ...shown.images.map((imageUrl) => ({ type: 'input_image' as const, detail: 'auto' as const, imageUrl }))],
+    }];
   });
 
   const indexMsg: ModelMessage = {
@@ -338,7 +359,7 @@ async function formatInput(guild: Guild | undefined, currentChannel: SendableCha
     : `<roles>
       ${mentionedRoles.map((role) => `<role id="${role.id}" name="${esc(role.name)}" mentionable="${role.mentionable}" refID="${referenceMap.get(role.id)}" />`).join('\n\t')}
       </roles>`}
-    ${toolList.length === 0 // past tool results go here, since the Anthropic API only accepts a tool result right after the call that made it
+    ${toolList.length === 0 // past tool results go here, since a tool result can only go right after the call that made it
     ? ''
     : `<tool_results>
       ${toolList.map((tool) => `<tool_result name="${esc(tool.tool_name)}" time="${new Date(tool.timestamp).toLocaleString()}"${tool.output.length > MAX_PROMPT_TOOL_RESULT_LENGTH ? ' truncated="true"' : ''}>${esc(tool.output.substring(0, MAX_PROMPT_TOOL_RESULT_LENGTH))}</tool_result>`).join('\n\t')}
@@ -489,7 +510,7 @@ const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, desc
   { list: 'discord', key: 'counters', label: 'Counters', description: 'Change the server\'s counters', tools: ['list_counters', 'counter'] },
   { list: 'other', key: 'web_search', label: 'Web search', description: 'Search the web', tools: ['web_search'] },
   { list: 'other', key: 'fetch_url', label: 'Fetch URLs', description: 'Read web pages and call APIs', tools: ['fetch_url'] },
-  { list: 'other', key: 'workspace', label: 'Workspace', description: 'Run commands and write files in its sandbox', tools: ['shell', 'run_command', 'write_file'] },
+  { list: 'other', key: 'workspace', label: 'Workspace', description: 'Run commands and write files in its sandbox', tools: ['shell', 'run_command', 'write_file', 'edit_file'] },
   { list: 'other', key: 'images', label: 'Images', description: 'Caption and look at images from URLs', tools: ['caption_image', 'view_image'] },
   { list: 'other', key: 'x_search', label: 'X search', description: 'Search posts on X (costs about 5 cents a search)', tools: ['x_search'] },
   { list: 'other', key: 'bluesky', label: 'Bluesky', description: 'Read Bluesky, and post or DM where it\'s logged in', tools: ['bluesky', 'bluesky_act', 'bluesky_dms'] },
@@ -593,6 +614,7 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'shell':
     case 'run_command': return ['ran', quote(input.command ?? (Array.isArray(input.commands) ? input.commands.join('; ') : ''))];
     case 'write_file': return ['wrote', clip(input.path)];
+    case 'edit_file': return ['edited', clip(input.path)];
     // channel refs like [#3] are left as written, so they're turned into channel links with the rest of the reply
     case 'fetch_channel': return ['read', clip(input.channel) || 'this channel'];
     case 'search_channel': return [`searched ${clip(input.channel) || 'this channel'} for`, quote(input.query ?? input.author)];
@@ -838,15 +860,16 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     </index>`;
 
   // models without tool support get none, rather than an error. tools in groups turned off with /chatbot tools are filtered out below
-  const offeredTools: ToolUnion[] | undefined = chatbot.tools_enabled && supportsTools(model) ? [
+  const offeredTools: ModelTool[] | undefined = chatbot.tools_enabled && supportsTools(model) ? [
     {
       type: 'openrouter:web_search',
-      parameters: { engine: 'native', max_results: 20 }, // "native" on Grok includes X search
-    } as unknown as ToolUnion,
+      parameters: { engine: 'native', maxResults: 20 }, // "native" on Grok includes X search
+    },
     // our own persistent workspace when it's set up and the server is attached. otherwise openrouter's shell, which is a fresh container each reply
     ...(useSandbox ? [
-      toAnthropicTool('run_command', localTools.runCommand),
-      toAnthropicTool('write_file', localTools.writeFile),
+      toModelTool('run_command', localTools.runCommand),
+      toModelTool('write_file', localTools.writeFile),
+      toModelTool('edit_file', localTools.editFile),
     ] : [{
       // runs commands in a sandbox on openrouter's side (python 3.11 and node 22 are installed), never on this machine.
       // network is limited to package registries, so it can still pip/npm install
@@ -855,55 +878,56 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         engine: 'openrouter',
         environment: {
           type: 'container_auto',
-          network_policy: { type: 'allowlist', allowed_domains: ['*'] },
+          networkPolicy: { type: 'allowlist', allowedDomains: ['*'] },
         },
       },
-    } as unknown as ToolUnion]),
-    toAnthropicTool('react_to_message', localTools.reactToMessage),
-    toAnthropicTool('change_nickname', localTools.changeNickname),
-    toAnthropicTool('create_reminder', localTools.createReminder),
-    toAnthropicTool('edit_reminder', localTools.editReminder),
-    toAnthropicTool('list_reminders', localTools.listReminders),
-    toAnthropicTool('view_reminder', localTools.viewReminder),
-    toAnthropicTool('remove_reminder', localTools.removeReminder),
-    toAnthropicTool('list_heartbeats', localTools.listHeartbeats),
-    toAnthropicTool('create_heartbeat', localTools.createHeartbeat),
-    toAnthropicTool('edit_heartbeat', localTools.editHeartbeat),
-    toAnthropicTool('delete_heartbeat', localTools.deleteHeartbeat),
-    toAnthropicTool('fetch_channel', localTools.fetchChannel),
-    toAnthropicTool('search_channel', localTools.searchChannel),
-    toAnthropicTool('fetch_embed', localTools.fetchEmbed),
-    toAnthropicTool('search_users', localTools.searchUsers),
-    toAnthropicTool('list_users', localTools.listUsers),
-    toAnthropicTool('view_user', localTools.viewUser),
-    toAnthropicTool('send_message', localTools.sendMessage),
-    toAnthropicTool('create_thread', localTools.createThread),
-    toAnthropicTool('create_memory', localTools.createMemory),
-    toAnthropicTool('edit_memory', localTools.editMemory),
-    toAnthropicTool('list_memories', localTools.listMemories),
-    toAnthropicTool('view_memory', localTools.viewMemory),
-    toAnthropicTool('remove_memory', localTools.removeMemory),
-    toAnthropicTool('search_summaries', localTools.searchSummaries),
-    toAnthropicTool('fetch_url', localTools.fetchURL),
-    toAnthropicTool('caption_image', localTools.captionImage),
-    ...(vision ? [toAnthropicTool('view_image', localTools.viewImage)] : []),
-    toAnthropicTool('list_counters', localTools.listCounters),
-    toAnthropicTool('counter', localTools.counter),
-    toAnthropicTool('metacog', localTools.metacog),
+    } as ModelTool]),
+    toModelTool('react_to_message', localTools.reactToMessage),
+    toModelTool('change_nickname', localTools.changeNickname),
+    toModelTool('create_reminder', localTools.createReminder),
+    toModelTool('edit_reminder', localTools.editReminder),
+    toModelTool('list_reminders', localTools.listReminders),
+    toModelTool('view_reminder', localTools.viewReminder),
+    toModelTool('remove_reminder', localTools.removeReminder),
+    toModelTool('list_heartbeats', localTools.listHeartbeats),
+    toModelTool('create_heartbeat', localTools.createHeartbeat),
+    toModelTool('edit_heartbeat', localTools.editHeartbeat),
+    toModelTool('delete_heartbeat', localTools.deleteHeartbeat),
+    toModelTool('fetch_channel', localTools.fetchChannel),
+    toModelTool('search_channel', localTools.searchChannel),
+    toModelTool('fetch_embed', localTools.fetchEmbed),
+    toModelTool('search_users', localTools.searchUsers),
+    toModelTool('list_users', localTools.listUsers),
+    toModelTool('view_user', localTools.viewUser),
+    toModelTool('send_message', localTools.sendMessage),
+    toModelTool('create_thread', localTools.createThread),
+    toModelTool('create_memory', localTools.createMemory),
+    toModelTool('edit_memory', localTools.editMemory),
+    toModelTool('list_memories', localTools.listMemories),
+    toModelTool('view_memory', localTools.viewMemory),
+    toModelTool('remove_memory', localTools.removeMemory),
+    toModelTool('search_summaries', localTools.searchSummaries),
+    toModelTool('fetch_url', localTools.fetchURL),
+    toModelTool('caption_image', localTools.captionImage),
+    ...(vision ? [toModelTool('view_image', localTools.viewImage)] : []),
+    toModelTool('list_counters', localTools.listCounters),
+    toModelTool('counter', localTools.counter),
+    toModelTool('metacog', localTools.metacog),
     // only offered once the key is in .env, so the model doesn't reach for a tool that can't work
-    ...(process.env.TWITTER_API_KEY ? [toAnthropicTool('x_search', localTools.xSearch)] : []),
-    toAnthropicTool('bluesky', localTools.bluesky), // always offered, since most of it works through the public API without a login
+    ...(process.env.TWITTER_API_KEY ? [toModelTool('x_search', localTools.xSearch)] : []),
+    toModelTool('bluesky', localTools.bluesky), // always offered, since most of it works through the public API without a login
     // acting as the bot's account is public, and its DMs are private, so only attached servers get these, and only once there's a login
     ...(process.env.BLUESKY_HANDLE && (isAttached(serverID) || isDM) ? [
-      // toAnthropicTool('bluesky_act', localTools.blueskyAct),
-      // toAnthropicTool('bluesky_dms', localTools.blueskyDMs),
+      // toModelTool('bluesky_act', localTools.blueskyAct),
+      toModelTool('bluesky_dms', localTools.blueskyDMs),
     ] : []),
   ] : undefined;
   // server tools have no name, only a type like openrouter:web_search
-  const tools = offeredTools?.filter((t) => !disabledTools.has('name' in t ? t.name : String(t.type).replace(/^openrouter:/, '')));
+  const enabledTools = offeredTools?.filter((t) => !disabledTools.has('name' in t ? t.name : serverToolName(t)!));
+  const tools = enabledTools?.length ? enabledTools : undefined;
 
   // tools we execute ourselves. web search runs on OpenRouter's side
-  const localToolMap: Record<string, Tool<any, any>> = {
+  const localToolMap: Record<string, LocalTool> = {
     react_to_message: localTools.reactToMessage,
     change_nickname: localTools.changeNickname,
 
@@ -946,9 +970,10 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
     run_command: localTools.runCommand,
     write_file: localTools.writeFile,
+    edit_file: localTools.editFile,
   };
 
-  const messages = agentInput as MessageParam[];
+  const messages = agentInput as ModelInput[];
   // the heartbeat goes in as the last turn, in place of a message to answer. it isn't saved, so it never looks like something a person said
   if (heartbeat) messages.push({ role: 'user', content: heartbeatTurn(heartbeat) });
 
@@ -984,98 +1009,98 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toolCallIDs?.push(result.tool_call_id);
   };
 
-  // unlike streamText, the Anthropic SDK doesn't run tools for us, so loop until the model stops asking for them
+  // the SDK doesn't run tools for us, so loop until the model stops asking for them
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
     abort?.throwIfAborted();
     // the tools it was using are done, so it's back to thinking, until the stream says it's typing or using another one
     if (step > 0) showStatus(THINKING_STATUS);
     // after Stop, this is the last call, whatever comes back
     const finishing = !!stop?.aborted;
-    const stream = anthropicClient.messages.stream({
-      model,
-      temperature: temperatureFor(model, chatbot.temperature ?? DEFAULT_TEMPERATURE),
-      // reasoning counts toward it too. openrouter treats 0 as no limit, and refuses the request if the credits can't cover that much output
-      max_tokens: 20_000,
-      system: systemPrompt,
-      // openrouter quietly ignores efforts a model can't use. it also accepts 'none' and 'minimal', which the sdk's type doesn't list
-      output_config: { effort: (chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT) as OutputConfig['effort'] },
-      messages,
-      tools,
-      // after Stop, it has to answer rather than call another tool
-      ...(finishing && tools ? { tool_choice: { type: 'none' as const } } : {}),
-    }, { signal: abort });
+    const stream = await openRouter.beta.responses.send({
+      responsesRequest: {
+        model,
+        ...(supportsTemperature(model) ? { temperature: temperatureFor(model, chatbot.temperature ?? DEFAULT_TEMPERATURE) } : {}),
+        // reasoning counts toward it too. openrouter treats 0 as no limit, and refuses the request if the credits can't cover that much output
+        maxOutputTokens: 20_000,
+        instructions: systemPrompt,
+        reasoning: reasoningFor(model, chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT),
+        input: messages,
+        tools,
+        // after Stop, it has to answer rather than call another tool
+        ...(finishing && tools ? { toolChoice: 'none' as const } : {}),
+        stream: true,
+      },
+    }, { fetchOptions: { signal: abort } });
 
     let stepText = ''; // text from this round only, so a "let me check" before a tool call doesn't get posted alongside the real answer
     let afterToolUse = false; // server tools (web search, shell) run mid-response, so text can continue right after one
-    // server tools run on OpenRouter's side, in the middle of the response. each is listed as soon as the stream moves past it,
-    // to its result (shell), or to whatever the model does next (web search, which has no result block), rather than once the response ends
-    const runningServerTools: string[] = []; // ids of ones not listed yet
+    // server tools run on OpenRouter's side, in the middle of the response. each is listed as soon as it finishes, rather than once the response ends
     const listedServerTools = new Set<string>();
-    const listServerTools = () => {
-      if (runningServerTools.length === 0) return;
-      runningServerTools.splice(0).forEach((id) => {
-        const block = stream.currentMessage?.content.find((other: any) => other.id === id) as ServerToolUseBlock | undefined;
-        if (!block) return;
-        listedServerTools.add(id);
-        toolCalls.push({ name: String(block.name).replace(/^openrouter:/, ''), input: block.input });
-      });
-      showStatus();
+    const listServerTool = (item: any) => {
+      listedServerTools.add(item.id);
+      toolCalls.push({ name: serverToolName(item)!, input: item.action });
     };
+    let response: OpenResponsesResult | undefined;
     for await (const event of stream) {
-      if (event.type === 'content_block_start') listServerTools(); // whatever ran before this block is done
-      if (event.type === 'content_block_start' && event.content_block.type === 'server_tool_use') runningServerTools.push(event.content_block.id);
-
-      if (event.type === 'content_block_start' && 'tool_use_id' in event.content_block) {
-        showStatus(THINKING_STATUS); // a server tool's result: it's done, and the model carries on
-      } else if (event.type === 'content_block_start' && (event.content_block.type === 'tool_use' || event.content_block.type === 'server_tool_use')) {
-        showStatus(`-# using ${String(event.content_block.name).replace(/^openrouter:/, '')}...`); // e.g. openrouter:web_search -> web_search
-        afterToolUse = true;
-      } else if (event.type === 'content_block_start' && event.content_block.type === 'thinking') {
-        showStatus(THINKING_STATUS);
-      } else if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+      if (event.type === 'response.output_item.added') {
+        const toolName = serverToolName(event.item) ?? (event.item.type === 'function_call' ? event.item.name : undefined);
+        if (toolName) {
+          showStatus(`-# using ${toolName}...`);
+          afterToolUse = true;
+        } else if (event.item.type === 'reasoning') {
+          showStatus(THINKING_STATUS);
+        }
+      } else if (event.type === 'response.output_item.done' && serverToolName(event.item)) {
+        listServerTool(event.item);
+        showStatus(THINKING_STATUS); // it's done, and the model carries on
+      } else if (event.type === 'response.output_text.delta') {
         if (stage !== TYPING_STATUS && !stop?.aborted) showStatus(TYPING_STATUS);
         // the model never adds a line break itself, so text before and after a tool would run together ("...hellOKAY...")
         if (afterToolUse && stepText && !stepText.endsWith('\n')) stepText += '\n';
         afterToolUse = false;
-        stepText += event.delta.text;
+        stepText += event.delta;
+      } else if (event.type === 'response.completed' || event.type === 'response.incomplete') {
+        response = event.response;
+      } else if (event.type === 'response.failed') {
+        throw new Error(event.response.error?.message ?? 'The response failed');
+      } else if (event.type === 'error') {
+        throw new Error(event.message);
       }
     }
-    listServerTools(); // any it ended on
+    if (!response) throw new Error('The response ended without finishing');
     streamStr = stepText || streamStr; // keep the earlier text if the final round has none
 
-    const response = await stream.finalMessage();
+    // record server-side tool calls (web search, shell), which come back already executed. a shell call has its results on it.
+    // a web search's are citations on the messages after it
+    const { output } = response;
+    output.forEach((item: any, i) => {
+      const toolName = serverToolName(item);
+      if (!toolName) return;
 
-    // record server-side tool calls (web search, shell), which come back already executed. each is a server_tool_use block,
-    // with its results either in a result block pointing back to it (shell: openrouter_shell_tool_result),
-    // or for web search, which has no result block, as citations on the text blocks after it
-    response.content.forEach((block, i) => {
-      if (block.type !== 'server_tool_use') return;
-
-      const resultBlock = response.content.find((other: any) => other.tool_use_id === block.id) as any;
-      let results;
-      if (resultBlock) {
-        results = resultBlock.content;
-      } else {
+      const { sources, ...input } = item.action ?? {};
+      let results = item.output;
+      if (!results) {
         // up to the next call of the same tool, since other tools' calls can come in between (e.g. a search then a shell call)
-        const nextCall = response.content.findIndex((other, j) => j > i && other.type === 'server_tool_use' && other.name === block.name);
-        results = response.content.slice(i + 1, nextCall === -1 ? undefined : nextCall)
-          .flatMap((other) => (other.type === 'text' ? other.citations ?? [] : []))
-          .map((citation: any) => ({ title: citation.title, url: citation.url, cited_text: citation.cited_text }));
+        const nextCall = output.findIndex((other, j) => j > i && serverToolName(other) === toolName);
+        const citations = output.slice(i + 1, nextCall === -1 ? undefined : nextCall)
+          .flatMap((other) => (other.type === 'message' ? other.content : []))
+          .flatMap((part) => (part.type === 'output_text' ? part.annotations ?? [] : []))
+          .flatMap((annotation) => (annotation.type === 'url_citation' ? [{ title: annotation.title, url: annotation.url, cited_text: (annotation as any).content }] : []));
+        results = citations.length > 0 ? citations : sources;
       }
 
-      const toolName = String(block.name).replace(/^openrouter:/, ''); // e.g. openrouter:web_search -> web_search
       // already listed while it streamed, almost always
-      if (!listedServerTools.has(block.id)) {
-        toolCalls.push({ name: toolName, input: block.input });
+      if (!listedServerTools.has(item.id)) {
+        listServerTool(item);
         showStatus();
       }
       saveToolResult({
         conversation_id: conversation.conversation_id,
         timestamp: Date.now(),
-        tool_call_id: block.id,
+        tool_call_id: item.callId ?? item.id,
         tool_name: toolName,
-        output: JSON.stringify({ input: block.input, results }),
-      }, block.input);
+        output: JSON.stringify({ input, results }),
+      }, input);
     });
 
     // even if it asks for a tool anyway, it gets no more calls
@@ -1084,41 +1109,46 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
       break;
     }
 
-    const toolUses = response.content.filter((block): block is ToolUseBlock => block.type === 'tool_use');
-    if (response.stop_reason !== 'tool_use' || toolUses.length === 0) break;
+    const toolUses = output.filter((item) => item.type === 'function_call');
+    if (response.status !== 'completed' || toolUses.length === 0) break;
 
     // run each requested tool, then hand the results back for the next step.
     // after Stop, ones not started yet are skipped, and ones still running are given up on. they finish in the background, and still take effect
-    const toolResults: ToolResultBlockParam[] = await Promise.all(toolUses.map(async (toolUse): Promise<ToolResultBlockParam> => {
-      const stoppedResult: ToolResultBlockParam = { type: 'tool_result', tool_use_id: toolUse.id, content: STOPPED_TOOL_RESULT };
+    const toolResults: ModelInput[] = await Promise.all(toolUses.map(async (toolUse): Promise<ModelInput> => {
+      const stoppedResult: ModelInput = { type: 'function_call_output', callId: toolUse.callId, output: STOPPED_TOOL_RESULT };
       if (stop?.aborted || abort?.aborted) return stoppedResult;
 
       // listed once it finishes, or once it's given up on, so the live list grows with every result
       let listed = false;
+      const input = parseToolInput(toolUse.arguments);
       const list = () => {
         if (listed) return;
         listed = true;
-        toolCalls.push({ name: toolUse.name, input: toolUse.input });
+        toolCalls.push({ name: toolUse.name, input });
         showStatus();
       };
-      const run = (async (): Promise<ToolResultBlockParam> => {
+      const run = (async (): Promise<ModelInput> => {
         const localTool = disabledTools.has(toolUse.name) ? undefined : localToolMap[toolUse.name]; // in case it calls one it wasn't offered
-        const output = localTool?.execute
-          ? await localTool.execute(toolUse.input, { toolCallId: toolUse.id, messages: [], context: replyContext })
+        const output: any = localTool
+          ? await localTool.execute(input, { context: replyContext })
           : { result: 'failure', message: `There is no tool named ${toolUse.name}` };
-        // view_image's image is given to the model as an image block, and left out of what's saved, since it's huge
-        const image = typeof output === 'object' ? output?.image : undefined;
+        // view_image's image is given to the model as an image, and left out of what's saved, since it's huge
+        const image: string | undefined = typeof output === 'object' ? output?.image : undefined;
         const outputStr = typeof output === 'string' ? output : JSON.stringify(image ? { ...output, image: undefined } : output);
 
         saveToolResult({
           conversation_id: conversation.conversation_id,
           timestamp: Date.now(),
-          tool_call_id: toolUse.id,
+          tool_call_id: toolUse.callId,
           tool_name: toolUse.name,
           output: outputStr,
-        }, toolUse.input);
+        }, input);
         list();
-        return { type: 'tool_result', tool_use_id: toolUse.id, content: image ? [{ type: 'text', text: outputStr }, { type: 'image', source: image }] : outputStr };
+        return {
+          type: 'function_call_output',
+          callId: toolUse.callId,
+          output: image ? [{ type: 'input_text', text: outputStr }, { type: 'input_image', detail: 'auto', imageUrl: image }] : outputStr,
+        };
       })();
       run.catch((error) => console.error(error)); // a tool given up on can still fail later, with nothing waiting on it
 
@@ -1126,9 +1156,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     }));
     abort?.throwIfAborted();
 
-    messages.push({ role: 'assistant', content: response.content });
     // a stopped reply is told why its tools stopped, and that it has to answer now
-    messages.push({ role: 'user', content: stop?.aborted ? [...toolResults, { type: 'text', text: STOPPED_NOTE }] : toolResults });
+    messages.push(...output as ModelInput[], ...toolResults, ...(stop?.aborted ? [{ role: 'user' as const, content: STOPPED_NOTE }] : []));
   }
   abort?.throwIfAborted();
 

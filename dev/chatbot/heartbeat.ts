@@ -10,7 +10,7 @@ import { chatbotMentions, generateReply, isAllowedServer } from './chatbot';
 import { getVisibleToolResults, summarizeConversation } from './conversation';
 import { fetchServerChannel } from './dm';
 
-const MAX_BOT_HEARTBEATS = 5; // per server, for ones the bot scheduled itself, since each beat is a model call
+const MAX_BOT_HEARTBEATS = 10; // per server, for ones the bot scheduled itself, since each beat is a model call
 
 // prefixed, so it can't clash with a reminder's task, which is named `${server_id}${reminder_name}`
 function taskName(serverID: Snowflake, heartbeatName: string): string {
