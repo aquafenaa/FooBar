@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 
-import { anthropicClient } from '..';
+import { openRouter } from '..';
+import { reasoningFor, responseText } from './models';
 import { clearConversationMessages, clearConversationToolResults, getAttachedServers, getConversation, getConversationMessages, getConversationToolResults, getConversationSummariesBySource, getConversationSummary, getCrossServerSubscribers, getLatestConversationSummaries, upsertConversation, upsertConversationSummary } from '../data';
 import { getEmbedding } from './chatbot';
 import { ConversationMessageTable, ConversationSummaryTable, ConversationTable, ConversationToolResultTable, ToolResultDiscard } from '../types/schema';
@@ -115,19 +116,21 @@ async function generateSummary(messages: ConversationMessageTable[], toolResults
     })),
   ].sort((a, b) => a.timestamp - b.timestamp).map((entry) => entry.text).join('\n');
 
-  const result = await anthropicClient.messages.create({
-    model: SUMMARY_MODEL,
-    max_tokens: 4096, // room for reasoning before the summary itself
-    system: conversationSummaryPrompt,
-    output_config: { effort: 'medium' },
-    temperature: 0.3,
-    messages: [{
-      role: 'user',
-      content: `${previousSummary ? `PREVIOUS SUMMARY:\n${previousSummary}\n\n` : ''}MESSAGES:\n${transcript}`,
-    }],
+  const result = await openRouter.beta.responses.send({
+    responsesRequest: {
+      model: SUMMARY_MODEL,
+      maxOutputTokens: 4096, // room for reasoning before the summary itself
+      instructions: conversationSummaryPrompt,
+      reasoning: reasoningFor(SUMMARY_MODEL, 'medium'),
+      temperature: 0.3,
+      input: [{
+        role: 'user',
+        content: `${previousSummary ? `PREVIOUS SUMMARY:\n${previousSummary}\n\n` : ''}MESSAGES:\n${transcript}`,
+      }],
+    },
   });
 
-  const text = result.content.flatMap((block) => (block.type === 'text' ? [block.text] : [])).join('\n').trim();
+  const text = responseText(result);
   return text ? text.substring(0, MAX_SUMMARY_LENGTH) : undefined;
 }
 

@@ -1,11 +1,13 @@
 // OpenRouter's model list, for choosing a chatbot's model and knowing what it supports.
 // it's ~800kb, too slow to fetch on every autocomplete keystroke, so it's kept in memory and refreshed hourly
 
+import { OpenResponsesResult, ReasoningConfig, ReasoningEffort } from '@openrouter/sdk/models';
+
 const MODELS_URL = 'https://openrouter.ai/api/v1/models'; // public, no key needed
 const REFRESH_INTERVAL = 60 * 60_000; // 1 hour
 
 // used whenever a chatbot hasn't picked a model, effort, or temperature
-const DEFAULT_MODEL = 'z-ai/glm-5.3';
+const DEFAULT_MODEL = '~z-ai/glm-flash-latest';
 const DEFAULT_REASONING_EFFORT = 'medium';
 const DEFAULT_TEMPERATURE = 1.0;
 const MAX_TEMPERATURE = 2; // the most OpenRouter takes
@@ -97,10 +99,30 @@ function getSupportedEfforts(id: string): string[] {
   return supported ? REASONING_EFFORTS.filter((effort) => supported.includes(effort)) : REASONING_EFFORTS;
 }
 
+/**
+ * The reasoning setting to send a model. OpenRouter refuses a level the model doesn't have, e.g. "none" on a model that has to reason,
+ * so it's the closest level it does have, the lower one on a tie. Nothing for a model that can't reason, which also refuses the setting
+ */
+function reasoningFor(id: string, effort: string): ReasoningConfig | undefined {
+  const supported = getSupportedEfforts(id);
+  if (supported.length === 0) return undefined;
+
+  const distance = (level: string) => Math.abs(REASONING_EFFORTS.indexOf(level) - REASONING_EFFORTS.indexOf(effort));
+  const closest = supported.reduce((best, level) => (distance(level) < distance(best) ? level : best));
+  return { effort: closest as ReasoningEffort };
+}
+
+// the text a response ended with
+function responseText(response: OpenResponsesResult): string {
+  return response.output.flatMap((item) => (item.type === 'message' ? item.content : []))
+    .flatMap((part) => (part.type === 'output_text' ? [part.text] : []))
+    .join('\n').trim();
+}
+
 // e.g. "$0.08/$3.20 per M": usd per million input/output tokens
 function formatPricing(model: OpenRouterModel): string {
   const perMillion = (price: string) => `$${(Number(price) * 1_000_000).toFixed(2)}`;
   return `${perMillion(model.pricing.prompt)}/${perMillion(model.pricing.completion)} per M`;
 }
 
-export { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, REASONING_EFFORTS, OpenRouterModel, loadModels, getModels, findModel, supportsTools, supportsImages, supportsTemperature, maxTemperature, temperatureFor, getSupportedEfforts, formatPricing };
+export { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, REASONING_EFFORTS, OpenRouterModel, loadModels, getModels, findModel, supportsTools, supportsImages, supportsTemperature, maxTemperature, temperatureFor, getSupportedEfforts, reasoningFor, responseText, formatPricing };

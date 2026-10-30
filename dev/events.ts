@@ -1,7 +1,7 @@
 import { BaseMessageOptions, Channel, ChannelType, Client, EmbedBuilder, Events, GuildMember, Message, MessageFlags, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, User } from 'discord.js';
 import cron from 'node-cron';
 
-import { commandMap } from './commands';
+import { commandMap, dmCommandMap } from './commands';
 import { THINKING_STATUS, generateReply, isAllowedServer, markMessageDeleted } from './chatbot/chatbot';
 import { loadHeartbeats } from './chatbot/heartbeat';
 import { PendingReply, discardToolResults, forgetReply, nextAttempt, restartReply, handleReplyButton, handleStatusButton, sendReply, statusButtons, trackReply, untrackReply } from './chatbot/replies';
@@ -12,7 +12,6 @@ import { inputToSchedule, safeFetch, sendReminder } from './utils';
 import { scheduleExpireTask } from './chatbot/conversation';
 import { loadModels } from './chatbot/models';
 import { dmRecipient, ensureDMServer, fetchServerChannel, handleDMCommand, isDMServer, isDMUser } from './chatbot/dm';
-import { dmCommandMap } from './dmCommands';
 
 const heartboardEmbedBuilder = (author: GuildMember | null, message: Message<boolean> | PartialMessage<boolean>, reaction: MessageReaction): BaseMessageOptions => {
   const authorName = author?.nickname ?? author?.displayName;
