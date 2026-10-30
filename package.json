@@ -1,8 +1,5 @@
 {
   "dependencies": {
-    "@discord-player/extractor": "^4.4.0",
-    "@discord-player/utils": "^0.2.2",
-    "@discordjs/opus": "github:discordjs/opus",
     "@openrouter/sdk": "^1.5.30",
     "better-sqlite3": "^12.5.0",
     "discord.js": "^14.27.0",
@@ -33,7 +30,6 @@
   "license": "ISC",
   "description": "",
   "allowScripts": {
-    "better-sqlite3@12.5.0": true,
-    "github:discordjs/opus#3f4a3d4cc3997107435a59ae86bc044d6c3be73e": true
+    "better-sqlite3@12.5.0": true
   }
 }
