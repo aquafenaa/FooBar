@@ -29,7 +29,7 @@ import { addChatbotSubscriber, addReminder, deleteAllHeartBoardEmojis, deleteAll
   updateHeartBoard, updateReminder, updateVoicePing, upsertChatbot, upsertConversationSummary,
   getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat } from './data';
 import { AutomaticResponseTable, ChatbotTable, ConversationSummaryTable, ReminderTable, HeartbeatTable, HeartBoardTable, VoicePingTable } from './types/schema';
-import { removeHeartbeat, scheduleHeartbeat } from './chatbot/heartbeat';
+import { removeHeartbeat, scheduleHeartbeat, triggerHeartbeat } from './chatbot/heartbeat';
 import { TOOL_GROUPS, getEmbedding, getSystemPrompt } from './chatbot/chatbot';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
@@ -1792,6 +1792,9 @@ const HeartbeatCommand: ConfigCommand = {
     .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View a heartbeat, or every heartbeat in this server')
       .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat. Leave blank to view all')
         .setAutocomplete(true)))
+    .addSubcommand((triggerSubcommand) => triggerSubcommand.setName('trigger').setDescription('Run a heartbeat now, without changing its schedule')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat')
+        .setRequired(true).setAutocomplete(true)))
     .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete').setDescription('Delete a heartbeat')
       .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the heartbeat')
         .setRequired(true).setAutocomplete(true))),
@@ -1881,6 +1884,11 @@ const HeartbeatCommand: ConfigCommand = {
 
     if (subcommand === 'view') {
       interaction.reply({ embeds: [this.configEmbedBuilder(serverID, heartbeat)], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (subcommand === 'trigger') {
+      const problem = triggerHeartbeat(heartbeat);
+      interaction.reply({ content: problem ?? `Running heartbeat **${heartbeat.heartbeat_name}** now!`, flags: MessageFlags.Ephemeral });
       return;
     }
     if (subcommand === 'delete') {

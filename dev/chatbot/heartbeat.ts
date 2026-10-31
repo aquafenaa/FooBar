@@ -59,11 +59,11 @@ async function settleConversation(conversationID: string): Promise<void> {
 // heartbeats still generating, so a slow beat is skipped rather than overlapping with the next one
 const running = new Set<string>();
 
-async function runHeartbeat(serverID: Snowflake, heartbeatName: string): Promise<void> {
+async function runHeartbeat(serverID: Snowflake, heartbeatName: string, triggered = false): Promise<void> {
   const heartbeat = getHeartbeat(serverID, heartbeatName); // read fresh, so edits since it was scheduled apply
   if (!heartbeat) return;
   // removed before running, so a one-time heartbeat never fires twice, even if its reply fails
-  if (!heartbeat.repeats) removeHeartbeat(heartbeat);
+  if (!heartbeat.repeats && !triggered) removeHeartbeat(heartbeat);
 
   const key = taskName(serverID, heartbeatName);
   if (running.has(key)) return;
@@ -127,4 +127,18 @@ async function runHeartbeat(serverID: Snowflake, heartbeatName: string): Promise
   if (conversationID) await settleConversation(conversationID).catch((error) => console.error(error));
 }
 
-export { MAX_BOT_HEARTBEATS, scheduleHeartbeat, removeHeartbeat, loadHeartbeats };
+/**
+ * Runs a heartbeat now, on top of its schedule, so a one-time one still runs when it's due.
+ * Doesn't wait for the beat to finish. Returns why it can't run instead, worded to show as-is
+ */
+function triggerHeartbeat(heartbeat: HeartbeatTable): string | undefined {
+  if (running.has(taskName(heartbeat.server_id, heartbeat.heartbeat_name))) return `**${heartbeat.heartbeat_name}** is already running!`;
+
+  const chatbot = getChatbot(heartbeat.server_id);
+  if (!chatbot?.chatbot_enabled || !chatbot.tools_enabled || !isAllowedServer(heartbeat.server_id)) return 'Heartbeats only run while the chatbot and its tools are enabled here!';
+
+  runHeartbeat(heartbeat.server_id, heartbeat.heartbeat_name, true).catch((error) => console.error(error));
+  return undefined;
+}
+
+export { MAX_BOT_HEARTBEATS, scheduleHeartbeat, removeHeartbeat, loadHeartbeats, triggerHeartbeat };
