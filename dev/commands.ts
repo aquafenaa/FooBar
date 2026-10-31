@@ -1,5 +1,10 @@
 import {
+  ActionRowBuilder,
+  AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   ChatInputCommandInteraction,
+  MessageComponentInteraction,
   Snowflake, AutocompleteInteraction,
   EmbedBuilder, MessageFlags, SlashCommandBuilder,
   ChannelType,
@@ -12,6 +17,7 @@ import {
   TextDisplayBuilder,
   CheckboxBuilder,
   CheckboxGroupBuilder,
+  StringSelectMenuBuilder,
 } from 'discord.js';
 import cron from 'node-cron';
 import { Command, ConfigCommand } from './types/bot';
@@ -99,7 +105,7 @@ function overflowNote(text: string | undefined, what: string): TextDisplayBuilde
  * Shows a modal, and waits for it to be sent. Undefined if it's closed or runs out of time,
  * which Discord never tells us about, so it isn't treated as an error
  */
-async function askModal(interaction: ChatInputCommandInteraction, modal: ModalBuilder): Promise<ModalSubmitInteraction | undefined> {
+async function askModal(interaction: ChatInputCommandInteraction | MessageComponentInteraction, modal: ModalBuilder): Promise<ModalSubmitInteraction | undefined> {
   const modalID = `modal:${interaction.id}`;
   await interaction.showModal(modal.setCustomId(modalID));
   return interaction.awaitModalSubmit({ time: MODAL_TIMEOUT, filter: (submit) => submit.customId === modalID && submit.user.id === interaction.user.id })
@@ -111,6 +117,161 @@ function rejectModal(submit: ModalSubmitInteraction, message: string, draft?: st
   const room = 2000 - message.length - 80;
   const kept = draft && room > 0 ? `\n-# Here's what you wrote, so it isn't lost:\n\`\`\`\n${draft.replace(/```/g, '`​``').substring(0, room)}\n\`\`\`` : '';
   submit.reply({ content: `${message}${kept}`, flags: MessageFlags.Ephemeral }).catch((error) => console.error(error));
+}
+
+const SUMMARIES_PER_PAGE = 10;
+const SUMMARY_PREVIEW_LENGTH = 200; // characters of each summary shown on a page
+const SUMMARY_BROWSER_TIMEOUT = 14 * 60_000; // a reply can't be edited after 15 minutes, so its buttons are taken away just before then
+
+function countSummaries(count: number): string {
+  return `${count.toLocaleString()} ${count === 1 ? 'summary' : 'summaries'}`;
+}
+
+function summaryPreview(summary: ConversationSummaryTable, length: number): string {
+  return summary.summary.replace(/\s+/g, ' ').substring(0, length);
+}
+
+async function editSummary(interaction: ChatInputCommandInteraction | MessageComponentInteraction, summary: ConversationSummaryTable): Promise<void> {
+  const summaryModal = new ModalBuilder().setTitle(`Edit ${summaryScopeLabel(summary)} summary · ${new Date(summary.timestamp).toLocaleDateString()}`.substring(0, 45));
+  const note = overflowNote(summary.summary, 'summary');
+  if (note) summaryModal.addTextDisplayComponents(note);
+  summaryModal.addLabelComponents(textField('summary', 'Summary', {
+    paragraph: true,
+    value: summary.summary,
+    description: 'What the chatbot recalls about this conversation, when it comes up again',
+  }));
+
+  const submit = await askModal(interaction, summaryModal);
+  if (!submit) return;
+
+  await submit.deferReply({ flags: MessageFlags.Ephemeral }); // embedding can take longer than discord's 3 second reply window
+  const newSummary = submit.fields.getTextInputValue('summary');
+  try {
+    // re-embed, so relevant summary lookup matches the new text
+    upsertConversationSummary({ ...summary, summary: newSummary, embedding: await getEmbedding(newSummary) });
+    await submit.editReply({ content: 'Successfully updated summary!' });
+  } catch (error) {
+    console.error(error);
+    await submit.editReply({ content: `Failed to save the summary.\n-# Here's what you wrote, so it isn't lost:\n\`\`\`\n${newSummary.substring(0, 1850)}\n\`\`\`` });
+  }
+}
+
+// asks first, since it can't be undone. returns whether they were deleted
+async function confirmDeleteSummaries(interaction: ChatInputCommandInteraction | MessageComponentInteraction, summaries: ConversationSummaryTable[]): Promise<boolean> {
+  const confirmModal = new ModalBuilder().setTitle('Delete Summaries')
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`This deletes **${countSummaries(summaries.length)}**. The chatbot will forget them for good.`))
+    .addLabelComponents(checkboxField('confirm', 'Yes, delete them', 'This can\'t be undone'));
+
+  const submit = await askModal(interaction, confirmModal);
+  if (!submit) return false;
+  if (!submit.fields.getCheckbox('confirm')) {
+    await submit.reply({ content: 'Nothing was deleted, since the box wasn\'t ticked.', flags: MessageFlags.Ephemeral });
+    return false;
+  }
+
+  summaries.forEach((summary) => deleteConversationSummary(summary.conversation_id, summary.source_id));
+  await submit.reply({ content: `Successfully deleted ${countSummaries(summaries.length)}!`, flags: MessageFlags.Ephemeral });
+  return true;
+}
+
+/**
+ * Pages through a server's summaries, newest first, in a reply only its user sees.
+ * The dropdown picks from the page being shown, so changing page clears what's picked
+ */
+async function browseSummaries(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+  let page = 0;
+  let search = '';
+  let selected: string[] = [];
+
+  // read fresh each time, so it never shows one that's since been deleted or edited
+  const matching = () => getServerSummaries(serverID).reverse().filter((summary) => summary.summary.toLowerCase().includes(search.toLowerCase()));
+  const selectedSummaries = () => matching().filter((summary) => selected.includes(summaryKey(summary)));
+
+  const render = () => {
+    const summaries = matching();
+    const pageCount = Math.max(Math.ceil(summaries.length / SUMMARIES_PER_PAGE), 1);
+    page = Math.min(page, pageCount - 1); // deleting the last one on the last page leaves it empty
+    const shown = summaries.slice(page * SUMMARIES_PER_PAGE, (page + 1) * SUMMARIES_PER_PAGE);
+    selected = selected.filter((key) => shown.some((summary) => summaryKey(summary) === key));
+
+    const embed = new EmbedBuilder().setTitle('Conversation Summaries')
+      .setDescription(shown.map((summary) => `**<t:${Math.floor(summary.timestamp / 1000)}:f>** · ${summaryScopeLabel(summary)}\n${summaryPreview(summary, SUMMARY_PREVIEW_LENGTH)}`).join('\n\n') || 'No summaries match that search.')
+      .setFooter({ text: `Page ${page + 1} of ${pageCount} · ${countSummaries(summaries.length)}${search ? ` matching "${search}"` : ''}` });
+
+    const button = (id: string, label: string, style: ButtonStyle, disabled: boolean) => new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(style).setDisabled(disabled);
+    const components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        button('prev', '◀ Newer', ButtonStyle.Secondary, page === 0),
+        button('next', 'Older ▶', ButtonStyle.Secondary, page >= pageCount - 1),
+        button('search', '🔍 Search', ButtonStyle.Secondary, false),
+      ),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        button('view', 'View', ButtonStyle.Primary, selected.length === 0),
+        button('edit', 'Edit', ButtonStyle.Secondary, selected.length !== 1),
+        button('delete', '🗑️ Delete', ButtonStyle.Danger, selected.length === 0),
+      ),
+    ];
+    // a dropdown needs at least one option, so it's left out when nothing matches
+    if (shown.length > 0) {
+      components.unshift(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(new StringSelectMenuBuilder()
+        .setCustomId('select').setPlaceholder('Select summaries…').setMinValues(0).setMaxValues(shown.length)
+        .addOptions(shown.map((summary) => ({
+          label: `${new Date(summary.timestamp).toLocaleString()} · ${summaryScopeLabel(summary)}`,
+          description: summaryPreview(summary, 100) || undefined,
+          value: summaryKey(summary),
+          default: selected.includes(summaryKey(summary)),
+        })))));
+    }
+
+    return { embeds: [embed], components };
+  };
+  // after a modal, whose own reply is what's used up
+  const refresh = () => interaction.editReply(render());
+
+  const handleComponent = async (component: MessageComponentInteraction) => {
+    if (component.isStringSelectMenu()) {
+      selected = component.values;
+      await component.update(render());
+    } else if (component.customId === 'prev' || component.customId === 'next') {
+      page += component.customId === 'next' ? 1 : -1;
+      selected = [];
+      await component.update(render());
+    } else if (component.customId === 'search') {
+      const submit = await askModal(component, new ModalBuilder().setTitle('Search Summaries')
+        .addLabelComponents(textField('query', 'Search for', { value: search, maxLength: 100, required: false, description: 'Leave empty to show every summary again' })));
+      if (!submit?.isFromMessage()) return;
+
+      search = submit.fields.getTextInputValue('query').trim();
+      page = 0;
+      selected = [];
+      await submit.update(render());
+    } else if (component.customId === 'view') {
+      const text = selectedSummaries().map((summary) => `${new Date(summary.timestamp).toLocaleString()} · ${summaryScopeLabel(summary)}\n\n${summary.summary}`).join('\n\n---\n\n');
+      // an embed only holds 4096 characters, so anything longer comes as a file, rather than being cut off
+      await component.reply(text.length <= 4096
+        ? { embeds: [new EmbedBuilder().setDescription(text || 'That summary no longer exists.')], flags: MessageFlags.Ephemeral }
+        : { files: [new AttachmentBuilder(Buffer.from(text), { name: 'summaries.txt' })], flags: MessageFlags.Ephemeral });
+    } else if (component.customId === 'edit') {
+      const [summary] = selectedSummaries();
+      if (!summary) return;
+      await editSummary(component, summary);
+      await refresh();
+    } else if (component.customId === 'delete') {
+      if (await confirmDeleteSummaries(component, selectedSummaries())) {
+        selected = [];
+        await refresh();
+      }
+    }
+  };
+
+  const reply = await interaction.reply({ ...render(), flags: MessageFlags.Ephemeral });
+  const collector = reply.createMessageComponentCollector({ time: SUMMARY_BROWSER_TIMEOUT });
+  collector.on('collect', (component) => {
+    handleComponent(component).catch((error) => console.error(error));
+  });
+  collector.on('end', () => {
+    interaction.editReply({ content: '-# This list has expired. Run the command again to keep going.', components: [] }).catch((error) => console.error(error));
+  });
 }
 
 // what the schedule fields accept. both are stored as cron
@@ -552,24 +713,7 @@ const ChatbotCommand: ConfigCommand = {
           return;
         }
 
-        // embeds cap at 25 fields, 1024 chars per field, and 6000 chars total, so show the newest summaries that fit
-        const fields: { name: string, value: string }[] = [];
-        let totalLength = 0;
-        for (const summary of [...summaries].reverse()) {
-          const field = {
-            name: `${summary.conversation_id} (${summaryScopeLabel(summary)}, ${new Date(summary.timestamp).toLocaleString()})`,
-            value: summary.summary.substring(0, 1024),
-          };
-          if (fields.length === 25 || totalLength + field.name.length + field.value.length > 5_800) break;
-
-          fields.push(field);
-          totalLength += field.name.length + field.value.length;
-        }
-
-        const summariesEmbed = new EmbedBuilder().setTitle('Conversation Summaries')
-          .addFields(...fields)
-          .setFooter({ text: `Showing ${fields.length} of ${summaries.length} summaries` });
-        interaction.reply({ embeds: [summariesEmbed], flags: MessageFlags.Ephemeral });
+        await browseSummaries(interaction, serverID);
         return;
       }
       if (subcommand === 'edit') {
@@ -579,35 +723,18 @@ const ChatbotCommand: ConfigCommand = {
           return;
         }
 
-        const summaryModal = new ModalBuilder().setTitle(`Edit ${summaryScopeLabel(summary)} summary · ${new Date(summary.timestamp).toLocaleDateString()}`.substring(0, 45));
-        const note = overflowNote(summary.summary, 'summary');
-        if (note) summaryModal.addTextDisplayComponents(note);
-        summaryModal.addLabelComponents(textField('summary', 'Summary', {
-          paragraph: true,
-          value: summary.summary,
-          description: 'What the chatbot recalls about this conversation, when it comes up again',
-        }));
-
-        const submit = await askModal(interaction, summaryModal);
-        if (!submit) return;
-
-        await submit.deferReply({ flags: MessageFlags.Ephemeral }); // embedding can take longer than discord's 3 second reply window
-        const newSummary = submit.fields.getTextInputValue('summary');
-        try {
-          // re-embed, so relevant summary lookup matches the new text
-          upsertConversationSummary({ ...summary, summary: newSummary, embedding: await getEmbedding(newSummary) });
-          submit.editReply({ content: 'Successfully updated summary!' });
-        } catch (error) {
-          console.error(error);
-          submit.editReply({ content: `Failed to save the summary.\n-# Here's what you wrote, so it isn't lost:\n\`\`\`\n${newSummary.substring(0, 1850)}\n\`\`\`` });
-        }
+        await editSummary(interaction, summary);
         return;
       }
       if (subcommand === 'delete') {
         // deletes both the local and shared copies of every conversation from this server
         if (!summaryOption) {
-          summaries.forEach((s) => deleteConversationSummary(s.conversation_id, s.source_id));
-          interaction.reply({ content: `Successfully deleted ${summaries.length} summaries!`, flags: MessageFlags.Ephemeral });
+          if (summaries.length === 0) {
+            interaction.reply({ content: 'There are no conversation summaries in this server!', flags: MessageFlags.Ephemeral });
+            return;
+          }
+
+          await confirmDeleteSummaries(interaction, summaries);
           return;
         }
 
