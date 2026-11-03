@@ -13,7 +13,8 @@ import { discordClient, openRouter } from '..';
 import { endConversation, getRelevantSummaries, getVisibleToolResults, summarizeConversation } from './conversation';
 import localTools, { LocalTool } from './tools';
 import { getVisibleMemories, isAttached, isShareable } from './context';
-import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, reasoningFor, supportsImages, supportsTemperature, supportsTools, temperatureFor } from './models';
+import { AUTO_EFFORT, judgeEffort } from './effort';
+import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, getSupportedEfforts, reasoningFor, supportsImages, supportsTemperature, supportsTools, temperatureFor } from './models';
 import { isSandboxEnabled, readNotes } from './sandbox';
 import { withCaptions, withImagePlaceholders, withImages } from './vision';
 import { isDMServer } from './dm';
@@ -1009,6 +1010,13 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toolCallIDs?.push(result.tool_call_id);
   };
 
+  // judged once, so every step of the reply below uses the same effort. the referenced message may already be part of the context
+  let reasoningEffort = chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT;
+  if (reasoningEffort === AUTO_EFFORT && getSupportedEfforts(model).length > 0) {
+    const reference = referenceMessage ?? conversationContext.find((msg) => msg.message_id === messageReference?.id);
+    reasoningEffort = await judgeEffort({ message: promptMessage, reference, toolResults: toolContext, memories }, abort);
+  }
+
   // the SDK doesn't run tools for us, so loop until the model stops asking for them
   for (let step = 0; step < MAX_TOOL_STEPS; step++) {
     abort?.throwIfAborted();
@@ -1023,7 +1031,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         // reasoning counts toward it too. openrouter treats 0 as no limit, and refuses the request if the credits can't cover that much output
         maxOutputTokens: 20_000,
         instructions: systemPrompt,
-        reasoning: reasoningFor(model, chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT),
+        reasoning: reasoningFor(model, reasoningEffort),
         input: messages,
         tools,
         // after Stop, it has to answer rather than call another tool
