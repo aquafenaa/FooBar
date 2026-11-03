@@ -34,6 +34,7 @@ import { TOOL_GROUPS, getEmbedding, getSystemPrompt } from './chatbot/chatbot';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
 import { fetchServerChannel } from './chatbot/dm';
+import { AUTO_EFFORT } from './chatbot/effort';
 import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, findModel, formatPricing, getModels, getSupportedEfforts, maxTemperature, supportsImages, supportsTemperature, supportsTools } from './chatbot/models';
 import { inputToSchedule, sendReminder } from './utils';
 
@@ -307,7 +308,7 @@ async function setModel(interaction: ChatInputCommandInteraction, serverID: Snow
   const effort = chatbot.reasoning_effort ?? DEFAULT_REASONING_EFFORT;
   const efforts = getSupportedEfforts(model.id);
   const effortNote = efforts.length === 0 ? 'This model doesn\'t reason, so the reasoning effort is ignored.'
-    : !efforts.includes(effort) ? `This model doesn't support the current \`${effort}\` reasoning effort. It supports ${efforts.join(', ')}.`
+    : effort !== AUTO_EFFORT && !efforts.includes(effort) ? `This model doesn't support the current \`${effort}\` reasoning effort. It supports ${efforts.join(', ')}.`
       : '';
 
   interaction.reply({
@@ -316,6 +317,12 @@ async function setModel(interaction: ChatInputCommandInteraction, serverID: Snow
       + (effortNote ? `\n${effortNote}` : ''),
     flags: MessageFlags.Ephemeral,
   });
+}
+
+// the efforts that can be set: the model's own, and auto once Jev has a key, like the other tools that need one
+function selectableEfforts(modelID: string): string[] {
+  const efforts = getSupportedEfforts(modelID);
+  return efforts.length > 0 && process.env.JEV_KEY ? [AUTO_EFFORT, ...efforts] : efforts;
 }
 
 // option "query": an effort level, filled in by effortChoices
@@ -328,7 +335,7 @@ async function setReasoningEffort(interaction: ChatInputCommandInteraction, serv
 
   const effort = interaction.options.getString('query')!.toLowerCase();
   const modelID = chatbot.model ?? DEFAULT_MODEL;
-  const efforts = getSupportedEfforts(modelID);
+  const efforts = selectableEfforts(modelID);
   if (efforts.length === 0) {
     interaction.reply({ content: `\`${modelID}\` doesn't reason, so there's no effort to set. Try a different model!`, flags: MessageFlags.Ephemeral });
     return;
@@ -471,9 +478,9 @@ async function effortChoices(interaction: AutocompleteInteraction, serverID: Sno
   const modelID = getChatbot(serverID)?.model ?? DEFAULT_MODEL;
   const modelDefault = findModel(modelID)?.reasoning?.default_effort;
 
-  await interaction.respond(getSupportedEfforts(modelID)
+  await interaction.respond(selectableEfforts(modelID)
     .filter((effort) => effort.includes(focusedValue))
-    .map((effort) => ({ name: effort === modelDefault ? `${effort} (model's default)` : effort, value: effort })));
+    .map((effort) => ({ name: effort === modelDefault ? `${effort} (model's default)` : effort === AUTO_EFFORT ? 'auto (Jev judges each message)' : effort, value: effort })));
 }
 
 const ChatbotCommand: ConfigCommand = {
