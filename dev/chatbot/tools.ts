@@ -1514,23 +1514,25 @@ const blueskyDMs = tool({
   description: 'Your Bluesky direct messages, which are private. Actions: '
     + '"list" your conversations, newest first, with unread counts. '
     + '"read" your conversation with someone, oldest first, which marks it read. '
-    + '"send" someone a message, starting a conversation if there isn\'t one. '
+    + '"send" someone a message, a post, or both, starting a conversation if there isn\'t one. You can only send to people who follow you. '
     + 'Give more: true with list or read for the next (older) page.',
   inputExamples: [
     { input: { action: 'list' } },
     { input: { action: 'read', with: '@jay.bsky.team' } },
     { input: { action: 'read', with: '@jay.bsky.team', more: true } },
     { input: { action: 'send', with: '@jay.bsky.team', text: 'Hey! Thanks for the follow.' } },
+    { input: { action: 'send', with: '@jay.bsky.team', post: 'https://bsky.app/profile/bsky.app/post/3l6oveex3ii2l', text: 'thought you\'d like this' } },
   ],
   inputSchema: zod.object({
     action: zod.enum(['list', 'read', 'send']),
     with: zod.string().optional().describe('For read and send: their handle or profile link, or a conversation id from list'),
-    text: zod.string().optional().describe(`For send: the message, at most ${BLUESKY_MAX_DM_LENGTH} characters`),
+    text: zod.string().optional().describe(`For send: the message, at most ${BLUESKY_MAX_DM_LENGTH} characters. Can be left out when sending a post`),
+    post: zod.string().optional().describe('For send: a post to share with them, by its bsky.app link or at:// uri'),
     more: zod.boolean().optional().describe('For list and read: get the next, older page'),
     count: zod.number().int().optional().describe(`How many conversations or messages, from 1 to ${MAX_BLUESKY_POSTS}. Defaults to 15`),
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { action: 'list' | 'read' | 'send', with?: string, text?: string, more?: boolean, count?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', conversations?: Record<string, unknown>[], messages?: Record<string, unknown>[], has_more?: boolean, message: string }> => {
+  execute: async (input: { action: 'list' | 'read' | 'send', with?: string, text?: string, post?: string, more?: boolean, count?: number }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', conversations?: Record<string, unknown>[], messages?: Record<string, unknown>[], has_more?: boolean, message: string }> => {
     if (!isAttached(context.server_id) && !context.dm) return { result: 'failure', message: BLUESKY_DETACHED_MESSAGE }; // a DM with the bot's owner always can
 
     const { action } = input;
@@ -1539,12 +1541,9 @@ const blueskyDMs = tool({
     const limit = Math.min(Math.max(input.count ?? 15, 1), MAX_BLUESKY_POSTS);
 
     if (action === 'send') {
-      const text = input.text?.trim();
-      if (!text) return { result: 'failure', message: 'Give a message to send.' };
+      const text = input.text?.trim() ?? '';
+      if (!text && !input.post?.trim()) return { result: 'failure', message: 'Give a message or a post to send.' };
       if (graphemeLength(text) > BLUESKY_MAX_DM_LENGTH) return { result: 'failure', message: `Messages can be at most ${BLUESKY_MAX_DM_LENGTH} characters.` };
-      if (!countUse(blueskyPostCounts, context, MAX_BLUESKY_POSTS_PER_REPLY)) {
-        return { result: 'failure', message: `You've already posted ${MAX_BLUESKY_POSTS_PER_REPLY} times on Bluesky this reply, the most allowed.` };
-      }
     }
 
     try {
@@ -1582,9 +1581,31 @@ const blueskyDMs = tool({
       const with_ = convo.members.filter((member: any) => member.did !== session.did).map((member: any) => `@${member.handle}`).join(', ');
 
       if (action === 'send') {
-        const text = input.text!.trim();
-        await blueskyChat('chat.bsky.convo.sendMessage', {}, { convoId: convo.id, message: { text, facets: await detectBlueskyFacets(text) } });
-        return { result: 'success', message: `Sent a message to ${with_}.` };
+        const text = input.text?.trim() ?? '';
+        // only to people who follow it, every member of a group. checked by the conversation's members, however they were named
+        const others = convo.members.filter((member: any) => member.did !== session.did);
+        const { relationships } = await blueskyGet('app.bsky.graph.getRelationships', { actor: session.did, others: others.map((member: any) => member.did) });
+        const notFollowing = others.filter((member: any) => !relationships.some((relationship: any) => relationship.did === member.did && relationship.followedBy));
+        if (notFollowing.length > 0) {
+          const names = notFollowing.map((member: any) => `@${member.handle}`).join(', ');
+          return { result: 'failure', message: `${names} ${notFollowing.length === 1 ? 'doesn\'t' : 'don\'t'} follow you, so you can't DM them.` };
+        }
+        // shared the way the app does: an empty or short message with the post embedded in it
+        const shared = input.post?.trim() ? await getBlueskyPostView(input.post) : undefined;
+        // counted last, so a send that was turned down doesn't use one up
+        if (!countUse(blueskyPostCounts, context, MAX_BLUESKY_POSTS_PER_REPLY)) {
+          return { result: 'failure', message: `You've already posted ${MAX_BLUESKY_POSTS_PER_REPLY} times on Bluesky this reply, the most allowed.` };
+        }
+        await blueskyChat('chat.bsky.convo.sendMessage', {}, {
+          convoId: convo.id,
+          message: {
+            text,
+            facets: text ? await detectBlueskyFacets(text) : undefined,
+            embed: shared ? { $type: 'app.bsky.embed.record', record: { uri: shared.uri, cid: shared.cid } } : undefined,
+          },
+        });
+        const sent = shared ? (text ? 'a message and a post' : 'a post') : 'a message';
+        return { result: 'success', message: `Sent ${sent} to ${with_}.` };
       }
 
       const cursorKey = `${context.conversation_id} dms ${convo.id}`;
