@@ -237,3 +237,14 @@ CREATE TABLE IF NOT EXISTS Counter(
 
   PRIMARY KEY (server_id, counter_name)
 );
+
+CREATE TABLE IF NOT EXISTS McpServer(
+  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
+  mcp_name VARCHAR(32) NOT NULL COLLATE NOCASE,
+  url TEXT NOT NULL,
+  description TEXT NOT NULL,
+  auth_token TEXT,
+  created_by VARCHAR(20) NOT NULL,
+
+  PRIMARY KEY (server_id, mcp_name)
+);

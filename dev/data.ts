@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import cron from 'node-cron';
 import { readFileSync } from 'fs';
 
-import { AutomaticResponseTable, ReminderTable, HeartbeatTable, CounterTable, ChatbotSubscriberTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable } from './types/schema';
+import { AutomaticResponseTable, ReminderTable, HeartbeatTable, McpServerTable, CounterTable, ChatbotSubscriberTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable } from './types/schema';
 import { ConfigData, ServerConfig, ServerData } from './types/bot';
 import { getBaseSystemPrompt, getDefaultSystemPrompt } from './chatbot/chatbot';
 import { fromBlob, SOURCE_SEPARATOR, toBlob } from './chatbot/conversation';
@@ -20,6 +20,26 @@ const db = new Database(dbPath);
 db.pragma('foreign_keys = ON');
 
 db.exec(schema);
+
+// ==================== McpServer ====================
+function getMcpServer(server_id: Snowflake, mcp_name: string): McpServerTable | undefined {
+  return db.prepare('SELECT * FROM McpServer WHERE server_id = ? AND mcp_name = ?').get(server_id, mcp_name) as McpServerTable | undefined;
+}
+function getMcpServersByServer(server_id: Snowflake): McpServerTable[] {
+  return db.prepare('SELECT * FROM McpServer WHERE server_id = ?').all(server_id) as McpServerTable[];
+}
+function insertMcpServer(mcp: McpServerTable): void {
+  db.prepare('INSERT INTO McpServer (server_id, mcp_name, url, description, auth_token, created_by) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(mcp.server_id, mcp.mcp_name, mcp.url, mcp.description, mcp.auth_token ?? null, mcp.created_by);
+}
+function updateMcpServer(mcp: McpServerTable): void {
+  db.prepare('UPDATE McpServer SET url = ?, description = ?, auth_token = ? WHERE server_id = ? AND mcp_name = ?')
+    .run(mcp.url, mcp.description, mcp.auth_token ?? null, mcp.server_id, mcp.mcp_name);
+}
+// only the row. removeMcpServer in chatbot/mcp.ts also closes its connection
+function deleteMcpServer(server_id: Snowflake, mcp_name: string): void {
+  db.prepare('DELETE FROM McpServer WHERE server_id = ? AND mcp_name = ?').run(server_id, mcp_name);
+}
 
 // ==================== Server ====================
 function getAllServers(): Snowflake[] {
@@ -861,6 +881,7 @@ export {
   getAllServers, getServer, insertServer, insertDMServer, getDMServers, deleteServer,
   getReminder, getRemindersByServer, addReminder, updateReminder, deleteReminder,
   getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, deleteHeartbeat,
+  getMcpServer, getMcpServersByServer, insertMcpServer, updateMcpServer, deleteMcpServer,
   getCounter, getCountersByServer, insertCounter, setCounterValue, incrementCounter, deleteCounter,
   getChatbot, getAttachedServers, upsertChatbot, deleteChatbot, setChatbotPrompt,
   isChatbotSubscriber, addChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, getCrossServerSubscribers, getSubscribersAmong, removeChatbotSubscriber,
