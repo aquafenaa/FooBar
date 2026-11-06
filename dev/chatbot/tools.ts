@@ -13,6 +13,7 @@ import { MAX_TIMEOUT, sandboxExec } from './sandbox';
 import { captionImage, fetchImage } from './vision';
 import { fromSummarySource, getVisibleSummaries } from './conversation';
 import { fetchServerChannel } from './dm';
+import { MAX_MCP_SERVERS, saveMcpServer } from './mcp';
 
 // filled in by the bot for each reply, rather than by the model, so the model can't get it wrong (or reach another server's memories)
 // a tool we run ourselves. context is what the bot, never the model, tells it about the reply
@@ -2698,5 +2699,47 @@ const editFile = tool({
   },
 });
 
+// only offered in a DM with the bot's owner, who can also add ones at private addresses. same servers as /mcp
+const addMcpTool = tool({
+  description: 'Add a remote MCP server, whose tools you\'re offered from then on, named <name>__<tool>. If it\'s added to this server, you can use them in this reply. '
+    + `It's connected to before it's saved, so a wrong URL or token fails here. A server can have at most ${MAX_MCP_SERVERS}. `
+    + 'Only servers reached over HTTP work, not ones run as a local command.',
+  inputExamples: [
+    { input: { name: 'docs', url: 'https://example.com/mcp', description: 'Search and read the docs for the Foo library' } },
+    { input: { name: 'linear', url: 'https://mcp.example.com/sse', description: 'The team\'s Linear workspace: issues and projects', auth_token: 'lin_api_...' } },
+  ],
+  inputSchema: zod.object({
+    name: zod.string().describe('Name of the MCP server: letters, numbers, - and _, at most 32 characters. Not case-sensitive'),
+    url: zod.string().describe('The server\'s URL, often ending in /mcp or /sse'),
+    description: zod.string().describe('What it\'s for, shown with each of its tools so you know when to reach for them'),
+    auth_token: zod.string().optional().describe('Its API key or token, if it needs one. Sent as "Authorization: Bearer <token>", or as it is if it already has a scheme like "Basic ..."'),
+    server: SERVER_FIELD.describe('Which server to add it to, by its id or name. Leave out for the DM\'s own'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { name: string, url: string, description: string, auth_token?: string, server?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', server_id?: Snowflake, tools?: string[], message: string }> => {
+    if (!context.dm) return { result: 'failure', message: 'MCP servers can only be added in a DM with your owner.' };
+    const server = await counterServer(context, input.server);
+    if ('error' in server) return { result: 'failure', message: server.error };
+
+    const name = input.name?.trim() ?? '';
+    const saved = await saveMcpServer({
+      server_id: server.serverID,
+      mcp_name: name,
+      url: input.url?.trim() ?? '',
+      description: input.description?.trim() ?? '',
+      auth_token: input.auth_token?.trim() || undefined,
+      created_by: discordClient.user!.id,
+    }, { allowPrivate: true });
+    if ('error' in saved) return { result: 'failure', message: saved.error };
+
+    return {
+      result: 'success',
+      server_id: server.serverID,
+      tools: saved.tools,
+      message: `Added MCP server "${name}", with ${saved.tools.length} tools.${server.serverID === context.server_id ? '' : ' They\'re offered in that server, not this DM.'}`,
+    };
+  },
+});
+
 export { LocalTool };
-export default { reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile, editFile };
+export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile, editFile };

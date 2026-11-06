@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@openrouter/sdk": "^1.5.30",
     "better-sqlite3": "^12.5.0",
     "discord.js": "^14.27.0",

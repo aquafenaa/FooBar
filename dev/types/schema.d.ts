@@ -190,9 +190,18 @@ interface HeartbeatTable {
   prompt: string,
   context?: string; // background shown with the prompt, e.g. what happened that it's following up on
 }
+// a remote MCP server whose tools the chatbot is offered in this server
+interface McpServerTable {
+  server_id: Snowflake,
+  mcp_name: string, // not case-sensitive. letters, numbers, - and _ only, since it starts the name of each of its tools
+  url: string,
+  description: string, // what it's for, shown to the model with each of its tools
+  auth_token?: string, // sent as "Authorization: Bearer <token>". never shown back
+  created_by: Snowflake, // the admin who added it, or the bot's own id if it added it
+}
 
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
-  AutomaticResponseTable, ResponseMessageTable, ReminderTable, HeartbeatTable, CounterTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
+  AutomaticResponseTable, ResponseMessageTable, ReminderTable, HeartbeatTable, McpServerTable, CounterTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
   ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable, /* AI-related structures */
 };

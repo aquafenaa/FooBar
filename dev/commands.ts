@@ -27,13 +27,14 @@ import { addChatbotSubscriber, addReminder, deleteAllHeartBoardEmojis, deleteAll
   getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertHeartBoard, insertHeartBoardEmoji,
   insertVoicePing, insertVoicePingInput, isChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, removeChatbotSubscriber, updateAutomaticResponse,
   updateHeartBoard, updateReminder, updateVoicePing, upsertChatbot, upsertConversationSummary,
-  getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat } from './data';
-import { AutomaticResponseTable, ChatbotTable, ConversationSummaryTable, ReminderTable, HeartbeatTable, HeartBoardTable, VoicePingTable } from './types/schema';
+  getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getMcpServer, getMcpServersByServer } from './data';
+import { AutomaticResponseTable, ChatbotTable, ConversationSummaryTable, ReminderTable, HeartbeatTable, HeartBoardTable, McpServerTable, VoicePingTable } from './types/schema';
 import { removeHeartbeat, scheduleHeartbeat, triggerHeartbeat } from './chatbot/heartbeat';
 import { TOOL_GROUPS, getEmbedding, getSystemPrompt } from './chatbot/chatbot';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
-import { fetchServerChannel } from './chatbot/dm';
+import { fetchServerChannel, isDMServer } from './chatbot/dm';
+import { MAX_MCP_SERVERS, listMcpToolNames, mcpGroupKey, removeMcpServer, saveMcpServer } from './chatbot/mcp';
 import { AUTO_EFFORT } from './chatbot/effort';
 import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, findModel, formatPricing, getModels, getSupportedEfforts, maxTemperature, supportsImages, supportsTemperature, supportsTools } from './chatbot/models';
 import { inputToSchedule, sendReminder } from './utils';
@@ -372,6 +373,14 @@ async function setTemperature(interaction: ChatInputCommandInteraction, serverID
   interaction.reply({ content: `Temperature set to **${chatbot.temperature ?? `${DEFAULT_TEMPERATURE} (default)`}**!${note}`, flags: MessageFlags.Ephemeral });
 }
 
+// the groups of tools turned off in a server, its MCP servers included
+function disabledToolLabels(serverID: Snowflake, chatbot: ChatbotTable): string[] {
+  return [
+    ...TOOL_GROUPS.filter((group) => chatbot.disabled_tools?.includes(group.key)).map((group) => group.label),
+    ...getMcpServersByServer(serverID).filter((mcp) => chatbot.disabled_tools?.includes(mcpGroupKey(mcp.mcp_name))).map((mcp) => `${mcp.mcp_name} (MCP)`),
+  ];
+}
+
 // option "enable": whether tools are on. without it, a modal picks which groups of tools are on
 async function setTools(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
   const enabledOption = interaction.options.getBoolean('enable');
@@ -384,21 +393,28 @@ async function setTools(interaction: ChatInputCommandInteraction, serverID: Snow
   if (enabledOption === null) {
     const groupOptions = (list: string) => TOOL_GROUPS.filter((group) => group.list === list)
       .map((group) => ({ value: group.key, label: group.label, description: group.description, checked: !chatbot.disabled_tools?.includes(group.key) }));
+    // at the bottom, and only once there are any. a server has at most MAX_MCP_SERVERS, so they always fit in one group
+    const mcpServers = getMcpServersByServer(serverID);
     const toolsModal = new ModalBuilder().setTitle('Chatbot Tools');
     if (!chatbot.tools_enabled) toolsModal.addTextDisplayComponents(new TextDisplayBuilder().setContent('⚠️ Tools are off here right now, so none of these are used until they\'re enabled again (`enable: True`).'));
     toolsModal.addLabelComponents(
       checkboxGroupField('discord', 'Discord', groupOptions('discord')),
       checkboxGroupField('other', 'Web, workspace, and other', groupOptions('other')),
     );
+    if (mcpServers.length > 0) {
+      toolsModal.addLabelComponents(checkboxGroupField('custom', 'Custom (MCP servers)', mcpServers.map((mcp) => ({
+        value: mcpGroupKey(mcp.mcp_name), label: mcp.mcp_name, description: mcp.description.substring(0, 100), checked: !chatbot.disabled_tools?.includes(mcpGroupKey(mcp.mcp_name)),
+      }))));
+    }
 
     const submit = await askModal(interaction, toolsModal);
     if (!submit) return;
 
-    const enabled = [...submit.fields.getCheckboxGroup('discord'), ...submit.fields.getCheckboxGroup('other')];
-    chatbot.disabled_tools = TOOL_GROUPS.map((group) => group.key).filter((key) => !enabled.includes(key));
+    const enabled = [...submit.fields.getCheckboxGroup('discord'), ...submit.fields.getCheckboxGroup('other'), ...(mcpServers.length > 0 ? submit.fields.getCheckboxGroup('custom') : [])];
+    chatbot.disabled_tools = [...TOOL_GROUPS.map((group) => group.key), ...mcpServers.map((mcp) => mcpGroupKey(mcp.mcp_name))].filter((key) => !enabled.includes(key));
     upsertChatbot(chatbot);
 
-    const disabled = TOOL_GROUPS.filter((group) => chatbot.disabled_tools!.includes(group.key)).map((group) => group.label);
+    const disabled = disabledToolLabels(serverID, chatbot);
     submit.reply({ content: disabled.length > 0 ? `Saved! Turned off: ${disabled.join(', ')}.` : 'Saved! Every tool is on.', flags: MessageFlags.Ephemeral });
     return;
   }
@@ -918,7 +934,7 @@ const ChatbotCommand: ConfigCommand = {
       .addFields(
         { name: 'Enabled', value: (chatbot?.chatbot_enabled ? 'Yes' : 'No') },
         { name: 'Tools Enabled', value: (chatbot?.tools_enabled ? 'Yes' : 'No') },
-        { name: 'Tools Turned Off', value: TOOL_GROUPS.filter((group) => chatbot?.disabled_tools?.includes(group.key)).map((group) => group.label).join(', ') || 'None' },
+        { name: 'Tools Turned Off', value: disabledToolLabels(serverID, chatbot).join(', ') || 'None' },
         { name: 'Context', value: (chatbot?.detached ? 'Detached (this server only)' : 'Shared with other servers (for opted-in users)') },
         { name: 'System Prompt', value: (chatbot?.system_prompt_override ? 'Overridden for this server' : 'Default (SYSTEM.md)') },
         { name: 'Persona', value: (chatbot?.chatbot_prompt ? 'Set' : 'None') },
@@ -1926,6 +1942,128 @@ const HeartbeatCommand: ConfigCommand = {
   },
 };
 
+const McpCommand: ConfigCommand = {
+  data: new SlashCommandBuilder().setName('mcp').setDescription('Give the chatbot tools from remote MCP servers')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator) // they can hold API tokens
+    .addSubcommand((addSubcommand) => addSubcommand.setName('add').setDescription('Add an MCP server'))
+    .addSubcommand((editSubcommand) => editSubcommand.setName('edit').setDescription('Edit an MCP server')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the MCP server to edit')
+        .setRequired(true).setAutocomplete(true)))
+    .addSubcommand((viewSubcommand) => viewSubcommand.setName('view').setDescription('View an MCP server and its tools, or every MCP server in this server')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the MCP server. Leave blank to view all')
+        .setAutocomplete(true)))
+    .addSubcommand((deleteSubcommand) => deleteSubcommand.setName('delete').setDescription('Delete an MCP server')
+      .addStringOption((nameOption) => nameOption.setName('name').setDescription('Name of the MCP server')
+        .setRequired(true).setAutocomplete(true))),
+  async execute(interaction: ChatInputCommandInteraction, serverID: Snowflake): Promise<void> {
+    const subcommand = interaction.options.getSubcommand();
+    const nameOption = interaction.options.getString('name');
+
+    // add and edit share one modal, filled in with the server being edited. its token is never shown back
+    if (subcommand === 'add' || subcommand === 'edit') {
+      const existing = subcommand === 'edit' ? getMcpServer(serverID, nameOption!) : undefined;
+      if (subcommand === 'edit' && !existing) {
+        interaction.reply({ content: 'There is no MCP server by this name, ensure you\'ve spelled it correctly', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (!existing && getMcpServersByServer(serverID).length >= MAX_MCP_SERVERS) {
+        interaction.reply({ content: `This server already has ${MAX_MCP_SERVERS} MCP servers, the most it can have. Delete one first.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const mcpModal = new ModalBuilder().setTitle(existing ? `Edit MCP Server: ${existing.mcp_name}`.substring(0, 45) : 'Add MCP Server');
+      if (!existing) mcpModal.addLabelComponents(textField('name', 'Name', { maxLength: 32, placeholder: 'e.g. docs', description: 'Letters, numbers, - and _. Starts the name of each of its tools' }));
+      mcpModal.addLabelComponents(
+        textField('url', 'URL', { value: existing?.url, maxLength: 500, placeholder: 'https://example.com/mcp', description: 'Its HTTP address, often ending in /mcp or /sse' }),
+        textField('description', 'Description', {
+          paragraph: true, value: existing?.description, maxLength: 500, placeholder: 'e.g. Search and read the docs for the Foo library', description: 'What it\'s for, so the chatbot knows when to use its tools',
+        }),
+        textField('token', 'Auth Token', {
+          required: false,
+          maxLength: 2000,
+          description: existing?.auth_token ? 'Blank keeps the current one. Type "none" to remove it' : 'Optional. Sent as a Bearer token, or as it is if it has a scheme ("Basic ...")',
+        }),
+      );
+
+      const submit = await askModal(interaction, mcpModal);
+      if (!submit) return;
+      await submit.deferReply({ flags: MessageFlags.Ephemeral }); // connecting to it can take longer than discord waits for a reply
+
+      const tokenInput = submit.fields.getTextInputValue('token').trim();
+      const mcp: McpServerTable = {
+        server_id: serverID,
+        mcp_name: existing?.mcp_name ?? submit.fields.getTextInputValue('name').trim(),
+        url: submit.fields.getTextInputValue('url').trim(),
+        description: submit.fields.getTextInputValue('description').trim(),
+        auth_token: tokenInput.toLowerCase() === 'none' ? undefined : tokenInput || existing?.auth_token,
+        created_by: existing?.created_by ?? interaction.user.id,
+      };
+      // in a DM with the bot's owner, it can reach private addresses, like a server running on the same machine
+      const saved = await saveMcpServer(mcp, { existing, allowPrivate: isDMServer(serverID) });
+      if ('error' in saved) {
+        submit.editReply({ content: saved.error });
+        return;
+      }
+
+      submit.editReply({ content: `Successfully ${existing ? 'updated' : 'added'} MCP server, with ${saved.tools.length} tool${saved.tools.length === 1 ? '' : 's'}!`, embeds: [this.configEmbedBuilder(serverID, { mcp, tools: saved.tools })] });
+      return;
+    }
+    if (subcommand === 'view' && !nameOption) {
+      const servers = getMcpServersByServer(serverID);
+      if (servers.length === 0) {
+        interaction.reply({ content: 'There are no MCP servers in this server! Try adding one with /mcp add', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const mcpEmbed = new EmbedBuilder().setTitle('MCP Servers')
+        .setDescription(servers.map((mcp) => `**${mcp.mcp_name}**: ${mcp.url}\n-# ${mcp.description.replace(/\s+/g, ' ').substring(0, 150)}`).join('\n').substring(0, 4096));
+      interaction.reply({ embeds: [mcpEmbed], flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    // every other subcommand works on an existing server
+    const mcp = getMcpServer(serverID, nameOption!);
+    if (!mcp) {
+      interaction.reply({ content: 'There is no MCP server by this name, ensure you\'ve spelled it correctly', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (subcommand === 'view') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      interaction.editReply({ embeds: [this.configEmbedBuilder(serverID, { mcp, tools: await listMcpToolNames(mcp) })] });
+      return;
+    }
+    if (subcommand === 'delete') {
+      removeMcpServer(mcp);
+      interaction.reply({ content: `Successfully deleted MCP server **${mcp.mcp_name}**!`, flags: MessageFlags.Ephemeral });
+    }
+  },
+  async autocomplete(interaction: AutocompleteInteraction, serverID: Snowflake) {
+    const focusedValue = interaction.options.getFocused().toLowerCase();
+
+    const filtered = getMcpServersByServer(serverID)
+      .filter((mcp) => mcp.mcp_name.toLowerCase().includes(focusedValue))
+      .slice(0, 25);
+    await interaction.respond(filtered.map((mcp) => ({ name: mcp.mcp_name, value: mcp.mcp_name })));
+  },
+  // tools: the names of its tools, or why they couldn't be listed
+  configEmbedBuilder(serverID: Snowflake, { mcp, tools }: { mcp: McpServerTable, tools?: string[] | string }) {
+    const embed = new EmbedBuilder().setTitle('MCP Server Settings')
+      .addFields(
+        { name: 'Name', value: mcp.mcp_name },
+        { name: 'URL', value: mcp.url.substring(0, 1024) },
+        { name: 'Description', value: mcp.description.substring(0, 1024) },
+        { name: 'Auth Token', value: mcp.auth_token ? 'Set' : 'None' },
+        { name: 'Made by', value: `<@${mcp.created_by}>` },
+      );
+    if (tools !== undefined) {
+      const toolsValue = typeof tools === 'string' ? tools : tools.map((t) => `\`${t}\``).join(', ');
+      embed.addFields({ name: typeof tools === 'string' ? 'Tools' : `Tools (${tools.length})`, value: toolsValue.substring(0, 1024) || 'None' });
+    }
+    return embed;
+  },
+};
+
 const CounterCommand: Command = {
   data: new SlashCommandBuilder().setName('counter').setDescription('Create counters to keep track of numbers')
     .addSubcommand((createSubcommand) => createSubcommand.setName('create').setDescription('Create a counter')
@@ -2027,9 +2165,10 @@ commandMap.set(ResponseCommand.data.name, ResponseCommand);
 commandMap.set(ReminderCommand.data.name, ReminderCommand);
 commandMap.set(HeartbeatCommand.data.name, HeartbeatCommand);
 commandMap.set(CounterCommand.data.name, CounterCommand);
+commandMap.set(McpCommand.data.name, McpCommand);
 
 // the commands a DM with the bot's owner has too. the rest are built around things only servers have: members, voice channels, reactions on a board
 const dmCommandMap: Map<string, Command> = new Map();
-[ChatbotCommand, ReminderCommand, HeartbeatCommand, CounterCommand].forEach((command) => dmCommandMap.set(command.data.name, command));
+[ChatbotCommand, ReminderCommand, HeartbeatCommand, CounterCommand, McpCommand].forEach((command) => dmCommandMap.set(command.data.name, command));
 
-export { commandMap, dmCommandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, HeartbeatCommand, CounterCommand, HeartboardCommand, VoicePingCommand };
+export { commandMap, dmCommandMap, ChatbotCommand, SubscribeCommand, UnsubscribeCommand, ResponseCommand, ReminderCommand, HeartbeatCommand, CounterCommand, McpCommand, HeartboardCommand, VoicePingCommand };

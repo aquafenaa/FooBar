@@ -18,6 +18,7 @@ import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, getSuppor
 import { isSandboxEnabled, readNotes } from './sandbox';
 import { withCaptions, withImagePlaceholders, withImages } from './vision';
 import { isDMServer } from './dm';
+import { McpOffer, callMcpTool, getMcpOffers } from './mcp';
 
 const promptPath = path.join(__dirname, '../../data/SYSTEM.md'); // two levels up: this file is in dev/chatbot/ (src/chatbot/ once built)
 const { DISCORD_ID } = process.env;
@@ -101,6 +102,10 @@ function toModelTool(name: string, localTool: LocalTool): ModelTool {
     parameters: zod.toJSONSchema(localTool.inputSchema),
     strict: false, // our schemas have optional fields, which strict mode doesn't allow
   };
+}
+// one of an MCP server's tools, whose schema is already JSON schema
+function toMcpModelTool(name: string, offer: McpOffer): ModelTool {
+  return { type: 'function', name, description: offer.description, parameters: offer.parameters, strict: false };
 }
 
 // the name of a tool that ran on OpenRouter's side, from its item in a response. undefined for any other item
@@ -499,7 +504,8 @@ ${heartbeat.silent
 
 /**
  * The groups /chatbot tools turns on and off, in the two lists its modal shows them in (a checkbox group holds at most 10).
- * Tools are named as the model sees them, with openrouter's server tools (web_search, shell) by their name after "openrouter:"
+ * Tools are named as the model sees them, with openrouter's server tools (web_search, shell) by their name after "openrouter:".
+ * Each MCP server is a group of its own too, in a third list under these, keyed by mcpGroupKey in mcp.ts
  */
 const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, description: string, tools: string[] }[] = [
   { list: 'discord', key: 'channels', label: 'Channels & messages', description: 'Read and search channels, send messages, create threads', tools: ['fetch_channel', 'search_channel', 'fetch_embed', 'send_message', 'create_thread'] },
@@ -516,6 +522,7 @@ const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, desc
   { list: 'other', key: 'x_search', label: 'X search', description: 'Search posts on X (costs about 5 cents a search)', tools: ['x_search'] },
   { list: 'other', key: 'bluesky', label: 'Bluesky', description: 'Read Bluesky, and post or DM where it\'s logged in', tools: ['bluesky', 'bluesky_act', 'bluesky_dms'] },
   { list: 'other', key: 'metacog', label: 'Metacog', description: 'Shift its own mindset, or structure its reasoning', tools: ['metacog'] },
+  { list: 'other', key: 'add_mcp', label: 'Add MCP servers', description: 'Add MCP servers itself. Only ever in a DM with its owner', tools: ['add_mcp_tool'] },
 ];
 
 // every tool in a server's disabled groups. a group that no longer exists is ignored
@@ -611,7 +618,26 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'fetch_url': return ['fetched', host(input.url)];
     case 'caption_image':
     case 'view_image': return ['looked at images', ''];
-    case 'metacog': return ['reflected', clip(input.mode)];
+    // a verb of its own for each mode, so two in one reply aren't run together. a call missing its fields failed, so it's just the verb
+    case 'metacog': {
+      const list = (items: unknown) => (Array.isArray(items) ? items.map((item) => quote(item)).filter(Boolean).join(' / ') : '');
+      switch (input.mode) {
+        case 'feel': return ['felt', [clip(input.sigil, 8), quote(input.quality)].filter(Boolean).join(' ')];
+        case 'drugs': return ['took', input.displaces ? `${clip(input.substance)}, replacing ${quote(input.displaces)}` : clip(input.substance)];
+        case 'become': return ['became', clip(input.name)];
+        case 'name': return ['named', quote(input.named)];
+        case 'ritual': return ['performed a ritual for', quote(input.threshold)];
+        case 'counterfactual': return ['dropped the assumption', quote(input.wall_to_remove)];
+        case 'deconstruct': return ['deconstructed', quote(input.subject)];
+        case 'synthesis': {
+          const lenses = [input.lens_a, input.lens_b, input.lens_c].map((lens) => clip(lens?.name, 20)).filter(Boolean).join(' / ');
+          return ['weighed', [lenses, input.problem ? `on ${quote(input.problem)}` : ''].filter(Boolean).join(' ')];
+        }
+        case 'fork': return ['forked into', list(input.threads)];
+        case 'tether': return ['anchored to', quote(input.anchor_point)];
+        default: return ['reflected', clip(input.mode)];
+      }
+    }
     case 'shell':
     case 'run_command': return ['ran', quote(input.command ?? (Array.isArray(input.commands) ? input.commands.join('; ') : ''))];
     case 'write_file': return ['wrote', clip(input.path)];
@@ -640,6 +666,7 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'create_heartbeat': return ['created heartbeat', quote(input.name)];
     case 'edit_heartbeat': return ['edited heartbeat', quote(input.name)];
     case 'delete_heartbeat': return ['deleted heartbeat', quote(input.name)];
+    case 'add_mcp_tool': return ['added MCP server', quote(input.name)];
     default: return [`used ${name}`, ''];
   }
 }
@@ -922,10 +949,19 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
       // toModelTool('bluesky_act', localTools.blueskyAct),
       toModelTool('bluesky_dms', localTools.blueskyDMs),
     ] : []),
+    // it can reach any server and private addresses, so only the bot's owner gets it
+    ...(isDM ? [toModelTool('add_mcp_tool', localTools.addMcpTool)] : []),
   ] : undefined;
   // server tools have no name, only a type like openrouter:web_search
   const enabledTools = offeredTools?.filter((t) => !disabledTools.has('name' in t ? t.name : serverToolName(t)!));
-  const tools = enabledTools?.length ? enabledTools : undefined;
+  // each MCP server's tools, by the name the model sees. asked again after add_mcp_tool adds one here, so it can use them right away
+  const loadMcpTools = async () => (offeredTools ? getMcpOffers(serverID, chatbot.disabled_tools) : new Map<string, McpOffer>());
+  const withMcpTools = (offers: Map<string, McpOffer>) => {
+    const all = [...enabledTools ?? [], ...[...offers].map(([name, offer]) => toMcpModelTool(name, offer))];
+    return all.length ? all : undefined;
+  };
+  let mcpTools = await loadMcpTools();
+  let tools = withMcpTools(mcpTools);
 
   // tools we execute ourselves. web search runs on OpenRouter's side
   const localToolMap: Record<string, LocalTool> = {
@@ -972,6 +1008,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     run_command: localTools.runCommand,
     write_file: localTools.writeFile,
     edit_file: localTools.editFile,
+
+    add_mcp_tool: localTools.addMcpTool,
   };
 
   const messages = agentInput as ModelInput[];
@@ -1137,9 +1175,15 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
       };
       const run = (async (): Promise<ModelInput> => {
         const localTool = disabledTools.has(toolUse.name) ? undefined : localToolMap[toolUse.name]; // in case it calls one it wasn't offered
-        const output: any = localTool
-          ? await localTool.execute(input, { context: replyContext })
-          : { result: 'failure', message: `There is no tool named ${toolUse.name}` };
+        const mcpTool = mcpTools.get(toolUse.name);
+        let output: any;
+        if (localTool) output = await localTool.execute(input, { context: replyContext });
+        else if (mcpTool) output = await callMcpTool(mcpTool, input, { images: vision, signal: abort });
+        else output = { result: 'failure', message: `There is no tool named ${toolUse.name}` };
+        if (localTool === localTools.addMcpTool && output?.result === 'success' && output.server_id === serverID) {
+          mcpTools = await loadMcpTools();
+          tools = withMcpTools(mcpTools);
+        }
         // view_image's image is given to the model as an image, and left out of what's saved, since it's huge
         const image: string | undefined = typeof output === 'object' ? output?.image : undefined;
         const outputStr = typeof output === 'string' ? output : JSON.stringify(image ? { ...output, image: undefined } : output);
