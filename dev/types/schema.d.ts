@@ -112,6 +112,8 @@ interface ConversationToolResultTable {
   output: string;
   dirty?: boolean, // whether the call could have changed something (sent a message, saved a memory, ran a command...), rather than only looked
   discarded?: ToolResultDiscard, // set when its reply was cancelled, failed, or replaced by another version. see getVisibleToolResults
+  input?: string, // the call's arguments, as JSON, so its digest can say what was asked
+  digest?: string, // a short note standing in for the output once it's too old to show in full. see compactToolResults
 }
 // why a tool result no longer belongs to the reply on screen
 type ToolResultDiscard = 'cancelled' | 'failed' | 'replaced';
