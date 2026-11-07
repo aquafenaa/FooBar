@@ -1,12 +1,12 @@
 import { z as zod } from 'zod';
 import cron from 'node-cron';
-import { AnyThreadChannel, ChannelType, DMChannel, Embed, Guild, GuildBasedChannel, GuildMember, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
+import { AnyThreadChannel, ChannelType, DMChannel, Embed, EmbedBuilder, Guild, GuildBasedChannel, GuildMember, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
 
 import { discordClient } from '..';
 import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getIndexChannel, getNextChannelRef, insertIndexChannel, getIndexUser, getNextUserRef, insertIndexUser, resolveRoleRef, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
 import { HeartbeatTable, MemoryTable, ReminderTable } from '../types/schema';
 import { estimateTokens, safeFetch, sendReminder } from '../utils';
-import { chatbotMentions, formatReactions, formatResponse } from './chatbot';
+import { chatbotMentions, formatReactions, formatResponse, resolveRefs } from './chatbot';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './context';
 import { MAX_BOT_HEARTBEATS, removeHeartbeat, scheduleHeartbeat } from './heartbeat';
 import { MAX_TIMEOUT, sandboxExec } from './sandbox';
@@ -1973,8 +1973,9 @@ function countUse(counts: WeakMap<ReplyContext, number>, context: ReplyContext, 
   return true;
 }
 
-// saved as the bot's turn, so what it sends outside its reply is in the conversation's summary
-function saveSentMessage(context: ReplyContext, sent: Message<boolean>): void {
+// saved as the bot's turn, so what it sends outside its reply is in the conversation's summary.
+// content overrides what's saved, for messages whose text isn't all in sent.content (like an embed)
+function saveSentMessage(context: ReplyContext, sent: Message<boolean>, content = sent.content): void {
   insertConversationMessage({
     conversation_id: context.conversation_id,
     message_id: sent.id,
@@ -1982,8 +1983,8 @@ function saveSentMessage(context: ReplyContext, sent: Message<boolean>): void {
     author_id: sent.author.id,
     author_name: sent.author.displayName,
     timestamp: sent.createdTimestamp,
-    message_content: sent.content,
-    token_count: estimateTokens(sent.content),
+    message_content: content,
+    token_count: estimateTokens(content),
   });
 }
 
@@ -2379,6 +2380,136 @@ const sendMessage = tool({
   },
 });
 
+// discord's embed limits, checked up front so the model gets a clear reason instead of an API error
+const EMBED_LIMITS = { title: 256, description: 4096, fields: 25, fieldName: 256, fieldValue: 1024, footer: 2048, author: 256, total: 6000 };
+const MAX_EMBED_CONTENT_LENGTH = 2000; // the content above it is a normal message, so it can't be split like send_message's
+
+const createEmbed = tool({
+  description: 'Send a message with a rich embed (a card with a colored bar, title, description, fields, images, and so on) to a channel in this server (in a DM with your owner, any server). '
+    + 'Use it for structured posts like announcements, summaries, scoreboards, or polls. Needs at least a title, description, or field. '
+    + 'Refs like [@2] and [#3] work in the description and field values, but mentions inside an embed never ping. Put a mention in content to ping someone. '
+    + `Shares send_message's limit of ${MAX_SENDS_PER_REPLY} messages per reply.`,
+  inputExamples: [
+    {
+      input: {
+        title: 'Movie Night 🍿',
+        description: 'This Friday at 8pm in [#3]. Bring snacks!',
+        color: '#ff66aa',
+        fields: [
+          { name: 'Movie', value: 'Spirited Away', inline: true },
+          { name: 'Host', value: '[@2]', inline: true },
+        ],
+        footer: { text: 'React with 👍 if you\'re coming' },
+      },
+    },
+    { input: { channel: '[#2]', content: '[@4] here\'s the summary you asked for', title: 'Weekly Recap', description: '- Picked a book\n- Planned the next meetup', timestamp: true } },
+  ],
+  inputSchema: zod.object({
+    channel: zod.string().optional().describe('Reference of the channel, e.g. [#3], or its id. Defaults to this channel'),
+    content: zod.string().optional().describe('Plain text above the embed. Mentions here can ping'),
+    title: zod.string().optional().describe(`At most ${EMBED_LIMITS.title} characters`),
+    description: zod.string().optional().describe(`Main text, with markdown. At most ${EMBED_LIMITS.description} characters`),
+    url: zod.string().optional().describe('Link the title goes to. Needs a title'),
+    color: zod.string().optional().describe('Hex color of the side bar, e.g. #ff66aa'),
+    author: zod.object({
+      name: zod.string(),
+      url: zod.string().optional(),
+      icon_url: zod.string().optional(),
+    }).optional().describe('Small line above the title'),
+    footer: zod.object({
+      text: zod.string(),
+      icon_url: zod.string().optional(),
+    }).optional().describe('Small line at the bottom'),
+    image: zod.string().optional().describe('URL of a large image at the bottom'),
+    thumbnail: zod.string().optional().describe('URL of a small image in the top right'),
+    timestamp: zod.union([zod.boolean(), zod.string()]).optional().describe('Time shown in the footer: true for now, or an ISO date like 2026-11-06T20:00:00Z'),
+    fields: zod.array(zod.object({
+      name: zod.string(),
+      value: zod.string(),
+      inline: zod.boolean().optional().describe('Whether it can sit beside other inline fields'),
+    })).optional().describe(`Up to ${EMBED_LIMITS.fields}. Names at most ${EMBED_LIMITS.fieldName} characters, values at most ${EMBED_LIMITS.fieldValue}`),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: {
+    channel?: string, content?: string, title?: string, description?: string, url?: string, color?: string,
+    author?: { name: string, url?: string, icon_url?: string }, footer?: { text: string, icon_url?: string },
+    image?: string, thumbnail?: string, timestamp?: boolean | string, fields?: { name: string, value: string, inline?: boolean }[],
+  }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message_id?: string, message: string }> => {
+    const refs = (text: string) => resolveRefs(context.conversation_id, text);
+    const title = input.title?.trim() || undefined;
+    const description = input.description?.trim() ? refs(input.description.trim()) : undefined;
+    const fields = (input.fields ?? []).map((field) => ({ name: field.name.trim(), value: refs(field.value.trim()), inline: field.inline ?? false }));
+    const content = input.content?.trim() ? refs(input.content.trim()) : undefined;
+
+    // checked against what's actually sent, after refs became mentions
+    if (!title && !description && fields.length === 0) return { result: 'failure', message: 'The embed needs at least a title, description, or field.' };
+    if (title && title.length > EMBED_LIMITS.title) return { result: 'failure', message: `The title can be at most ${EMBED_LIMITS.title} characters.` };
+    if (description && description.length > EMBED_LIMITS.description) return { result: 'failure', message: `The description can be at most ${EMBED_LIMITS.description} characters.` };
+    if (fields.length > EMBED_LIMITS.fields) return { result: 'failure', message: `An embed can have at most ${EMBED_LIMITS.fields} fields.` };
+    const badField = fields.find((field) => !field.name || !field.value || field.name.length > EMBED_LIMITS.fieldName || field.value.length > EMBED_LIMITS.fieldValue);
+    if (badField) return { result: 'failure', message: `Every field needs a name (at most ${EMBED_LIMITS.fieldName} characters) and a value (at most ${EMBED_LIMITS.fieldValue}). "${badField.name.substring(0, 50)}" doesn't fit.` };
+    if (input.footer && input.footer.text.length > EMBED_LIMITS.footer) return { result: 'failure', message: `The footer can be at most ${EMBED_LIMITS.footer} characters.` };
+    if (input.author && input.author.name.length > EMBED_LIMITS.author) return { result: 'failure', message: `The author name can be at most ${EMBED_LIMITS.author} characters.` };
+    if (content && content.length > MAX_EMBED_CONTENT_LENGTH) return { result: 'failure', message: `The content above the embed can be at most ${MAX_EMBED_CONTENT_LENGTH} characters.` };
+    const total = (title?.length ?? 0) + (description?.length ?? 0) + (input.footer?.text.length ?? 0) + (input.author?.name.length ?? 0)
+      + fields.reduce((sum, field) => sum + field.name.length + field.value.length, 0);
+    if (total > EMBED_LIMITS.total) return { result: 'failure', message: `An embed can have at most ${EMBED_LIMITS.total} characters in all, and this one has ${total}.` };
+
+    let color: number | undefined;
+    if (input.color) {
+      const hex = /^#?([0-9a-f]{6})$/i.exec(input.color.trim())?.[1];
+      if (!hex) return { result: 'failure', message: `"${input.color}" isn't a hex color like #ff66aa.` };
+      color = parseInt(hex, 16);
+    }
+
+    let timestamp: Date | undefined;
+    if (input.timestamp === true) timestamp = new Date();
+    else if (typeof input.timestamp === 'string') {
+      timestamp = new Date(input.timestamp);
+      if (Number.isNaN(timestamp.getTime())) return { result: 'failure', message: `"${input.timestamp}" isn't a date.` };
+    }
+
+    if (input.url && !title) return { result: 'failure', message: 'A url needs a title to link from.' };
+
+    const channel = await resolveTextChannel(context, input.channel);
+    if (typeof channel === 'string') return { result: 'failure', message: channel };
+    if (!channel.isSendable()) return { result: 'failure', message: 'I can\'t send messages in this channel.' };
+    if (!countUse(sendCounts, context, MAX_SENDS_PER_REPLY)) return { result: 'failure', message: `You've already sent ${MAX_SENDS_PER_REPLY} messages this reply, the most allowed.` };
+
+    const embed = new EmbedBuilder();
+    if (title) embed.setTitle(title);
+    if (description) embed.setDescription(description);
+    if (input.url) embed.setURL(input.url);
+    if (color !== undefined) embed.setColor(color);
+    if (input.author) embed.setAuthor({ name: input.author.name, url: input.author.url, iconURL: input.author.icon_url });
+    if (input.footer) embed.setFooter({ text: input.footer.text, iconURL: input.footer.icon_url });
+    if (input.image) embed.setImage(input.image);
+    if (input.thumbnail) embed.setThumbnail(input.thumbnail);
+    if (timestamp) embed.setTimestamp(timestamp);
+    if (fields.length > 0) embed.addFields(fields);
+
+    try {
+      // only the content can ping, since discord never pings mentions inside an embed
+      const sent = await channel.send({ content, embeds: [embed], allowedMentions: chatbotMentions(serverOf(channel, context), content ?? '') });
+
+      // the embed's text, so the conversation's summary knows what was in it
+      const saved = [
+        content,
+        '[embed]',
+        title && `**${title}**`,
+        description,
+        ...fields.map((field) => `${field.name}: ${field.value}`),
+        input.footer?.text,
+      ].filter(Boolean).join('\n');
+      saveSentMessage(context, sent, saved);
+
+      return { result: 'success', message_id: sent.id, message: `Sent an embed in ${channelLabel(channel)}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
 const MAX_THREADS_PER_REPLY = 2;
 const threadCounts = new WeakMap<ReplyContext, number>(); // create_thread calls so far, per reply
 const MAX_THREAD_NAME_LENGTH = 100; // discord's limit
@@ -2763,4 +2894,4 @@ const addMcpTool = tool({
 });
 
 export { LocalTool };
-export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createThread, runCommand, writeFile, editFile };
+export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createEmbed, createThread, runCommand, writeFile, editFile };

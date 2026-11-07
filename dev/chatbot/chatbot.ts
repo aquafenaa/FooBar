@@ -10,7 +10,7 @@ import { getChatbot, getConversationByChannel, getConversationMessages, getConve
 import { ChatbotTable, ConversationMessageTable, ConversationTable, ConversationToolResultTable, HeartbeatTable } from '../types/schema';
 import { estimateTokens, millisToCronSchedule, safeFetch, splitPoint, trackFence } from '../utils';
 import { discordClient, openRouter } from '..';
-import { endConversation, getRelevantSummaries, getVisibleToolResults, summarizeConversation } from './conversation';
+import { PromptToolResult, compactToolResults, endConversation, getRelevantSummaries, getToolResultTokenCount, getVisibleToolResults, splitToolResults, summarizeConversation, toolResultText } from './conversation';
 import localTools, { LocalTool } from './tools';
 import { getVisibleMemories, isAttached, isShareable } from './context';
 import { AUTO_EFFORT, judgeEffort } from './effort';
@@ -31,9 +31,7 @@ const BLANK_MESSAGE = /^[\s\u200B-\u200D\u2060\uFEFF\u2800]*$/;
 const MAX_TOOL_SYNOPSIS_LENGTH = 300; // characters of the line under the tool list, saying what they were used for
 const HEARTBEAT_OK = 'HEARTBEAT_OK'; // what the model replies to a heartbeat with nothing worth posting
 const DELETED_MEMORY_DURATION = 10 * 60_000; // 10 minutes, far longer than a reply takes to generate
-const MAX_PROMPT_TOOL_RESULTS = 10; // most recent tool results given back to the model each reply
-const MAX_PROMPT_TOOL_RESULT_LENGTH = 4000; // characters of each one. the full result stays in the database
-const MAX_CONVERSATION_TOKENS = 10_000; // ~125 messages. past this, the conversation is summarized and a new one starts
+const MAX_CONVERSATION_TOKENS = 10_000; // ~125 messages, counting tool results as shown. past this, the conversation is summarized and a new one starts
 const MESSAGE_BREAK_GAP = 60 * 60_000; // 1 hour. a longer silence between two messages is marked, so the model knows time has passed
 const MAX_IMAGE_MESSAGES = 8; // a model with vision sees the images in this many of the latest messages. older ones are given by their captions
 
@@ -170,7 +168,7 @@ function formatElapsed(millis: number): string {
  * Resolves user, channel, and role mentions.
  * With vision, the latest messages' images are attached, along with the out-of-context reference's
 */
-async function formatInput(guild: Guild | undefined, currentChannel: SendableChannels, conversation: ConversationTable, referenceMessage: ConversationMessageTable | undefined, toolList: ConversationToolResultTable[], convoContext: ConversationMessageTable[], vision: boolean): Promise<ModelMessage[]> {
+async function formatInput(guild: Guild | undefined, currentChannel: SendableChannels, conversation: ConversationTable, referenceMessage: ConversationMessageTable | undefined, toolList: PromptToolResult[], convoContext: ConversationMessageTable[], vision: boolean): Promise<ModelMessage[]> {
   if (!convoContext) return [];
 
   const MENTION_RE = /<(?:@!?(\d{17,20})|#(\d{17,20})|@&(\d{17,20}))>/g; // 3 capture groups for users, channels, & role mentions respectively
@@ -368,7 +366,11 @@ async function formatInput(guild: Guild | undefined, currentChannel: SendableCha
     ${toolList.length === 0 // past tool results go here, since a tool result can only go right after the call that made it
     ? ''
     : `<tool_results>
-      ${toolList.map((tool) => `<tool_result name="${esc(tool.tool_name)}" time="${new Date(tool.timestamp).toLocaleString()}"${tool.output.length > MAX_PROMPT_TOOL_RESULT_LENGTH ? ' truncated="true"' : ''}>${esc(tool.output.substring(0, MAX_PROMPT_TOOL_RESULT_LENGTH))}</tool_result>`).join('\n\t')}
+      ${toolList.map((tool) => {
+    // older results are compacted to a short note, so the newest can be shown in full
+    const { text, truncated } = toolResultText(tool);
+    return `<tool_result name="${esc(tool.tool_name)}" time="${new Date(tool.timestamp).toLocaleString()}"${tool.compacted && tool.digest ? ' compacted="true"' : ''}${truncated ? ' truncated="true"' : ''}>${esc(text)}</tool_result>`;
+  }).join('\n\t')}
     </tool_results>`}
     ${pinnedMessages.length === 0
     ? ''
@@ -397,20 +399,24 @@ function chatbotMentions(serverID: Snowflake, content: string): MessageMentionOp
   return { parse: ['roles'], users: [...getSubscribersAmong(serverID, mentioned)].slice(0, 100), repliedUser: true };
 }
 
-/**
- * Splits a finished LLM response into Discord-safe message chunks (<= 2000 chars),
- * preserving open code fences across the split.
-*/
-async function formatResponse(conversationID: string, agentResponse: string): Promise<string[]> {
-  const chunks: string[] = [];
-  let rest = agentResponse
-    // turn user, channel, & role shorthands back into Discord mentions. unknown ones are left as written
+// turn user, channel, & role shorthands back into Discord mentions, and strip what it copied from the prompt. unknown refs are left as written
+function resolveRefs(conversationID: string, text: string): string {
+  return text
     .replace(/\[@\d+\]/g, (ref) => { const id = resolveUserRef(conversationID, ref); return id ? `<@${id}>` : ref; })
     .replace(/\[#\d+\]/g, (ref) => { const id = resolveChannelRef(conversationID, ref); return id ? `<#${id}>` : ref; })
     .replace(/\[&\d+\]/g, (ref) => { const id = resolveRoleRef(conversationID, ref); return id ? `<@&${id}>` : ref; })
     .replace(/(?<!")\[\$\d+\]|\[\$\d+\](?!")/g, '') // replace local message numbers from output
     .replace(/<reactions\b[^>]*>[\s\S]*?<\/reactions>/g, '') // in case it copies the reaction tags it's shown
     .replace(/<message_break\b[^>]*\/>/g, ''); // same for the message breaks
+}
+
+/**
+ * Splits a finished LLM response into Discord-safe message chunks (<= 2000 chars),
+ * preserving open code fences across the split.
+*/
+async function formatResponse(conversationID: string, agentResponse: string): Promise<string[]> {
+  const chunks: string[] = [];
+  let rest = resolveRefs(conversationID, agentResponse);
   let open: string | null = null; // fence line still open at the start of `rest`
 
   while (rest.length > 0) {
@@ -508,7 +514,7 @@ ${heartbeat.silent
  * Each MCP server is a group of its own too, in a third list under these, keyed by mcpGroupKey in mcp.ts
  */
 const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, description: string, tools: string[] }[] = [
-  { list: 'discord', key: 'channels', label: 'Channels & messages', description: 'Read and search channels, send messages, create threads', tools: ['fetch_channel', 'search_channel', 'fetch_embed', 'send_message', 'create_thread'] },
+  { list: 'discord', key: 'channels', label: 'Channels & messages', description: 'Read and search channels, send messages and embeds, create threads', tools: ['fetch_channel', 'search_channel', 'fetch_embed', 'send_message', 'create_embed', 'create_thread'] },
   { list: 'discord', key: 'users', label: 'Users', description: 'Look up members of the server', tools: ['search_users', 'list_users', 'view_user'] },
   { list: 'discord', key: 'reactions', label: 'Reactions & nickname', description: 'React to messages, change its own nickname', tools: ['react_to_message', 'change_nickname'] },
   { list: 'discord', key: 'memories', label: 'Memories & summaries', description: 'Save and read memories, search past conversations', tools: ['create_memory', 'edit_memory', 'list_memories', 'view_memory', 'remove_memory', 'search_summaries'] },
@@ -646,6 +652,7 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'fetch_channel': return ['read', clip(input.channel) || 'this channel'];
     case 'search_channel': return [`searched ${clip(input.channel) || 'this channel'} for`, quote(input.query ?? input.author)];
     case 'send_message': return ['sent a message in', clip(input.channel) || 'this channel'];
+    case 'create_embed': return ['sent an embed in', clip(input.channel) || 'this channel'];
     case 'create_thread': return ['created thread', quote(input.name)];
     case 'react_to_message': return ['reacted', clip(input.emoji, 8)];
     case 'change_nickname': return ['changed nickname to', quote(input.nickname) || 'default'];
@@ -842,8 +849,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   // sort by chronological order
   conversationContext.sort((msg1, msg2) => msg1.timestamp - msg2.timestamp);
 
-  // only the latest results, so a long conversation's prompt doesn't keep growing. all of them are still kept for the summary
-  const toolContext = getVisibleToolResults(conversation.conversation_id).slice(-MAX_PROMPT_TOOL_RESULTS);
+  // the latest results in full, and older ones by their digest, so a long conversation's prompt doesn't keep growing. the full results are still kept for the summary
+  const toolContext = splitToolResults(getVisibleToolResults(conversation.conversation_id));
   const agentInput = await formatInput(guild, channel, conversation, referenceMessage, toolContext, conversationContext, vision);
   const indexMsg = agentInput.shift()!;
   // dated, so the model can tell how long ago it was
@@ -928,6 +935,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toModelTool('list_users', localTools.listUsers),
     toModelTool('view_user', localTools.viewUser),
     toModelTool('send_message', localTools.sendMessage),
+    toModelTool('create_embed', localTools.createEmbed),
     toModelTool('create_thread', localTools.createThread),
     toModelTool('create_memory', localTools.createMemory),
     toModelTool('edit_memory', localTools.editMemory),
@@ -985,6 +993,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     list_users: localTools.listUsers,
     view_user: localTools.viewUser,
     send_message: localTools.sendMessage,
+    create_embed: localTools.createEmbed,
     create_thread: localTools.createThread,
 
     create_memory: localTools.createMemory,
@@ -1044,7 +1053,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   const saveToolResult = (result: ConversationToolResultTable, input: unknown) => {
     const dirty = isDirtyCall(result.tool_name, input);
     if (cancel?.aborted && !dirty) return;
-    insertConversationToolResult({ ...result, dirty, discarded: cancel?.aborted ? 'cancelled' : undefined });
+    insertConversationToolResult({ ...result, dirty, discarded: cancel?.aborted ? 'cancelled' : undefined, input: input === undefined ? undefined : JSON.stringify(input) });
     toolCallIDs?.push(result.tool_call_id);
   };
 
@@ -1220,8 +1229,14 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
   // every reply resends the whole conversation, so once it's this big, wrap it up into a summary and start fresh.
   // a heartbeat's conversation is summarized as soon as it's sent anyway
-  if (!heartbeat && getConversationTokenCount(conversation.conversation_id) > MAX_CONVERSATION_TOKENS) {
-    endConversation(conversation).catch((error) => console.error(error)); // in the background, so it doesn't hold up anything
+  // tool results count as they're shown: the newest in full, older ones by their digest
+  if (!heartbeat) {
+    if (getConversationTokenCount(conversation.conversation_id) + getToolResultTokenCount(conversation.conversation_id) > MAX_CONVERSATION_TOKENS) {
+      endConversation(conversation).catch((error) => console.error(error)); // in the background, so it doesn't hold up anything
+    } else {
+      // results that just aged out of the full window get their digests, ready for the next reply
+      compactToolResults(conversation.conversation_id).catch((error) => console.error(error));
+    }
   }
 
   // a heartbeat with nothing worth saying stays silent. its caller decides whether there's anything to summarize
@@ -1232,4 +1247,4 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   return { conversation_id: conversation.conversation_id, chunks };
 }
 
-export { ReplyControl, TOOL_GROUPS, THINKING_STATUS, TYPING_STATUS, STOPPED_STATUS, setWriting, getBaseSystemPrompt, getDefaultSystemPrompt, getSystemPrompt, getEmbedding, formatReactions, formatResponse, chatbotMentions, generateReply, isAllowedServer, markMessageDeleted };
+export { ReplyControl, TOOL_GROUPS, THINKING_STATUS, TYPING_STATUS, STOPPED_STATUS, setWriting, getBaseSystemPrompt, getDefaultSystemPrompt, getSystemPrompt, getEmbedding, formatReactions, formatResponse, resolveRefs, chatbotMentions, generateReply, isAllowedServer, markMessageDeleted };

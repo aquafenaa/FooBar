@@ -297,11 +297,15 @@ function getConversationToolResults(conversation_id: string): ConversationToolRe
   // NOTE: every result, including discarded ones. what the model and summaries see goes through getVisibleToolResults
   return (db.prepare('SELECT * FROM ConversationToolResult WHERE conversation_id = ? ORDER BY timestamp ASC, rowid ASC')
     .all(conversation_id) as ConversationToolResultTable[])
-    .map((result) => ({ ...result, dirty: Boolean(result.dirty), discarded: result.discarded ?? undefined }));
+    .map((result) => ({ ...result, dirty: Boolean(result.dirty), discarded: result.discarded ?? undefined, input: result.input ?? undefined, digest: result.digest ?? undefined }));
 }
 function insertConversationToolResult(toolResult: ConversationToolResultTable): void {
-  db.prepare('INSERT OR IGNORE INTO ConversationToolResult (conversation_id, tool_name, tool_call_id, timestamp, output, dirty, discarded) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(toolResult.conversation_id, toolResult.tool_name, toolResult.tool_call_id, toolResult.timestamp, toolResult.output, toolResult.dirty ? 1 : 0, toolResult.discarded ?? null);
+  db.prepare('INSERT OR IGNORE INTO ConversationToolResult (conversation_id, tool_name, tool_call_id, timestamp, output, dirty, discarded, input) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(toolResult.conversation_id, toolResult.tool_name, toolResult.tool_call_id, toolResult.timestamp, toolResult.output, toolResult.dirty ? 1 : 0, toolResult.discarded ?? null, toolResult.input ?? null);
+}
+function setToolResultDigests(digests: { tool_call_id: string, digest: string }[]): void {
+  const update = db.prepare('UPDATE ConversationToolResult SET digest = ? WHERE tool_call_id = ?');
+  db.transaction(() => digests.forEach(({ tool_call_id: id, digest }) => update.run(digest, id)))();
 }
 // marks results as no longer part of the reply on screen, or (with undefined) as part of it again
 function setToolResultsDiscarded(tool_call_ids: string[], discarded: ToolResultDiscard | undefined): void {
@@ -874,6 +878,12 @@ const updateDatabase = db.transaction(() => {
     if (!hasColumn('Chatbot', 'disabled_tools')) db.prepare('ALTER TABLE Chatbot ADD COLUMN disabled_tools TEXT').run(); // empty, so every server keeps every tool
     db.pragma('user_version = 14');
   }
+  if (currentVersion < 15) {
+    // empty, so existing results are shown as they always were until they're compacted
+    if (!hasColumn('ConversationToolResult', 'input')) db.prepare('ALTER TABLE ConversationToolResult ADD COLUMN input TEXT').run();
+    if (!hasColumn('ConversationToolResult', 'digest')) db.prepare('ALTER TABLE ConversationToolResult ADD COLUMN digest TEXT').run();
+    db.pragma('user_version = 15');
+  }
 });
 
 export {
@@ -896,7 +906,7 @@ export {
   getMemory, getMemoriesBySource, upsertMemory, deleteMemory,
   getConversationSummary, getConversationSummaries, getConversationSummariesBySource, getLatestConversationSummaries, upsertConversationSummary, deleteConversationSummary,
   getNextUserRef, getIndexUser, getIndexUsers, insertIndexUser, resolveUserRef, deleteIndexUser,
-  getConversationToolResults, insertConversationToolResult, setToolResultsDiscarded, clearConversationToolResults,
+  getConversationToolResults, insertConversationToolResult, setToolResultsDiscarded, setToolResultDigests, clearConversationToolResults,
   getNextMessageRef, getIndexMessage, getIndexMessages, insertIndexMessage, resolveMessageRef, deleteIndexMessage,
   getNextChannelRef, getIndexChannel, getIndexChannels, insertIndexChannel, resolveChannelRef, deleteIndexChannel,
   getNextRoleRef, getIndexRole, getIndexRoles, insertIndexRole, resolveRoleRef, deleteIndexRole,

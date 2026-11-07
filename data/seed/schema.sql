@@ -144,6 +144,8 @@ CREATE TABLE IF NOT EXISTS ConversationToolResult(
   output TEXT,
   dirty BOOLEAN,
   discarded TEXT,
+  input TEXT,
+  digest TEXT,
 
   PRIMARY KEY (conversation_id, tool_call_id)
 );
