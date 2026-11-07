@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS Conversation(
   platform VARCHAR(50) NOT NULL,
   channel_id VARCHAR(50),
   source_id VARCHAR(50),
-  expires_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL,
+  summary_attempts INTEGER
 );
 CREATE TABLE IF NOT EXISTS ConversationMessage(
   conversation_id VARCHAR(50) NOT NULL REFERENCES Conversation(conversation_id) ON DELETE CASCADE,

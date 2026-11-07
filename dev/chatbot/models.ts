@@ -7,7 +7,7 @@ const MODELS_URL = 'https://openrouter.ai/api/v1/models'; // public, no key need
 const REFRESH_INTERVAL = 60 * 60_000; // 1 hour
 
 // used whenever a chatbot hasn't picked a model, effort, or temperature
-const DEFAULT_MODEL = '~z-ai/glm-flash-latest';
+const DEFAULT_MODEL = 'deepseek/deepseek-v4.1-flash';
 const DEFAULT_REASONING_EFFORT = 'medium';
 const DEFAULT_TEMPERATURE = 1.0;
 const MAX_TEMPERATURE = 2; // the most OpenRouter takes
