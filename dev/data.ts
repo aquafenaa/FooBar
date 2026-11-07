@@ -189,6 +189,10 @@ function upsertConversation(conversation: ConversationTable): void {
       expires_at = excluded.expires_at
   `).run(conversation.conversation_id, conversation.platform, conversation.channel_id ?? null, conversation.source_id ?? null, conversation.expires_at);
 }
+// kept apart from upsertConversation, which leaves it as it is
+function setSummaryAttempts(conversation_id: string, attempts: number): void {
+  db.prepare('UPDATE Conversation SET summary_attempts = ? WHERE conversation_id = ?').run(attempts, conversation_id);
+}
 function deleteConversation(conversation_id: string): void {
   db.prepare('DELETE FROM Conversation WHERE conversation_id = ?').run(conversation_id);
 }
@@ -884,6 +888,11 @@ const updateDatabase = db.transaction(() => {
     if (!hasColumn('ConversationToolResult', 'digest')) db.prepare('ALTER TABLE ConversationToolResult ADD COLUMN digest TEXT').run();
     db.pragma('user_version = 15');
   }
+  if (currentVersion < 16) {
+    // empty, so every conversation waiting to be summarized gets its full attempts
+    if (!hasColumn('Conversation', 'summary_attempts')) db.prepare('ALTER TABLE Conversation ADD COLUMN summary_attempts INTEGER').run();
+    db.pragma('user_version = 16');
+  }
 });
 
 export {
@@ -901,7 +910,7 @@ export {
   getVoicePing, getVoicePingsByServer, insertVoicePing, updateVoicePing, deleteVoicePing,
   getVoicePingInputs, insertVoicePingInput, deleteAllVoicePingInputs, deleteVoicePingInput,
   saveAnonymizedMessage,
-  getConversation, getAllConversations, getConversationsBySource, getConversationByChannel, getExpiredConversations, upsertConversation, deleteConversation, deleteAllConversations,
+  getConversation, getAllConversations, getConversationsBySource, getConversationByChannel, getExpiredConversations, upsertConversation, setSummaryAttempts, deleteConversation, deleteAllConversations,
   getConversationMessages, insertConversationMessage, isConversationMessage, updateConversationMessageContent, deleteConversationMessageByID, deleteConversationMessage, clearConversationMessages, getConversationTokenCount,
   getMemory, getMemoriesBySource, upsertMemory, deleteMemory,
   getConversationSummary, getConversationSummaries, getConversationSummariesBySource, getLatestConversationSummaries, upsertConversationSummary, deleteConversationSummary,

@@ -80,6 +80,7 @@ interface ConversationTable {
   channel_id?: string, // channel the conversation takes place in, if the platform has them
   source_id?: string, // where the conversation came from: the server id on discord, or the post path on bluesky
   expires_at: number; // date in millis
+  summary_attempts?: number, // summaries tried and failed. see summarizeConversation
 }
 interface ConversationMessageTable {
   conversation_id: string,

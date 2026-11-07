@@ -2,13 +2,16 @@ import cron from 'node-cron';
 
 import { openRouter } from '..';
 import { reasoningFor, responseText } from './models';
-import { clearConversationMessages, clearConversationToolResults, setToolResultDigests, getAttachedServers, getConversation, getConversationMessages, getConversationToolResults, getConversationSummariesBySource, getConversationSummary, getCrossServerSubscribers, getLatestConversationSummaries, upsertConversation, upsertConversationSummary } from '../data';
+import { clearConversationMessages, clearConversationToolResults, setSummaryAttempts, setToolResultDigests, getAttachedServers, getConversation, getConversationMessages, getConversationToolResults, getConversationSummariesBySource, getConversationSummary, getCrossServerSubscribers, getLatestConversationSummaries, upsertConversation, upsertConversationSummary } from '../data';
 import { getEmbedding } from './chatbot';
 import { ConversationMessageTable, ConversationSummaryTable, ConversationTable, ConversationToolResultTable, ToolResultDiscard } from '../types/schema';
 import { dotProduct, estimateTokens, millisToCronSchedule } from '../utils';
 import { MAIN_SOURCE, isAttached } from './context';
 
-const SUMMARY_MODEL = 'z-ai/glm-5.3';
+const SUMMARY_MODEL = 'deepseek/deepseek-v4.1-flash'; // also writes tool result digests
+const MAX_SUMMARY_ATTEMPTS = 3; // per conversation, counting across restarts. past this, its messages are kept but it's never tried again
+const SUMMARY_EFFORTS = ['medium', 'low', 'minimal']; // each retry reasons less, in case the last one spent its output on reasoning and wrote nothing
+const SUMMARY_RETRY_DELAY = 10_000; // 10 seconds, in case the last one failed from a blip on the provider's side
 const MAX_SUMMARY_LENGTH = 4000;
 const EXPIRY_LEEWAY = 60_000; // 1 minute
 
@@ -210,7 +213,7 @@ function parseDigests(text: string | undefined): Record<string, unknown> {
   }
 }
 
-async function generateSummary(messages: ConversationMessageTable[], toolResults: PromptToolResult[], previousSummary: string | undefined): Promise<string | undefined> {
+async function generateSummary(messages: ConversationMessageTable[], toolResults: PromptToolResult[], previousSummary: string | undefined, effort: string): Promise<string | undefined> {
   // messages and tool results, interleaved in the order they happened
   const transcript = [
     ...messages.map((msg) => ({
@@ -231,7 +234,7 @@ async function generateSummary(messages: ConversationMessageTable[], toolResults
       model: SUMMARY_MODEL,
       maxOutputTokens: 4096, // room for reasoning before the summary itself
       instructions: conversationSummaryPrompt,
-      reasoning: reasoningFor(SUMMARY_MODEL, 'medium'),
+      reasoning: reasoningFor(SUMMARY_MODEL, effort),
       temperature: 0.3,
       input: [{
         role: 'user',
@@ -241,6 +244,8 @@ async function generateSummary(messages: ConversationMessageTable[], toolResults
   });
 
   const text = responseText(result);
+  // logged, since an empty summary is still billed, and otherwise fails without a trace
+  if (!text) console.error(`Summary came back empty (${effort} reasoning): status ${result.status}${result.incompleteDetails ? `, ${JSON.stringify(result.incompleteDetails)}` : ''}`);
   return text ? text.substring(0, MAX_SUMMARY_LENGTH) : undefined;
 }
 
@@ -259,6 +264,9 @@ async function summarizeConversation(conversation_id: string): Promise<string | 
   // conversation was extended after this task was scheduled, so it isn't ours to summarize yet
   // leeway, since cron fires on the second while expires_at has millis, so the task can run slightly before expiry
   if (conversation.expires_at - Date.now() > EXPIRY_LEEWAY) return;
+  // gave up on it already, so startup doesn't pay for it again every restart
+  const previousAttempts = conversation.summary_attempts ?? 0;
+  if (previousAttempts >= MAX_SUMMARY_ATTEMPTS) return;
 
   const messages = getConversationMessages(conversation_id);
   if (messages.length === 0) return;
@@ -286,10 +294,27 @@ async function summarizeConversation(conversation_id: string): Promise<string | 
   if (makeLocal) targets.push({ source_id: localSource, messages, toolResults, previous: (previousLocal ?? previousShared)?.summary });
   if (makeShared) targets.push({ source_id: sharedSource, messages: sharedMessages, toolResults: sharedToolResults, previous: previousShared?.summary });
 
-  const summaries = await Promise.all(targets.map((target) => generateSummary(target.messages, target.toolResults, target.previous)));
+  // retried right away, rather than waiting for a restart. only the targets still missing a summary are retried
+  const summaries: (string | undefined)[] = targets.map(() => undefined);
+  for (let attempt = previousAttempts; attempt < MAX_SUMMARY_ATTEMPTS && summaries.some((summary) => !summary); attempt++) {
+    if (attempt > previousAttempts) await new Promise((resolve) => { setTimeout(resolve, SUMMARY_RETRY_DELAY); });
+    setSummaryAttempts(conversation_id, attempt + 1); // counted before the call, so one cut short by a crash still counts
+    const effort = SUMMARY_EFFORTS[Math.min(attempt, SUMMARY_EFFORTS.length - 1)];
+    await Promise.all(targets.map(async (target, i) => {
+      if (summaries[i]) return;
+      summaries[i] = await generateSummary(target.messages, target.toolResults, target.previous, effort).catch((error) => {
+        console.error(`Summary failed (${effort} reasoning): ${error?.message ?? error}`);
+        return undefined;
+      });
+    }));
+  }
 
-  // keep the messages if we got nothing back, so they can be summarized on a later attempt
-  if (summaries.some((summary) => !summary)) return;
+  // keep the messages if we got nothing back, so nothing is lost. but it's not tried again, so it can't keep costing
+  if (summaries.some((summary) => !summary)) {
+    console.error(`Gave up summarizing conversation ${conversation_id} after ${MAX_SUMMARY_ATTEMPTS} attempts. Its messages are kept`);
+    return;
+  }
+  setSummaryAttempts(conversation_id, 0); // so if it's ever picked back up, it gets every attempt again
 
   await Promise.all(targets.map(async (target, i) => upsertConversationSummary({
     conversation_id,
