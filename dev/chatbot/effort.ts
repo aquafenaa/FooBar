@@ -107,7 +107,6 @@ async function judgeEffort(input: EffortInput, signal?: AbortSignal): Promise<st
     const { answers } = await response.json() as { answers: Record<Judgment, { noul: number }> };
     const judgments = Object.fromEntries((Object.keys(QUESTIONS) as Judgment[]).map((judgment) => [judgment, answers[judgment].noul])) as Answers;
     const effort = chooseEffort(judgments);
-    console.log(`Jev chose ${effort} effort:`, judgments);
     return effort;
   } catch (error) {
     if (!signal?.aborted) console.error('Jev failed, so this reply uses the default effort:', error, body);
