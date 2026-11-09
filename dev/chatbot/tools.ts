@@ -2729,6 +2729,8 @@ const SITE_DESCRIPTION = SITE_URL
   : '';
 
 const SANDBOX_DESCRIPTION = 'Your own persistent Linux workspace (Debian, with python3, pip, git, curl, and jq, and internet access). '
+  + 'You\'re root there, so you can apt-get install other packages (run apt-get update first), but anything outside /workspace can be lost when the workspace is rebuilt, '
+  + 'so note what you installed in NOTES.md, and install whatever start.sh needs at its top. '
   + 'Everything you save there is kept between replies, conversations, and every server you share memories with. '
   + `Keep NOTES.md up to date with what you're working on and anything you'll want later: it's shown to you at the start of every reply.${SITE_DESCRIPTION}`;
 const DETACHED_MESSAGE = 'The workspace is only available in servers attached to the shared context.';
