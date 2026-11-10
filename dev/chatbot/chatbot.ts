@@ -1110,10 +1110,18 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         showStatus(THINKING_STATUS); // it's done, and the model carries on
       } else if (event.type === 'response.output_text.delta') {
         if (stage !== TYPING_STATUS && !stop?.aborted) showStatus(TYPING_STATUS);
-        // the model never adds a line break itself, so text before and after a tool would run together ("...hellOKAY...")
-        if (afterToolUse && stepText && !stepText.endsWith('\n')) stepText += '\n';
-        afterToolUse = false;
-        stepText += event.delta;
+        let text = event.delta;
+        if (afterToolUse) {
+          // the model never adds a line break itself, so text before and after a tool would run together ("...hellOKAY...").
+          // exactly one break, and only after real text: whitespace on either side of the tool is dropped,
+          // and the break waits for the first delta that isn't only whitespace
+          text = text.replace(/^\s+/, '');
+          if (text) {
+            stepText = stepText.trim() ? `${stepText.trimEnd()}\n` : '';
+            afterToolUse = false;
+          }
+        }
+        stepText += text;
       } else if (event.type === 'response.completed' || event.type === 'response.incomplete') {
         response = event.response;
       } else if (event.type === 'response.failed') {
