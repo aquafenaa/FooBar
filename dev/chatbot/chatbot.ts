@@ -3,7 +3,7 @@ import cron from 'node-cron';
 import { z as zod } from 'zod';
 import { OpenResponsesResult, ResponsesRequest } from '@openrouter/sdk/models';
 
-import { getChatbot, getConversationByChannel, getConversationFiles, getConversationMessages, getConversationTokenCount, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, getSubscribersAmong, insertConversationMessage, insertConversationFile, insertConversationToolResult, updateConversationMessageContent, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
+import { ToolDefault, getChatbot, getEnabledTools, getConversationByChannel, getConversationFiles, getConversationMessages, getConversationTokenCount, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, getSubscribersAmong, insertConversationMessage, insertConversationFile, insertConversationToolResult, updateConversationMessageContent, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
 import { ChatbotTable, ConversationMessageTable, ConversationTable, ConversationToolResultTable, HeartbeatTable } from '../types/schema';
 import { estimateTokens, millisToCronSchedule, safeFetch, splitPoint, trackFence } from '../utils';
 import { discordClient, openRouter } from '..';
@@ -555,13 +555,15 @@ ${heartbeat.silent
 }
 
 /**
- * The groups /chatbot tools turns on and off, in the two lists its modal shows them in (a checkbox group holds at most 10).
+ * How /chatbot tools lays out its modal: the groups it shows, in its two lists (a checkbox group holds at most 10).
+ * Only the modal knows about groups: ticking or unticking one turns each of its tools on or off, which are saved one by one.
  * Tools are named as the model sees them, with openrouter's server tools (web_search, shell) by their name after "openrouter:".
- * Each MCP server is a group of its own too, in a third list under these, keyed by mcpGroupKey in mcp.ts
+ * Each MCP server is a checkbox of its own too, in a third list under these, keyed by mcpGroupKey in mcp.ts
  */
 const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, description: string, tools: string[] }[] = [
   { list: 'discord', key: 'channels', label: 'Channels & messages', description: 'Read and search channels, send messages and embeds, create threads', tools: ['fetch_channel', 'search_channel', 'fetch_embed', 'send_message', 'create_embed', 'create_thread'] },
   { list: 'discord', key: 'users', label: 'Users', description: 'Look up members of the server', tools: ['search_users', 'list_users', 'view_user'] },
+  { list: 'discord', key: 'roles', label: 'Roles', description: 'Create, edit, give, remove, and delete roles, for people who could themselves', tools: ['edit_role', 'manage_role', 'delete_role'] },
   { list: 'discord', key: 'reactions', label: 'Reactions & nickname', description: 'React to messages, change its own nickname', tools: ['react_to_message', 'change_nickname'] },
   { list: 'discord', key: 'memories', label: 'Memories & summaries', description: 'Save and read memories, search past conversations', tools: ['create_memory', 'edit_memory', 'list_memories', 'view_memory', 'remove_memory', 'search_summaries'] },
   { list: 'discord', key: 'reminders', label: 'Reminders', description: 'Create and manage reminders', tools: ['create_reminder', 'edit_reminder', 'list_reminders', 'view_reminder', 'remove_reminder'] },
@@ -577,9 +579,69 @@ const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, desc
   { list: 'other', key: 'add_mcp', label: 'Add MCP servers', description: 'Add MCP servers itself. Only ever in a DM with its owner', tools: ['add_mcp_tool'] },
 ];
 
-// every tool in a server's disabled groups. a group that no longer exists is ignored
-function disabledToolNames(chatbot: ChatbotTable): Set<string> {
-  return new Set(TOOL_GROUPS.filter((group) => chatbot.disabled_tools?.includes(group.key)).flatMap((group) => group.tools));
+// tools we execute ourselves, by the name the model sees. web search and shell run on OpenRouter's side.
+// a function, rather than a constant, since tools.ts imports this file too, so its tools may not be loaded yet when this one is
+function getLocalTools(): Record<string, LocalTool> {
+  return {
+    react_to_message: localTools.reactToMessage,
+    change_nickname: localTools.changeNickname,
+
+    create_reminder: localTools.createReminder,
+    edit_reminder: localTools.editReminder,
+    list_reminders: localTools.listReminders,
+    view_reminder: localTools.viewReminder,
+    remove_reminder: localTools.removeReminder,
+    list_heartbeats: localTools.listHeartbeats,
+    create_heartbeat: localTools.createHeartbeat,
+    edit_heartbeat: localTools.editHeartbeat,
+    delete_heartbeat: localTools.deleteHeartbeat,
+
+    fetch_channel: localTools.fetchChannel,
+    search_channel: localTools.searchChannel,
+    fetch_embed: localTools.fetchEmbed,
+    search_users: localTools.searchUsers,
+    list_users: localTools.listUsers,
+    view_user: localTools.viewUser,
+    edit_role: localTools.editRole,
+    manage_role: localTools.manageRole,
+    delete_role: localTools.deleteRole,
+    send_message: localTools.sendMessage,
+    create_embed: localTools.createEmbed,
+    create_thread: localTools.createThread,
+
+    create_memory: localTools.createMemory,
+    edit_memory: localTools.editMemory,
+    list_memories: localTools.listMemories,
+    view_memory: localTools.viewMemory,
+    remove_memory: localTools.removeMemory,
+    search_summaries: localTools.searchSummaries,
+
+    fetch_url: localTools.fetchURL,
+    view_image: localTools.viewImage, // captions instead when the model has no vision, by replyContext.vision
+    view_file: localTools.viewFile,
+    list_counters: localTools.listCounters,
+    counter: localTools.counter,
+    metacog: localTools.metacog,
+    x_search: localTools.xSearch,
+    bluesky: localTools.bluesky,
+    bluesky_act: localTools.blueskyAct,
+    bluesky_dms: localTools.blueskyDMs,
+
+    run_command: localTools.runCommand,
+    write_file: localTools.writeFile,
+    edit_file: localTools.editFile,
+
+    add_mcp_tool: localTools.addMcpTool,
+  };
+}
+
+// every tool /chatbot tools can turn on and off, with whether it's on until a server says otherwise. openrouter's server tools
+// aren't ours, so they're always on by default. a tool in no group is listed too, so it isn't left off just for not being in the modal.
+// MCP servers are handled by getMcpOffers, and listed on their own in the modal
+function toolDefaults(): ToolDefault[] {
+  const local = getLocalTools();
+  const names = new Set([...TOOL_GROUPS.flatMap((group) => group.tools), ...Object.keys(local)]);
+  return [...names].map((name) => ({ name, defaultEnabled: local[name]?.defaultEnabled ?? true }));
 }
 
 /**
@@ -719,6 +781,10 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'create_heartbeat': return ['created heartbeat', quote(input.name)];
     case 'edit_heartbeat': return ['edited heartbeat', quote(input.name)];
     case 'delete_heartbeat': return ['deleted heartbeat', quote(input.name)];
+    // role refs like [&2] are left as written, so they're turned into role mentions with the rest of the reply
+    case 'edit_role': return input.role ? ['edited role', clip(input.role)] : ['created role', quote(input.name)];
+    case 'manage_role': return input.action === 'remove' ? [`removed ${clip(input.role)} from`, clip(input.user)] : [`gave ${clip(input.role)} to`, clip(input.user)];
+    case 'delete_role': return ['deleted role', clip(input.role)];
     case 'add_mcp_tool': return ['added MCP server', quote(input.name)];
     default: return [`used ${name}`, ''];
   }
@@ -762,7 +828,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   const chatbot = getChatbot(serverID)!;
   const model = chatbot.model ?? DEFAULT_MODEL;
   const vision = supportsImages(model);
-  const disabledTools = disabledToolNames(chatbot);
+  const enabledToolNames = new Set(getEnabledTools(serverID, toolDefaults()));
   // a DM with the bot's owner is a server of its own, with no guild behind it. it gets full control over every server instead
   const isDM = isDMServer(serverID);
   const guild = isDM ? undefined : await discordClient.guilds.fetch(serverID);
@@ -925,6 +991,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     reference_message_id: messageReference?.id, // the message the user is replying to, shown to the model as [$0]
     dm: isDM || undefined, // full control: channel and server tools can reach any server the bot is in
     vision, // view_image shows the image itself, or a caption of it for a model without vision
+    requester_id: userMessage?.author.id, // role tools check what they could do themselves. a heartbeat has no one asking
   };
 
   // the server's prompt modules in order, by default `system` (SYSTEM.md, unless it's been set) and `persona`
@@ -987,6 +1054,9 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toModelTool('search_users', localTools.searchUsers),
     toModelTool('list_users', localTools.listUsers),
     toModelTool('view_user', localTools.viewUser),
+    toModelTool('edit_role', localTools.editRole),
+    toModelTool('manage_role', localTools.manageRole),
+    toModelTool('delete_role', localTools.deleteRole),
     toModelTool('send_message', localTools.sendMessage),
     toModelTool('create_embed', localTools.createEmbed),
     toModelTool('create_thread', localTools.createThread),
@@ -1015,9 +1085,9 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     ...(isDM ? [toModelTool('add_mcp_tool', localTools.addMcpTool)] : []),
   ] : undefined;
   // server tools have no name, only a type like openrouter:web_search
-  const enabledTools = offeredTools?.filter((t) => !disabledTools.has('name' in t ? t.name : serverToolName(t)!));
+  const enabledTools = offeredTools?.filter((t) => enabledToolNames.has('name' in t ? t.name : serverToolName(t)!));
   // each MCP server's tools, by the name the model sees. asked again after add_mcp_tool adds one here, so it can use them right away
-  const loadMcpTools = async () => (offeredTools ? getMcpOffers(serverID, chatbot.disabled_tools) : new Map<string, McpOffer>());
+  const loadMcpTools = async () => (offeredTools ? getMcpOffers(serverID) : new Map<string, McpOffer>());
   const withMcpTools = (offers: Map<string, McpOffer>) => {
     const all = [...enabledTools ?? [], ...[...offers].map(([name, offer]) => toMcpModelTool(name, offer))];
     return all.length ? all : undefined;
@@ -1025,55 +1095,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   let mcpTools = await loadMcpTools();
   let tools = withMcpTools(mcpTools);
 
-  // tools we execute ourselves. web search runs on OpenRouter's side
-  const localToolMap: Record<string, LocalTool> = {
-    react_to_message: localTools.reactToMessage,
-    change_nickname: localTools.changeNickname,
-
-    create_reminder: localTools.createReminder,
-    edit_reminder: localTools.editReminder,
-    list_reminders: localTools.listReminders,
-    view_reminder: localTools.viewReminder,
-    remove_reminder: localTools.removeReminder,
-    list_heartbeats: localTools.listHeartbeats,
-    create_heartbeat: localTools.createHeartbeat,
-    edit_heartbeat: localTools.editHeartbeat,
-    delete_heartbeat: localTools.deleteHeartbeat,
-
-    fetch_channel: localTools.fetchChannel,
-    search_channel: localTools.searchChannel,
-    fetch_embed: localTools.fetchEmbed,
-    search_users: localTools.searchUsers,
-    list_users: localTools.listUsers,
-    view_user: localTools.viewUser,
-    send_message: localTools.sendMessage,
-    create_embed: localTools.createEmbed,
-    create_thread: localTools.createThread,
-
-    create_memory: localTools.createMemory,
-    edit_memory: localTools.editMemory,
-    list_memories: localTools.listMemories,
-    view_memory: localTools.viewMemory,
-    remove_memory: localTools.removeMemory,
-    search_summaries: localTools.searchSummaries,
-
-    fetch_url: localTools.fetchURL,
-    view_image: localTools.viewImage, // captions instead when the model has no vision, by replyContext.vision
-    view_file: localTools.viewFile,
-    list_counters: localTools.listCounters,
-    counter: localTools.counter,
-    metacog: localTools.metacog,
-    x_search: localTools.xSearch,
-    bluesky: localTools.bluesky,
-    bluesky_act: localTools.blueskyAct,
-    bluesky_dms: localTools.blueskyDMs,
-
-    run_command: localTools.runCommand,
-    write_file: localTools.writeFile,
-    edit_file: localTools.editFile,
-
-    add_mcp_tool: localTools.addMcpTool,
-  };
+  const localToolMap = getLocalTools();
 
   const messages = agentInput as ModelInput[];
   // the heartbeat goes in as the last turn, in place of a message to answer. it isn't saved, so it never looks like something a person said
@@ -1248,7 +1270,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         showStatus();
       };
       const run = (async (): Promise<ModelInput> => {
-        const localTool = disabledTools.has(toolUse.name) ? undefined : localToolMap[toolUse.name]; // in case it calls one it wasn't offered
+        const localTool = enabledToolNames.has(toolUse.name) ? localToolMap[toolUse.name] : undefined; // in case it calls one that's turned off
         const mcpTool = mcpTools.get(toolUse.name);
         let output: any;
         if (localTool) output = await localTool.execute(input, { context: replyContext });
@@ -1319,4 +1341,4 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   return { conversation_id: conversation.conversation_id, chunks };
 }
 
-export { ReplyControl, TOOL_GROUPS, THINKING_STATUS, TYPING_STATUS, STOPPED_STATUS, setWriting, getEmbedding, formatReactions, formatResponse, resolveRefs, chatbotMentions, generateReply, isAllowedServer, markMessageDeleted };
+export { ReplyControl, TOOL_GROUPS, toolDefaults,THINKING_STATUS, TYPING_STATUS, STOPPED_STATUS, setWriting, getEmbedding, formatReactions, formatResponse, resolveRefs, chatbotMentions, generateReply, isAllowedServer, markMessageDeleted };

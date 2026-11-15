@@ -83,8 +83,14 @@ CREATE TABLE IF NOT EXISTS Chatbot(
   detached BOOLEAN,
   model TEXT,
   reasoning_effort TEXT,
-  temperature REAL,
-  disabled_tools TEXT
+  temperature REAL
+);
+CREATE TABLE IF NOT EXISTS ChatbotTool(
+  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
+  tool_name VARCHAR(80) NOT NULL,
+  enabled BOOLEAN NOT NULL,
+
+  PRIMARY KEY (server_id, tool_name)
 );
 CREATE TABLE IF NOT EXISTS ChatbotPrompt(
   server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,

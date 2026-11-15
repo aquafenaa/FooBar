@@ -5,7 +5,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { CallToolResult, McpError, Tool } from '@modelcontextprotocol/sdk/types.js';
-import { deleteMcpServer, getChatbot, getMcpServer, getMcpServersByServer, insertMcpServer, updateMcpServer, upsertChatbot } from '../data';
+import { deleteMcpServer, getEnabledTools, getMcpServer, getMcpServersByServer, insertMcpServer, resetToolEnabled, updateMcpServer } from '../data';
 import { McpServerTable } from '../types/schema';
 
 const MAX_MCP_SERVERS = 10; // per server, since /chatbot tools lists them in one checkbox group, which holds at most 10
@@ -22,7 +22,7 @@ const connections = new Map<string, Promise<Connection>>();
 const failedAt = new Map<string, number>();
 const connectionKey = (mcp: McpServerTable) => `${mcp.server_id}|${mcp.mcp_name.toLowerCase()}`;
 
-// what /chatbot tools turns a server on and off by, in disabled_tools beside the built-in groups
+// what /chatbot tools turns a whole MCP server on and off by, in ChatbotTool beside the built-in tools. on by default
 function mcpGroupKey(name: string): string {
   return `mcp:${name.toLowerCase()}`;
 }
@@ -185,12 +185,7 @@ function removeMcpServer(mcp: McpServerTable): void {
   deleteMcpServer(mcp.server_id, mcp.mcp_name);
   closeMcpConnection(mcp);
 
-  const chatbot = getChatbot(mcp.server_id);
-  const key = mcpGroupKey(mcp.mcp_name);
-  if (chatbot?.disabled_tools?.includes(key)) {
-    chatbot.disabled_tools = chatbot.disabled_tools.filter((disabled) => disabled !== key);
-    upsertChatbot(chatbot);
-  }
+  resetToolEnabled(mcp.server_id, mcpGroupKey(mcp.mcp_name));
 }
 
 // one of an MCP server's tools, as offered to the model
@@ -200,8 +195,10 @@ type McpOffer = { mcp: McpServerTable, tool: Tool, description: string, paramete
  * The tools of every MCP server in a server that's on, by the name the model sees: <server>__<tool>.
  * Servers are asked at once, and any that can't be reached are left out of this reply
  */
-async function getMcpOffers(serverID: Snowflake, disabledGroups?: string[]): Promise<Map<string, McpOffer>> {
-  const servers = getMcpServersByServer(serverID).filter((mcp) => !disabledGroups?.includes(mcpGroupKey(mcp.mcp_name)));
+async function getMcpOffers(serverID: Snowflake): Promise<Map<string, McpOffer>> {
+  const all = getMcpServersByServer(serverID);
+  const enabled = new Set(getEnabledTools(serverID, all.map((mcp) => ({ name: mcpGroupKey(mcp.mcp_name), defaultEnabled: true }))));
+  const servers = all.filter((mcp) => enabled.has(mcpGroupKey(mcp.mcp_name)));
   const listed = await Promise.all(servers.map(async (mcp) => ({ mcp, tools: await getTools(mcp) ?? [] })));
 
   const offers = new Map<string, McpOffer>();

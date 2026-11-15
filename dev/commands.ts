@@ -28,10 +28,10 @@ import { addChatbotSubscriber, addReminder, deleteAllHeartBoardEmojis, deleteAll
   insertVoicePing, insertVoicePingInput, isChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, removeChatbotSubscriber, updateAutomaticResponse,
   updateHeartBoard, updateReminder, updateVoicePing, upsertChatbot, upsertConversationSummary,
   getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getMcpServer, getMcpServersByServer,
-  getPrompt, getPrompts, upsertPrompt, deletePrompt } from './data';
+  getPrompt, getPrompts, upsertPrompt, deletePrompt, getEnabledTools, setToolsEnabled } from './data';
 import { AutomaticResponseTable, ChatbotTable, ConversationSummaryTable, ReminderTable, HeartbeatTable, HeartBoardTable, McpServerTable, VoicePingTable } from './types/schema';
 import { removeHeartbeat, scheduleHeartbeat, triggerHeartbeat } from './chatbot/heartbeat';
-import { TOOL_GROUPS, getEmbedding } from './chatbot/chatbot';
+import { TOOL_GROUPS, getEmbedding, toolDefaults } from './chatbot/chatbot';
 import { DEFAULT_PROMPT_NAMES, MAX_PROMPTS, SYSTEM_PROMPT_NAME, createDefaultPrompts, getBaseSystemPrompt, invalidPromptName, promptContent, resetPrompt } from './chatbot/prompts';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
@@ -375,11 +375,19 @@ async function setTemperature(interaction: ChatInputCommandInteraction, serverID
   interaction.reply({ content: `Temperature set to **${chatbot.temperature ?? `${DEFAULT_TEMPERATURE} (default)`}**!${note}`, flags: MessageFlags.Ephemeral });
 }
 
+// which tools are on in a server, by name, with each MCP server as mcp:<name>. a group is only shown as on if all its tools are
+function enabledToolSet(serverID: Snowflake, mcpServers: McpServerTable[]): Set<string> {
+  return new Set(getEnabledTools(serverID, [...toolDefaults(), ...mcpServers.map((mcp) => ({ name: mcpGroupKey(mcp.mcp_name), defaultEnabled: true }))]));
+}
+const isGroupOn = (enabled: Set<string>, group: typeof TOOL_GROUPS[number]) => group.tools.every((name) => enabled.has(name));
+
 // the groups of tools turned off in a server, its MCP servers included
-function disabledToolLabels(serverID: Snowflake, chatbot: ChatbotTable): string[] {
+function disabledToolLabels(serverID: Snowflake): string[] {
+  const mcpServers = getMcpServersByServer(serverID);
+  const enabled = enabledToolSet(serverID, mcpServers);
   return [
-    ...TOOL_GROUPS.filter((group) => chatbot.disabled_tools?.includes(group.key)).map((group) => group.label),
-    ...getMcpServersByServer(serverID).filter((mcp) => chatbot.disabled_tools?.includes(mcpGroupKey(mcp.mcp_name))).map((mcp) => `${mcp.mcp_name} (MCP)`),
+    ...TOOL_GROUPS.filter((group) => !isGroupOn(enabled, group)).map((group) => group.label),
+    ...mcpServers.filter((mcp) => !enabled.has(mcpGroupKey(mcp.mcp_name))).map((mcp) => `${mcp.mcp_name} (MCP)`),
   ];
 }
 
@@ -393,10 +401,11 @@ async function setTools(interaction: ChatInputCommandInteraction, serverID: Snow
   }
 
   if (enabledOption === null) {
-    const groupOptions = (list: string) => TOOL_GROUPS.filter((group) => group.list === list)
-      .map((group) => ({ value: group.key, label: group.label, description: group.description, checked: !chatbot.disabled_tools?.includes(group.key) }));
     // at the bottom, and only once there are any. a server has at most MAX_MCP_SERVERS, so they always fit in one group
     const mcpServers = getMcpServersByServer(serverID);
+    const enabledTools = enabledToolSet(serverID, mcpServers);
+    const groupOptions = (list: string) => TOOL_GROUPS.filter((group) => group.list === list)
+      .map((group) => ({ value: group.key, label: group.label, description: group.description, checked: isGroupOn(enabledTools, group) }));
     const toolsModal = new ModalBuilder().setTitle('Chatbot Tools');
     if (!chatbot.tools_enabled) toolsModal.addTextDisplayComponents(new TextDisplayBuilder().setContent('⚠️ Tools are off here right now, so none of these are used until they\'re enabled again (`enable: True`).'));
     toolsModal.addLabelComponents(
@@ -405,7 +414,7 @@ async function setTools(interaction: ChatInputCommandInteraction, serverID: Snow
     );
     if (mcpServers.length > 0) {
       toolsModal.addLabelComponents(checkboxGroupField('custom', 'Custom (MCP servers)', mcpServers.map((mcp) => ({
-        value: mcpGroupKey(mcp.mcp_name), label: mcp.mcp_name, description: mcp.description.substring(0, 100), checked: !chatbot.disabled_tools?.includes(mcpGroupKey(mcp.mcp_name)),
+        value: mcpGroupKey(mcp.mcp_name), label: mcp.mcp_name, description: mcp.description.substring(0, 100), checked: enabledTools.has(mcpGroupKey(mcp.mcp_name)),
       }))));
     }
 
@@ -413,10 +422,13 @@ async function setTools(interaction: ChatInputCommandInteraction, serverID: Snow
     if (!submit) return;
 
     const enabled = [...submit.fields.getCheckboxGroup('discord'), ...submit.fields.getCheckboxGroup('other'), ...(mcpServers.length > 0 ? submit.fields.getCheckboxGroup('custom') : [])];
-    chatbot.disabled_tools = [...TOOL_GROUPS.map((group) => group.key), ...mcpServers.map((mcp) => mcpGroupKey(mcp.mcp_name))].filter((key) => !enabled.includes(key));
-    upsertChatbot(chatbot);
+    // groups only exist here: each one ticked or not turns every one of its tools on or off
+    setToolsEnabled(serverID, [
+      ...TOOL_GROUPS.flatMap((group) => group.tools.map((name) => ({ name, enabled: enabled.includes(group.key) }))),
+      ...mcpServers.map((mcp) => ({ name: mcpGroupKey(mcp.mcp_name), enabled: enabled.includes(mcpGroupKey(mcp.mcp_name)) })),
+    ]);
 
-    const disabled = disabledToolLabels(serverID, chatbot);
+    const disabled = disabledToolLabels(serverID);
     submit.reply({ content: disabled.length > 0 ? `Saved! Turned off: ${disabled.join(', ')}.` : 'Saved! Every tool is on.', flags: MessageFlags.Ephemeral });
     return;
   }
@@ -986,7 +998,7 @@ const ChatbotCommand: ConfigCommand = {
       .addFields(
         { name: 'Enabled', value: (chatbot?.chatbot_enabled ? 'Yes' : 'No') },
         { name: 'Tools Enabled', value: (chatbot?.tools_enabled ? 'Yes' : 'No') },
-        { name: 'Tools Turned Off', value: disabledToolLabels(serverID, chatbot).join(', ') || 'None' },
+        { name: 'Tools Turned Off', value: disabledToolLabels(serverID).join(', ') || 'None' },
         { name: 'Context', value: (chatbot?.detached ? 'Detached (this server only)' : 'Shared with other servers (for opted-in users)') },
         { name: 'Prompts', value: promptSummary(serverID) },
         { name: 'Model', value: chatbot?.model ?? `${DEFAULT_MODEL} (default)` },

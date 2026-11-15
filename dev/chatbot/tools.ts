@@ -1,9 +1,9 @@
 import { z as zod } from 'zod';
 import cron from 'node-cron';
-import { AnyThreadChannel, ChannelType, DMChannel, Embed, EmbedBuilder, Guild, GuildBasedChannel, GuildMember, GuildTextBasedChannel, Message, PermissionFlagsBits, Snowflake } from 'discord.js';
+import { AnyThreadChannel, ChannelType, DMChannel, Embed, EmbedBuilder, Guild, GuildBasedChannel, GuildMember, GuildTextBasedChannel, Message, PermissionFlagsBits, Role, Snowflake } from 'discord.js';
 
 import { discordClient } from '..';
-import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getIndexChannel, getNextChannelRef, insertIndexChannel, getIndexUser, getNextUserRef, insertIndexUser, resolveRoleRef, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
+import { addReminder, deleteCounter, deleteMemory, deleteReminder, getCounter, getCountersByServer, getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getIndexChannel, getNextChannelRef, insertIndexChannel, getIndexUser, getNextUserRef, insertIndexUser, getIndexRole, getNextRoleRef, insertIndexRole, resolveRoleRef, getReminder, getRemindersByServer, getServer, incrementCounter, insertCounter, insertConversationMessage, setCounterValue, resolveChannelRef, resolveMessageRef, resolveUserRef, updateReminder, upsertMemory } from '../data';
 import { HeartbeatTable, MemoryTable, ReminderTable } from '../types/schema';
 import { estimateTokens, safeFetch, sendReminder } from '../utils';
 import { chatbotMentions, formatReactions, formatResponse, resolveRefs } from './chatbot';
@@ -19,6 +19,8 @@ import { MAX_MCP_SERVERS, saveMcpServer } from './mcp';
 // filled in by the bot for each reply, rather than by the model, so the model can't get it wrong (or reach another server's memories)
 // a tool we run ourselves. context is what the bot, never the model, tells it about the reply
 interface LocalTool {
+  // whether servers have it until they turn it off (true, the default), or only once they turn it on in /chatbot tools (false)
+  defaultEnabled?: boolean,
   description?: string,
   inputExamples?: { input: unknown }[],
   inputSchema: zod.ZodType,
@@ -36,6 +38,8 @@ const replyContextSchema = zod.object({
   // a DM with the bot's owner, who has full control: channel and server tools can reach any server the bot is in, private channels included
   dm: zod.boolean().optional(),
   vision: zod.boolean().optional(), // whether the model can take images, or needs them captioned (view_image)
+  // who the bot is answering, so role tools can't do for them what they couldn't do themselves. a heartbeat has no one
+  requester_id: zod.string().optional(),
 });
 type ReplyContext = zod.infer<typeof replyContextSchema>;
 
@@ -2303,10 +2307,8 @@ const listUsers = tool({
       }
 
       if (input.role) {
-        const raw = input.role.trim();
-        const roleID = /^<?@?&?(\d{17,20})>?$/.exec(raw)?.[1] ?? resolveRoleRef(context.conversation_id, raw) ?? resolveRoleRef(context.conversation_id, `[${raw}]`) ?? resolveRoleRef(context.conversation_id, `[&${raw}]`);
-        const role = roleID ? await safeFetch(() => guild.roles.fetch(roleID)) : undefined;
-        if (!role) return { result: 'failure', message: `There is no role ${raw} in this server.` };
+        const role = await resolveRole(context, guild, input.role);
+        if (typeof role === 'string') return { result: 'failure', message: role };
 
         members = members.filter((member) => member.roles.cache.has(role.id));
         where += ` with the role ${role.name}`;
@@ -2363,6 +2365,223 @@ const viewUser = tool({
       },
       message: `Viewed ${member.displayName}.`,
     };
+  },
+});
+
+const MAX_ROLE_NAME_LENGTH = 100; // Discord's limit
+const ROLE_FIELD = 'a reference like [&2], its id, or its name';
+
+// a role's ref in this conversation, like [&2], made if it doesn't have one yet, so the model can mention it right away
+function roleRef(context: ReplyContext, roleID: string): string {
+  const existing = getIndexRole(context.conversation_id, roleID);
+  if (existing) return existing.shorthand;
+
+  const shorthand = `[&${getNextRoleRef(context.conversation_id)}]`;
+  insertIndexRole({ conversation_id: context.conversation_id, role_id: roleID, shorthand });
+  return shorthand;
+}
+
+/**
+ * A role in the given server, from a ref like [&2], a <@&id> mention, a plain id, or its name (not case-sensitive).
+ * Always fetched through that server, so another server's role is never found. Returns why not instead, worded to give to the model as-is
+ */
+async function resolveRole(context: ReplyContext, guild: Guild, roleInput: string): Promise<Role | string> {
+  const raw = roleInput.trim();
+  if (!raw) return 'Say which role.';
+
+  const roleID = /^<?@?&?(\d{17,20})>?$/.exec(raw)?.[1]
+    ?? resolveRoleRef(context.conversation_id, raw) ?? resolveRoleRef(context.conversation_id, `[${raw}]`) ?? resolveRoleRef(context.conversation_id, `[&${raw}]`);
+  if (roleID) {
+    const role = await safeFetch(() => guild.roles.fetch(roleID));
+    if (role) return role;
+  }
+
+  // view_user gives roles by name, so a name works too
+  const lower = raw.replace(/^@/, '').toLowerCase();
+  const named = (await guild.roles.fetch()).filter((role) => role.name.toLowerCase() === lower);
+  if (named.size === 1) return named.first()!;
+  if (named.size > 1) return `More than one role is named "${raw}": ${named.map((role) => role.id).join(', ')}. Use its id.`;
+  return `There is no role ${raw} in ${context.dm ? guild.name : 'this server'}.`;
+}
+
+/**
+ * Why a role can't be created, or changed (edited, given, removed, deleted), through the bot, or undefined if it can.
+ * Checked against the bot's own permission and place in the role list, and then the asker's, the same way Discord would,
+ * so no one can get the bot to do what they couldn't do themselves. A heartbeat has no one asking, and a DM is the bot's owner,
+ * so those are only checked against the bot
+ */
+async function roleProblem(context: ReplyContext, guild: Guild, role?: Role): Promise<string | undefined> {
+  const me = guild.members.me ?? await guild.members.fetchMe();
+  if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) return 'I don\'t have the Manage Roles permission in this server.';
+  if (role) {
+    if (role.id === guild.id) return '@everyone can\'t be changed this way.';
+    if (role.managed) return `${role.name} belongs to an integration (a bot, Server Booster, or similar), so it can't be changed by hand.`;
+    if (me.roles.highest.comparePositionTo(role) <= 0) return `${role.name} is at or above my highest role, so I can't change it. Someone would have to move my role above it first.`;
+  }
+
+  if (context.dm || !context.requester_id) return undefined;
+  const asker = await safeFetch(() => guild.members.fetch(context.requester_id!));
+  if (!asker) return 'The person asking isn\'t a member of this server.';
+  if (asker.id === guild.ownerId) return undefined; // the server's owner can change any role
+  if (!asker.permissions.has(PermissionFlagsBits.ManageRoles)) return `${asker.displayName} doesn't have the Manage Roles permission, so I can't change roles for them.`;
+  if (role && asker.roles.highest.comparePositionTo(role) <= 0) return `${role.name} is at or above ${asker.displayName}'s highest role, so they couldn't change it themselves, and I can't for them.`;
+  return undefined;
+}
+
+// a hex code like #ff66aa (or ff66aa) as a number, 0 for "none", or undefined if it isn't one
+function parseRoleColor(color: string): number | undefined {
+  const raw = color.trim().toLowerCase();
+  if (['none', 'default', ''].includes(raw)) return 0;
+  const hex = /^#?([0-9a-f]{6}|[0-9a-f]{3})$/.exec(raw)?.[1];
+  if (!hex) return undefined;
+  return parseInt(hex.length === 3 ? [...hex].map((c) => c + c).join('') : hex, 16);
+}
+
+function toRoleCard(context: ReplyContext, role: Role) {
+  return {
+    ref: roleRef(context, role.id),
+    name: role.name,
+    color: role.colors.primaryColor ? `#${role.colors.primaryColor.toString(16).padStart(6, '0')}` : 'none',
+    hoist: role.hoist,
+    mentionable: role.mentionable,
+  };
+}
+
+// create and edit share a tool, since they take the same fields. permissions are left to people, so the bot can't hand any out
+const editRole = tool({
+  defaultEnabled: false, // role tools change who can do what in a server, so each server turns them on itself
+  description: 'Create a role, or edit one: its name, color, whether its members are shown separately in the member list, and whether anyone can @mention it. '
+    + 'Leave out role to create a new one, which needs a name. When editing, only what you give is changed. '
+    + 'You can only change roles below your own highest role, and only for someone who could change it themselves (Manage Roles, and a higher role). '
+    + 'Role permissions can\'t be changed with this.',
+  inputExamples: [
+    { input: { name: 'Movie Night', color: '#ff66aa', mentionable: true } },
+    { input: { role: '[&2]', color: '#3498db' } },
+    { input: { role: 'Regulars', name: 'Old Timers', hoist: true } },
+  ],
+  inputSchema: zod.object({
+    role: zod.string().optional().describe(`The role to edit: ${ROLE_FIELD}. Leave out to create a new role`),
+    name: zod.string().optional().describe(`Name, at most ${MAX_ROLE_NAME_LENGTH} characters. Needed to create a role`),
+    color: zod.string().optional().describe('Color as a hex code, e.g. #ff66aa, or "none" for no color'),
+    hoist: zod.boolean().optional().describe('Whether its members are shown separately in the member list'),
+    mentionable: zod.boolean().optional().describe('Whether anyone can @mention it'),
+    reason: zod.string().optional().describe('Why, shown in the server\'s audit log'),
+    server: SERVER_FIELD,
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { role?: string, name?: string, color?: string, hoist?: boolean, mentionable?: boolean, reason?: string, server?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', role?: ReturnType<typeof toRoleCard>, message: string }> => {
+    const name = input.name?.trim();
+    if (name !== undefined && (!name || name.length > MAX_ROLE_NAME_LENGTH)) return { result: 'failure', message: `Role names must be 1 to ${MAX_ROLE_NAME_LENGTH} characters.` };
+    const color = input.color === undefined ? undefined : parseRoleColor(input.color);
+    if (input.color !== undefined && color === undefined) return { result: 'failure', message: `"${input.color}" isn't a hex color like #ff66aa.` };
+    const changes = { name, colors: color === undefined ? undefined : { primaryColor: color }, hoist: input.hoist, mentionable: input.mentionable, reason: input.reason?.trim() || undefined };
+
+    try {
+      const guild = await resolveGuild(context, input.server);
+      if (typeof guild === 'string') return { result: 'failure', message: guild };
+
+      if (!input.role?.trim()) {
+        if (!name) return { result: 'failure', message: 'A name is needed to create a role.' };
+        const problem = await roleProblem(context, guild);
+        if (problem) return { result: 'failure', message: problem };
+
+        const created = await guild.roles.create({ ...changes, name }); // new roles start at the bottom of the list, below everyone
+        const card = toRoleCard(context, created);
+        return { result: 'success', role: card, message: `Created role ${created.name} (${card.ref}).` };
+      }
+
+      const role = await resolveRole(context, guild, input.role);
+      if (typeof role === 'string') return { result: 'failure', message: role };
+      if (name === undefined && color === undefined && input.hoist === undefined && input.mentionable === undefined) {
+        return { result: 'failure', message: 'Give a new name, color, hoist, or mentionable to edit.' };
+      }
+      const problem = await roleProblem(context, guild, role);
+      if (problem) return { result: 'failure', message: problem };
+
+      const oldName = role.name;
+      const edited = await role.edit(changes);
+      return { result: 'success', role: toRoleCard(context, edited), message: `Edited role ${oldName}${edited.name !== oldName ? ` (now ${edited.name})` : ''}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
+const manageRole = tool({
+  defaultEnabled: false,
+  description: 'Give a role to a member of this server, or take one away. '
+    + 'You can only give or remove roles below your own highest role, and only for someone who could do it themselves (Manage Roles, and a higher role).',
+  inputExamples: [
+    { input: { action: 'give', user: '[@3]', role: '[&2]' } },
+    { input: { action: 'remove', user: '123456789012345678', role: 'Movie Night' } },
+  ],
+  inputSchema: zod.object({
+    action: zod.enum(['give', 'remove']),
+    user: zod.string().describe('Reference of the user, e.g. [@3], or their id'),
+    role: zod.string().describe(`The role: ${ROLE_FIELD}`),
+    reason: zod.string().optional().describe('Why, shown in the server\'s audit log'),
+    server: SERVER_FIELD,
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { action: 'give' | 'remove', user: string, role: string, reason?: string, server?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
+    const rawUser = input.user.trim();
+    const userID = /^<?@?!?(\d{17,20})>?$/.exec(rawUser)?.[1] ?? resolveUserRef(context.conversation_id, rawUser) ?? resolveUserRef(context.conversation_id, `[${rawUser}]`) ?? resolveUserRef(context.conversation_id, `[@${rawUser}]`);
+    if (!userID) return { result: 'failure', message: `There is no user with ref ${rawUser}.` };
+
+    try {
+      const guild = await resolveGuild(context, input.server);
+      if (typeof guild === 'string') return { result: 'failure', message: guild };
+      const member = await safeFetch(() => guild.members.fetch(userID));
+      if (!member) return { result: 'failure', message: `${rawUser} isn't a member of ${context.dm ? guild.name : 'this server'}.` };
+      const role = await resolveRole(context, guild, input.role);
+      if (typeof role === 'string') return { result: 'failure', message: role };
+      const problem = await roleProblem(context, guild, role);
+      if (problem) return { result: 'failure', message: problem };
+
+      const reason = input.reason?.trim() || undefined;
+      if (input.action === 'give') {
+        if (member.roles.cache.has(role.id)) return { result: 'success', message: `${member.displayName} already has ${role.name}.` };
+        await member.roles.add(role, reason);
+        return { result: 'success', message: `Gave ${role.name} to ${member.displayName}.` };
+      }
+      if (!member.roles.cache.has(role.id)) return { result: 'success', message: `${member.displayName} doesn't have ${role.name}.` };
+      await member.roles.remove(role, reason);
+      return { result: 'success', message: `Removed ${role.name} from ${member.displayName}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
+const deleteRole = tool({
+  defaultEnabled: false,
+  description: 'Delete a role from this server, taking it away from everyone who has it. This can\'t be undone, so be sure it\'s wanted. '
+    + 'You can only delete roles below your own highest role, and only for someone who could do it themselves (Manage Roles, and a higher role).',
+  inputExamples: [
+    { input: { role: '[&2]' } },
+    { input: { role: 'Movie Night', reason: 'Movie nights ended' } },
+  ],
+  inputSchema: zod.object({
+    role: zod.string().describe(`The role: ${ROLE_FIELD}`),
+    reason: zod.string().optional().describe('Why, shown in the server\'s audit log'),
+    server: SERVER_FIELD,
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { role: string, reason?: string, server?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
+    try {
+      const guild = await resolveGuild(context, input.server);
+      if (typeof guild === 'string') return { result: 'failure', message: guild };
+      const role = await resolveRole(context, guild, input.role);
+      if (typeof role === 'string') return { result: 'failure', message: role };
+      const problem = await roleProblem(context, guild, role);
+      if (problem) return { result: 'failure', message: problem };
+
+      const members = role.members.size; // from the cache, so it may be short in a big server
+      await role.delete(input.reason?.trim() || undefined);
+      return { result: 'success', message: `Deleted role ${role.name}${members > 0 ? `, which ${members} members had` : ''}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
   },
 });
 
@@ -2922,4 +3141,4 @@ const addMcpTool = tool({
 });
 
 export { LocalTool };
-export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, viewImage: viewImageTool, viewImageCaptioned, viewFile: viewFileTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createEmbed, createThread, runCommand, writeFile, editFile };
+export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, viewImage: viewImageTool, viewImageCaptioned, viewFile: viewFileTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, editRole, manageRole, deleteRole, sendMessage, createEmbed, createThread, runCommand, writeFile, editFile };

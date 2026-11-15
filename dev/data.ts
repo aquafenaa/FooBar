@@ -58,7 +58,6 @@ function getChatbot(server_id: Snowflake): ChatbotTable | null {
   chatbot.model = chatbot.model ?? undefined;
   chatbot.reasoning_effort = chatbot.reasoning_effort ?? undefined;
   chatbot.temperature = chatbot.temperature ?? undefined;
-  chatbot.disabled_tools = chatbot.disabled_tools ? JSON.parse(chatbot.disabled_tools as unknown as string) : undefined;
   return chatbot;
 }
 // servers whose chatbot shares the 'main' context
@@ -67,16 +66,15 @@ function getAttachedServers(): Snowflake[] {
 }
 function upsertChatbot(chatbot: ChatbotTable): void {
   db.prepare(`
-    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, temperature, disabled_tools)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, temperature)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(server_id) DO UPDATE SET
       chatbot_enabled = excluded.chatbot_enabled,
       tools_enabled = excluded.tools_enabled,
       detached = excluded.detached,
       model = excluded.model,
       reasoning_effort = excluded.reasoning_effort,
-      temperature = excluded.temperature,
-      disabled_tools = excluded.disabled_tools
+      temperature = excluded.temperature
   `).run(
     chatbot.server_id,
     chatbot.chatbot_enabled ? 1 : 0,
@@ -85,13 +83,35 @@ function upsertChatbot(chatbot: ChatbotTable): void {
     chatbot.model ?? null,
     chatbot.reasoning_effort ?? null,
     chatbot.temperature ?? null,
-    chatbot.disabled_tools?.length ? JSON.stringify(chatbot.disabled_tools) : null,
   );
 }
-// its prompts too, so a chatbot made again starts with fresh ones
+// its prompts and tool settings too, so a chatbot made again starts fresh
 function deleteChatbot(server_id: Snowflake) {
   db.prepare('DELETE FROM ChatbotPrompt WHERE server_id = ?').run(server_id);
+  db.prepare('DELETE FROM ChatbotTool WHERE server_id = ?').run(server_id);
   db.prepare('DELETE FROM Chatbot WHERE server_id = ?').run(server_id);
+}
+
+// ==================== ChatbotTool ====================
+// a tool the chatbot can offer, and whether servers have it until they turn it off (true), or only once they turn it on (false)
+type ToolDefault = { name: string, defaultEnabled: boolean };
+
+// which of the given tools are on in a server: what it's set them to, or each tool's own default where it hasn't
+function getEnabledTools(server_id: Snowflake, tools: ToolDefault[]): string[] {
+  const rows = db.prepare('SELECT tool_name, enabled FROM ChatbotTool WHERE server_id = ?').all(server_id) as { tool_name: string, enabled: number }[];
+  const saved = new Map(rows.map((row) => [row.tool_name, Boolean(row.enabled)]));
+  return tools.filter((tool) => saved.get(tool.name) ?? tool.defaultEnabled).map((tool) => tool.name);
+}
+const setToolsEnabled = db.transaction((server_id: Snowflake, tools: { name: string, enabled: boolean }[]) => {
+  const upsert = db.prepare(`
+    INSERT INTO ChatbotTool (server_id, tool_name, enabled) VALUES (?, ?, ?)
+    ON CONFLICT(server_id, tool_name) DO UPDATE SET enabled = excluded.enabled
+  `);
+  tools.forEach((tool) => upsert.run(server_id, tool.name, tool.enabled ? 1 : 0));
+});
+// back to its default
+function resetToolEnabled(server_id: Snowflake, tool_name: string): void {
+  db.prepare('DELETE FROM ChatbotTool WHERE server_id = ? AND tool_name = ?').run(server_id, tool_name);
 }
 
 // ==================== ChatbotPrompt ====================
@@ -929,6 +949,39 @@ const updateDatabase = db.transaction(() => {
     // ConversationFile is made by schema.sql. files sent before it existed aren't kept, so they show as no longer available
     db.pragma('user_version = 18');
   }
+  if (currentVersion < 19) {
+    // tools are turned on and off one at a time in ChatbotTool, rather than by group. each group a server had turned off becomes
+    // its tools, as the groups were then (not TOOL_GROUPS, which can change). MCP servers keep their mcp:<name> key
+    if (hasColumn('Chatbot', 'disabled_tools')) {
+      const groupTools: Record<string, string[]> = {
+        channels: ['fetch_channel', 'search_channel', 'fetch_embed', 'send_message', 'create_embed', 'create_thread'],
+        users: ['search_users', 'list_users', 'view_user'],
+        roles: ['edit_role', 'manage_role', 'delete_role'],
+        reactions: ['react_to_message', 'change_nickname'],
+        memories: ['create_memory', 'edit_memory', 'list_memories', 'view_memory', 'remove_memory', 'search_summaries'],
+        reminders: ['create_reminder', 'edit_reminder', 'list_reminders', 'view_reminder', 'remove_reminder'],
+        heartbeats: ['list_heartbeats', 'create_heartbeat', 'edit_heartbeat', 'delete_heartbeat'],
+        counters: ['list_counters', 'counter'],
+        web_search: ['web_search'],
+        fetch_url: ['fetch_url'],
+        workspace: ['shell', 'run_command', 'write_file', 'edit_file'],
+        images: ['view_image', 'view_file'],
+        x_search: ['x_search'],
+        bluesky: ['bluesky', 'bluesky_act', 'bluesky_dms'],
+        metacog: ['metacog'],
+        add_mcp: ['add_mcp_tool'],
+      };
+      const chatbots = db.prepare('SELECT server_id, disabled_tools FROM Chatbot WHERE disabled_tools IS NOT NULL').all() as { server_id: Snowflake, disabled_tools: string }[];
+      const insert = db.prepare('INSERT OR REPLACE INTO ChatbotTool (server_id, tool_name, enabled) VALUES (?, ?, 0)');
+      chatbots.forEach((chatbot) => {
+        (JSON.parse(chatbot.disabled_tools) as string[])
+          .flatMap((key) => groupTools[key] ?? (key.startsWith('mcp:') ? [key] : []))
+          .forEach((name) => insert.run(chatbot.server_id, name));
+      });
+      db.prepare('ALTER TABLE Chatbot DROP COLUMN disabled_tools').run();
+    }
+    db.pragma('user_version = 19');
+  }
 });
 
 export {
@@ -939,6 +992,7 @@ export {
   getMcpServer, getMcpServersByServer, insertMcpServer, updateMcpServer, deleteMcpServer,
   getCounter, getCountersByServer, insertCounter, setCounterValue, incrementCounter, deleteCounter,
   getChatbot, getAttachedServers, upsertChatbot, deleteChatbot,
+  ToolDefault, getEnabledTools, setToolsEnabled, resetToolEnabled,
   getPrompts, getPrompt, upsertPrompt, deletePrompt, reorderPrompts,
   isChatbotSubscriber, addChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, getCrossServerSubscribers, getSubscribersAmong, removeChatbotSubscriber,
   getHeartBoard, getHeartBoardsByServer, getHeartBoardsByEmoji, insertHeartBoard, updateHeartBoard, deleteHeartBoard,

@@ -65,7 +65,12 @@ interface ChatbotTable {
   model?: string, // openrouter model id, e.g. z-ai/glm-5.3. the default model if unset
   reasoning_effort?: string, // e.g. low, high, max. which ones work depends on the model. the default effort if unset
   temperature?: number, // 0-2, how random its replies are. the default temperature if unset
-  disabled_tools?: string[], // tool groups turned off here (see TOOL_GROUPS in chatbot.ts). stored as JSON. every group is on if unset
+}
+// a tool a server has turned on or off. a tool with no row here uses its own default (defaultEnabled)
+interface ChatbotToolTable {
+  server_id: Snowflake,
+  tool_name: string, // as the model sees it, or mcp:<name> for a whole MCP server
+  enabled: boolean,
 }
 interface ChatbotPromptTable {
   server_id: Snowflake,
@@ -220,5 +225,5 @@ interface McpServerTable {
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
   AutomaticResponseTable, ResponseMessageTable, ReminderTable, HeartbeatTable, McpServerTable, CounterTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
-  ChatbotTable, ChatbotPromptTable, SavedAnonymizedChat, ChatbotSubscriberTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationFileTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable, /* AI-related structures */
+  ChatbotTable, ChatbotToolTable, ChatbotPromptTable, SavedAnonymizedChat, ChatbotSubscriberTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationFileTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable, /* AI-related structures */
 };
