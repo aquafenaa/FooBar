@@ -562,7 +562,7 @@ ${heartbeat.silent
  */
 const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, description: string, tools: string[] }[] = [
   { list: 'discord', key: 'channels', label: 'Channels & messages', description: 'Read and search channels, send messages and embeds, create threads', tools: ['fetch_channel', 'search_channel', 'fetch_embed', 'send_message', 'create_embed', 'create_thread'] },
-  { list: 'discord', key: 'users', label: 'Users', description: 'Look up members of the server', tools: ['search_users', 'list_users', 'view_user'] },
+  { list: 'discord', key: 'users', label: 'Users', description: 'Look up members and roles of the server', tools: ['search_users', 'list_users', 'view_user', 'view_role'] },
   { list: 'discord', key: 'roles', label: 'Roles', description: 'Create, edit, give, remove, and delete roles, for people who could themselves', tools: ['edit_role', 'manage_role', 'delete_role'] },
   { list: 'discord', key: 'reactions', label: 'Reactions & nickname', description: 'React to messages, change its own nickname', tools: ['react_to_message', 'change_nickname'] },
   { list: 'discord', key: 'memories', label: 'Memories & summaries', description: 'Save and read memories, search past conversations', tools: ['create_memory', 'edit_memory', 'list_memories', 'view_memory', 'remove_memory', 'search_summaries'] },
@@ -602,6 +602,7 @@ function getLocalTools(): Record<string, LocalTool> {
     search_users: localTools.searchUsers,
     list_users: localTools.listUsers,
     view_user: localTools.viewUser,
+    view_role: localTools.viewRole,
     edit_role: localTools.editRole,
     manage_role: localTools.manageRole,
     delete_role: localTools.deleteRole,
@@ -782,6 +783,7 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'edit_heartbeat': return ['edited heartbeat', quote(input.name)];
     case 'delete_heartbeat': return ['deleted heartbeat', quote(input.name)];
     // role refs like [&2] are left as written, so they're turned into role mentions with the rest of the reply
+    case 'view_role': return ['viewed role', clip(input.role)];
     case 'edit_role': return input.role ? ['edited role', clip(input.role)] : ['created role', quote(input.name)];
     case 'manage_role': return input.action === 'remove' ? [`removed ${clip(input.role)} from`, clip(input.user)] : [`gave ${clip(input.role)} to`, clip(input.user)];
     case 'delete_role': return ['deleted role', clip(input.role)];
@@ -1054,6 +1056,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toModelTool('search_users', localTools.searchUsers),
     toModelTool('list_users', localTools.listUsers),
     toModelTool('view_user', localTools.viewUser),
+    toModelTool('view_role', localTools.viewRole),
     toModelTool('edit_role', localTools.editRole),
     toModelTool('manage_role', localTools.manageRole),
     toModelTool('delete_role', localTools.deleteRole),

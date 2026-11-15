@@ -2437,11 +2437,13 @@ function parseRoleColor(color: string): number | undefined {
   return parseInt(hex.length === 3 ? [...hex].map((c) => c + c).join('') : hex, 16);
 }
 
+const toHexColor = (color: number) => `#${color.toString(16).padStart(6, '0')}`;
+
 function toRoleCard(context: ReplyContext, role: Role) {
   return {
     ref: roleRef(context, role.id),
     name: role.name,
-    color: role.colors.primaryColor ? `#${role.colors.primaryColor.toString(16).padStart(6, '0')}` : 'none',
+    color: role.colors.primaryColor ? toHexColor(role.colors.primaryColor) : 'none',
     hoist: role.hoist,
     mentionable: role.mentionable,
   };
@@ -2581,6 +2583,70 @@ const deleteRole = tool({
       return { result: 'success', message: `Deleted role ${role.name}${members > 0 ? `, which ${members} members had` : ''}.` };
     } catch (error: any) {
       return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
+// what a managed role belongs to, or undefined for one made by hand
+function roleManagedBy(role: Role): string | undefined {
+  if (!role.managed && !role.tags) return undefined;
+  const { tags } = role;
+  if (tags?.botId) return `the bot <@${tags.botId}>`;
+  if (tags?.premiumSubscriberRole) return 'Server Booster';
+  if (tags?.subscriptionListingId) return 'a server subscription';
+  if (tags?.guildConnections) return 'linked roles (connections)';
+  if (tags?.integrationId) return `an integration (${tags.integrationId})`;
+  return role.managed ? 'an integration' : undefined;
+}
+
+// only reads, so it's in the users group and on by default, unlike the tools that change roles
+const viewRole = tool({
+  description: 'View everything about a role in this server: its name, colors, icon, place in the role list, how many members have it, its permissions, '
+    + 'whether it\'s shown separately or can be @mentioned, what manages it, and whether you could change it with the role tools.',
+  inputExamples: [
+    { input: { role: '[&2]' } },
+    { input: { role: 'Moderators' } },
+  ],
+  inputSchema: zod.object({
+    role: zod.string().describe(`The role: ${ROLE_FIELD}`),
+    server: SERVER_FIELD,
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { role: string, server?: string }, { context }: { context: ReplyContext }) => {
+    try {
+      const guild = await resolveGuild(context, input.server);
+      if (typeof guild === 'string') return { result: 'failure' as const, message: guild };
+      const role = await resolveRole(context, guild, input.role);
+      if (typeof role === 'string') return { result: 'failure' as const, message: role };
+      await guild.members.fetch(); // fills the cache, which a role's members are read from
+
+      const { secondaryColor, tertiaryColor } = role.colors;
+      const ranked = [...guild.roles.cache.values()].sort((a, b) => b.position - a.position); // highest first, as Discord lists them
+      const permissions = role.permissions.toArray();
+      // only the bot's side: whether the asker could too is checked when they ask for a change
+      const cantChange = await roleProblem({ ...context, requester_id: undefined }, guild, role);
+
+      return {
+        result: 'success' as const,
+        role: {
+          ...toRoleCard(context, role),
+          id: role.id,
+          secondary_color: secondaryColor ? toHexColor(secondaryColor) : undefined, // a gradient's other colors
+          tertiary_color: tertiaryColor ? toHexColor(tertiaryColor) : undefined,
+          icon_url: role.iconURL() ?? undefined,
+          emoji: role.unicodeEmoji ?? undefined,
+          position: `${ranked.findIndex((r) => r.id === role.id) + 1} of ${ranked.length}, highest first`,
+          members: role.members.size,
+          created: new Date(role.createdTimestamp).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }),
+          permissions: permissions.includes('Administrator') ? ['Administrator (every permission)'] : permissions,
+          managed_by: roleManagedBy(role),
+          you_can_change_it: !cantChange,
+          why_not: cantChange,
+        },
+        message: `Viewed role ${role.name}.`,
+      };
+    } catch (error: any) {
+      return { result: 'failure' as const, message: String(error?.message ?? error) };
     }
   },
 });
@@ -3141,4 +3207,4 @@ const addMcpTool = tool({
 });
 
 export { LocalTool };
-export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, viewImage: viewImageTool, viewImageCaptioned, viewFile: viewFileTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, editRole, manageRole, deleteRole, sendMessage, createEmbed, createThread, runCommand, writeFile, editFile };
+export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, viewImage: viewImageTool, viewImageCaptioned, viewFile: viewFileTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, viewRole, editRole, manageRole, deleteRole, sendMessage, createEmbed, createThread, runCommand, writeFile, editFile };
