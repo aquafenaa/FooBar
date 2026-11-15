@@ -21,6 +21,8 @@ import { buildPromptModules } from './prompts';
 
 const MAX_MESSAGE_LENGTH = 2000;
 const PADDING_LENGTH = 8;
+// what the model writes to end one Discord message and start the next. <|...|> marks what it writes, unlike the XML tags it's shown
+const NEW_MESSAGE_TOKEN = '<|new_message|>';
 const MAX_TOOL_STEPS = 50; // number of model calls allowed per reply, when it keeps asking for tools
 // only whitespace, or characters that show as nothing (zero-width spaces, the braille blank...)
 const BLANK_MESSAGE = /^[\s\u200B-\u200D\u2060\uFEFF\u2800]*$/;
@@ -405,12 +407,31 @@ function resolveRefs(conversationID: string, text: string): string {
 }
 
 /**
- * Splits a finished LLM response into Discord-safe message chunks (<= 2000 chars),
- * preserving open code fences across the split.
-*/
-async function formatResponse(conversationID: string, agentResponse: string): Promise<string[]> {
+ * Splits text into the messages the model asked for with NEW_MESSAGE_TOKEN.
+ * A token inside a code block is left as it is, so it can show the token in code without breaking the block
+ */
+function splitOnNewMessage(text: string): string[] {
+  const [first, ...parts] = text.split(NEW_MESSAGE_TOKEN);
+  const segments: string[] = [];
+  let current = first;
+  for (const part of parts) {
+    // each segment starts outside a code block, since it only ends outside one
+    if (trackFence(current, null)) {
+      current += NEW_MESSAGE_TOKEN + part;
+    } else {
+      segments.push(current);
+      current = part;
+    }
+  }
+  segments.push(current);
+  // only blank lines are trimmed from the start, so code indentation on a segment's first line survives
+  return segments.map((segment) => segment.replace(/^\s*\n/, '').trimEnd());
+}
+
+// splits one message into Discord-safe chunks (<= 2000 chars), preserving open code fences across the split
+function splitLongMessage(text: string): string[] {
   const chunks: string[] = [];
-  let rest = resolveRefs(conversationID, agentResponse);
+  let rest = text;
   let open: string | null = null; // fence line still open at the start of `rest`
 
   while (rest.length > 0) {
@@ -434,9 +455,18 @@ async function formatResponse(conversationID: string, agentResponse: string): Pr
     // Consume exactly one separator so code indentation on the next line survives
     rest = rest.slice(cut).replace(/^(\n\n|\n| )/, '');
   }
+  return chunks;
+}
 
-  // a message with nothing visible in it is never sent, or saved
-  return chunks.filter((chunk) => !BLANK_MESSAGE.test(chunk));
+/**
+ * Splits a finished LLM response into Discord messages: first where the model wrote NEW_MESSAGE_TOKEN,
+ * then wherever a message is too long for Discord
+ */
+async function formatResponse(conversationID: string, agentResponse: string): Promise<string[]> {
+  return splitOnNewMessage(resolveRefs(conversationID, agentResponse))
+    .flatMap(splitLongMessage)
+    // a message with nothing visible in it is never sent, or saved
+    .filter((chunk) => !BLANK_MESSAGE.test(chunk));
 }
 
 // what a reply is generated for: a message someone sent the bot, or a heartbeat, which has no message to answer
@@ -877,6 +907,9 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
   // the server's prompt modules in order, by default `system` (SYSTEM.md, unless it's been set) and `persona`
   const systemPrompt = `${buildPromptModules(serverID)}
+    <message_splitting>
+      Write ${NEW_MESSAGE_TOKEN} to end your current Discord message and start a new one. Use it sparingly, like a person sending a quick follow-up.
+    </message_splitting>
     <relevant_summaries>
       ${summaryStr}
     </relevant_summaries>
