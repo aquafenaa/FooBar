@@ -459,6 +459,28 @@ function splitLongMessage(text: string): string[] {
 }
 
 /**
+ * Some providers send the reply back as its content parts written out as JSON, e.g. [{"text": "hi", "type": "text"}],
+ * with a part for each message the model split it into. That's turned back into text, with the splits kept.
+ * Anything else is returned as it is, including a reply that only starts with [
+ */
+function unwrapTextParts(text: string, model: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('[{') || !trimmed.endsWith('}]')) return text;
+
+  let parts: unknown;
+  try {
+    parts = JSON.parse(trimmed);
+  } catch {
+    return text;
+  }
+  const isTextPart = (part: any) => part?.type === 'text' && typeof part.text === 'string' && Object.keys(part).length === 2;
+  if (!Array.isArray(parts) || parts.length === 0 || !parts.every(isTextPart)) return text;
+
+  console.warn(`Unwrapped a reply sent as JSON content parts (${parts.length}), from ${model}`);
+  return parts.map((part) => part.text.trim()).join(`\n${NEW_MESSAGE_TOKEN}\n`);
+}
+
+/**
  * Splits a finished LLM response into Discord messages: first where the model wrote NEW_MESSAGE_TOKEN,
  * then wherever a message is too long for Discord
  */
@@ -1166,7 +1188,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
       }
     }
     if (!response) throw new Error('The response ended without finishing');
-    streamStr = stepText || streamStr; // keep the earlier text if the final round has none
+    streamStr = unwrapTextParts(stepText, response.model) || streamStr; // keep the earlier text if the final round has none
 
     // record server-side tool calls (web search, shell), which come back already executed. a shell call has its results on it.
     // a web search's are citations on the messages after it
