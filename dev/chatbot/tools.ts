@@ -9,8 +9,9 @@ import { estimateTokens, safeFetch, sendReminder } from '../utils';
 import { chatbotMentions, formatReactions, formatResponse, resolveRefs } from './chatbot';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './context';
 import { MAX_BOT_HEARTBEATS, removeHeartbeat, scheduleHeartbeat } from './heartbeat';
-import { MAX_TIMEOUT, sandboxExec } from './sandbox';
+import { MAX_TIMEOUT, isSandboxEnabled, sandboxExec } from './sandbox';
 import { captionImage, fetchImage } from './vision';
+import { FilePart, MAX_FILE_WORDS, viewFile } from './files';
 import { fromSummarySource, getVisibleSummaries } from './conversation';
 import { fetchServerChannel } from './dm';
 import { MAX_MCP_SERVERS, saveMcpServer } from './mcp';
@@ -34,6 +35,7 @@ const replyContextSchema = zod.object({
   reference_message_id: zod.string().optional(), // the message the user is replying to, which the model sees as [$0]
   // a DM with the bot's owner, who has full control: channel and server tools can reach any server the bot is in, private channels included
   dm: zod.boolean().optional(),
+  vision: zod.boolean().optional(), // whether the model can take images, or needs them captioned (view_image)
 });
 type ReplyContext = zod.infer<typeof replyContextSchema>;
 
@@ -630,22 +632,28 @@ const fetchURL = tool({
   },
 });
 
-const captionImageTool = tool({
-  description: 'Look at an image at a URL, and get back a short description of it, including any text in it. '
-    + 'Use it on images you find mid-response (e.g. from a web search or a fetched page), or to look again at an image in the conversation, which are shown as "(url) [image: caption]". '
-    + 'Give a question to have it look for something specific. Only works on JPEG, PNG, GIF, and WebP images up to 5MB.',
+const VIEW_IMAGE_USES = 'Use it on images you find mid-response (e.g. from a web search or a fetched page), or to look again at an older image in the conversation, which are shown as "(url) [image: caption]". '
+  + 'Only works on JPEG, PNG, GIF, and WebP images up to 5MB.';
+
+// the one tool for images. a model with vision gets the image back as an image block, which is left out of the saved result.
+// one without is given a caption instead, from the caption model. see viewImageCaptioned for what it's told
+const viewImageTool = tool({
+  description: `Look at an image at a URL yourself. It's attached to the result, so you see the image itself rather than a description of it. ${VIEW_IMAGE_USES}`,
   inputExamples: [
     { input: { url: 'https://example.com/images/chart.png' } },
-    { input: { url: 'https://example.com/menu.jpg', question: 'How much is the large pepperoni pizza?' } },
   ],
   inputSchema: zod.object({
     url: zod.string().describe('Full URL of the image, including https://'),
-    question: zod.string().optional().describe('Something specific to look for or answer about the image'),
   }),
-  execute: async (input: { url: string, question?: string }): Promise<{ result: 'success' | 'failure', caption?: string, message: string }> => {
+  contextSchema: replyContextSchema,
+  execute: async (input: { url: string, question?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string, image?: string, caption?: string }> => {
     try {
-      const caption = await captionImage(input.url, input.question);
-      return { result: 'success', caption, message: 'Captioned image.' };
+      if (!context.vision) {
+        const caption = await captionImage(input.url, input.question);
+        return { result: 'success', caption, message: 'Described the image.' };
+      }
+      const image = await fetchImage(input.url);
+      return { result: 'success', message: 'The image is attached.', image };
     } catch (error: any) {
       return {
         result: 'failure',
@@ -655,25 +663,43 @@ const captionImageTool = tool({
   },
 });
 
-// only offered to models with vision. the image goes back to the model as an image block, and is left out of the saved result
-const viewImageTool = tool({
-  description: 'Look at an image at a URL yourself. It\'s attached to the result, so you see the image itself rather than a description of it. '
-    + 'Use it on images you find mid-response (e.g. from a web search or a fetched page), or to look again at an older image in the conversation, which are shown as "(url) [image: caption]". '
-    + 'Only works on JPEG, PNG, GIF, and WebP images up to 5MB.',
+// view_image as a model without vision is offered it: the same tool, but it's told it gets a description, and can ask about something specific
+const viewImageCaptioned = tool({
+  ...viewImageTool,
+  description: `Look at an image at a URL, and get back a short description of it, including any text in it. Give a question to have it look for something specific. ${VIEW_IMAGE_USES}`,
   inputExamples: [
     { input: { url: 'https://example.com/images/chart.png' } },
+    { input: { url: 'https://example.com/menu.jpg', question: 'How much is the large pepperoni pizza?' } },
   ],
   inputSchema: zod.object({
     url: zod.string().describe('Full URL of the image, including https://'),
+    question: zod.string().optional().describe('Something specific to look for or answer about the image'),
   }),
-  execute: async (input: { url: string }): Promise<{ result: 'success' | 'failure', message: string, image?: string }> => {
+});
+
+const viewFileTool = tool({
+  description: `Read a file at a URL. Text and code files up to ${MAX_FILE_WORDS.toLocaleString('en-US')} words come back as their text, and PDFs are attached to the result. `
+    + `Anything longer, or that isn't text or a PDF (zip, audio, spreadsheets...), is downloaded into your workspace's downloads folder instead, and you're told its path, so you can work with it there. `
+    + 'Use it on files you find mid-response, or to read an older file from the conversation again, which are shown as "(url) [file: name, size]". Files up to 10MB can be read.',
+  inputExamples: [
+    { input: { url: 'https://example.com/data/report.pdf' } },
+  ],
+  inputSchema: zod.object({
+    url: zod.string().describe('Full URL of the file, including https://'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { url: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string, content?: string, saved_to?: string, file?: FilePart }> => {
+    // the workspace is only for attached servers, like the sandbox tools. without it, long text is cut short, and anything else can't be read
+    const canSave = isSandboxEnabled() && (isAttached(context.server_id) || !!context.dm);
     try {
-      const image = await fetchImage(input.url);
-      return { result: 'success', message: 'The image is attached.', image };
+      const viewed = await viewFile(input.url, canSave);
+      if (viewed.saved) return { result: 'success', saved_to: viewed.saved, message: `It's too long or not readable here, so it was saved to your workspace at ${viewed.saved}.` };
+      if (viewed.part?.type === 'input_text') return { result: 'success', content: viewed.part.text, message: `Read ${viewed.name}.` };
+      return { result: 'success', file: viewed.part, message: `${viewed.name} is attached.` };
     } catch (error: any) {
       return {
         result: 'failure',
-        message: error?.name === 'TimeoutError' ? 'Fetching the image timed out after 15 seconds.' : String(error?.message ?? error),
+        message: error?.name === 'TimeoutError' ? 'Fetching the file timed out.' : `Couldn't read the file: ${error?.message ?? error}`,
       };
     }
   },
@@ -929,7 +955,7 @@ function toBlueskyEmbed(embed: any): Record<string, any> {
     case 'app.bsky.embed.images#view':
       return { images: embed.images.map((image: any) => ({ url: image.fullsize, alt: image.alt || undefined })) };
     case 'app.bsky.embed.video#view':
-      return { video: { thumbnail: embed.thumbnail, alt: embed.alt || undefined } }; // the thumbnail, since that's what caption_image can look at
+      return { video: { thumbnail: embed.thumbnail, alt: embed.alt || undefined } }; // the thumbnail, since that's what view_image can look at
     case 'app.bsky.embed.external#view':
       return { link: { url: embed.external.uri, title: embed.external.title || undefined, description: embed.external.description || undefined } };
     case 'app.bsky.embed.record#view':
@@ -1019,7 +1045,7 @@ const bluesky = tool({
     + '"profile" shows someone\'s bio and counts. '
     + '"notifications" shows your latest likes, reposts, follows, replies, mentions, and quotes. '
     + `Give more: true, with the same action and target, to get the next page of what you last looked at. Up to ${MAX_BLUESKY_POSTS} posts at once. `
-    + 'Image urls and video thumbnails can be looked at with caption_image.',
+    + 'Image urls and video thumbnails can be looked at with view_image.',
   inputExamples: [
     { input: { action: 'timeline' } },
     { input: { action: 'timeline', more: true } },
@@ -2896,4 +2922,4 @@ const addMcpTool = tool({
 });
 
 export { LocalTool };
-export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, captionImage: captionImageTool, viewImage: viewImageTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createEmbed, createThread, runCommand, writeFile, editFile };
+export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, viewImage: viewImageTool, viewImageCaptioned, viewFile: viewFileTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, sendMessage, createEmbed, createThread, runCommand, writeFile, editFile };

@@ -78,6 +78,11 @@ function supportsImages(id: string): boolean {
   return !!findModel(id)?.architecture?.input_modalities?.includes('image');
 }
 
+// whether it reads PDFs itself. if not, they're turned into text first (see the file-parser plugin in generateReply). assumes no if the list couldn't be loaded
+function supportsFiles(id: string): boolean {
+  return !!findModel(id)?.architecture?.input_modalities?.includes('file');
+}
+
 // the most temperature a model takes, so a setting above it can't make every reply fail
 function maxTemperature(id: string): number {
   return TEMPERATURE_LIMITS.find(([prefix]) => id.startsWith(prefix))?.[1] ?? MAX_TEMPERATURE;
@@ -125,4 +130,4 @@ function formatPricing(model: OpenRouterModel): string {
   return `${perMillion(model.pricing.prompt)}/${perMillion(model.pricing.completion)} per M`;
 }
 
-export { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, REASONING_EFFORTS, OpenRouterModel, loadModels, getModels, findModel, supportsTools, supportsImages, supportsTemperature, maxTemperature, temperatureFor, getSupportedEfforts, reasoningFor, responseText, formatPricing };
+export { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, MAX_TEMPERATURE, REASONING_EFFORTS, OpenRouterModel, loadModels, getModels, findModel, supportsTools, supportsImages, supportsTemperature, maxTemperature, temperatureFor, getSupportedEfforts, reasoningFor, responseText, formatPricing, supportsFiles };

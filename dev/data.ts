@@ -4,9 +4,9 @@ import Database from 'better-sqlite3';
 import cron from 'node-cron';
 import { readFileSync } from 'fs';
 
-import { AutomaticResponseTable, ReminderTable, HeartbeatTable, McpServerTable, CounterTable, ChatbotSubscriberTable, ChatbotTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable } from './types/schema';
+import { AutomaticResponseTable, ReminderTable, HeartbeatTable, McpServerTable, CounterTable, ChatbotSubscriberTable, ChatbotTable, ChatbotPromptTable, HeartBoardEmojiTable, HeartBoardMessageTable, HeartBoardTable, SavedAnonymizedChat, ServerTable, VoicePingInputTable, VoicePingTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationFileTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable } from './types/schema';
 import { ConfigData, ServerConfig, ServerData } from './types/bot';
-import { getBaseSystemPrompt, getDefaultSystemPrompt } from './chatbot/chatbot';
+import { getBaseSystemPrompt } from './chatbot/prompts';
 import { fromBlob, SOURCE_SEPARATOR, toBlob } from './chatbot/conversation';
 
 const schemaPath = path.join(__dirname, '../data/seed/schema.sql');
@@ -58,7 +58,6 @@ function getChatbot(server_id: Snowflake): ChatbotTable | null {
   chatbot.model = chatbot.model ?? undefined;
   chatbot.reasoning_effort = chatbot.reasoning_effort ?? undefined;
   chatbot.temperature = chatbot.temperature ?? undefined;
-  chatbot.system_prompt_override = chatbot.system_prompt_override ?? undefined;
   chatbot.disabled_tools = chatbot.disabled_tools ? JSON.parse(chatbot.disabled_tools as unknown as string) : undefined;
   return chatbot;
 }
@@ -68,8 +67,8 @@ function getAttachedServers(): Snowflake[] {
 }
 function upsertChatbot(chatbot: ChatbotTable): void {
   db.prepare(`
-    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, temperature, system_prompt_override, chatbot_prompt, disabled_tools)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO Chatbot (server_id, chatbot_enabled, tools_enabled, detached, model, reasoning_effort, temperature, disabled_tools)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(server_id) DO UPDATE SET
       chatbot_enabled = excluded.chatbot_enabled,
       tools_enabled = excluded.tools_enabled,
@@ -77,8 +76,6 @@ function upsertChatbot(chatbot: ChatbotTable): void {
       model = excluded.model,
       reasoning_effort = excluded.reasoning_effort,
       temperature = excluded.temperature,
-      system_prompt_override = excluded.system_prompt_override,
-      chatbot_prompt = excluded.chatbot_prompt,
       disabled_tools = excluded.disabled_tools
   `).run(
     chatbot.server_id,
@@ -88,17 +85,39 @@ function upsertChatbot(chatbot: ChatbotTable): void {
     chatbot.model ?? null,
     chatbot.reasoning_effort ?? null,
     chatbot.temperature ?? null,
-    chatbot.system_prompt_override ?? null,
-    chatbot.chatbot_prompt,
     chatbot.disabled_tools?.length ? JSON.stringify(chatbot.disabled_tools) : null,
   );
 }
+// its prompts too, so a chatbot made again starts with fresh ones
 function deleteChatbot(server_id: Snowflake) {
+  db.prepare('DELETE FROM ChatbotPrompt WHERE server_id = ?').run(server_id);
   db.prepare('DELETE FROM Chatbot WHERE server_id = ?').run(server_id);
 }
-function setChatbotPrompt(server_id: Snowflake, new_prompt: string): void {
-  db.prepare('UPDATE Chatbot SET chatbot_prompt = ? WHERE server_id = ?').run(new_prompt, server_id);
+
+// ==================== ChatbotPrompt ====================
+// in the order they go in the prompt
+function getPrompts(server_id: Snowflake): ChatbotPromptTable[] {
+  return db.prepare('SELECT * FROM ChatbotPrompt WHERE server_id = ? ORDER BY position').all(server_id) as ChatbotPromptTable[];
 }
+function getPrompt(server_id: Snowflake, prompt_name: string): ChatbotPromptTable | undefined {
+  return db.prepare('SELECT * FROM ChatbotPrompt WHERE server_id = ? AND prompt_name = ?').get(server_id, prompt_name) as ChatbotPromptTable | undefined;
+}
+// a new module goes after the others. an existing one keeps its place, and only its content changes
+function upsertPrompt(prompt: ChatbotPromptTable): void {
+  db.prepare(`
+    INSERT INTO ChatbotPrompt (server_id, prompt_name, content, position)
+    VALUES (?, ?, ?, (SELECT COALESCE(MAX(position) + 1, 0) FROM ChatbotPrompt WHERE server_id = ?))
+    ON CONFLICT(server_id, prompt_name) DO UPDATE SET content = excluded.content
+  `).run(prompt.server_id, prompt.prompt_name, prompt.content, prompt.server_id);
+}
+function deletePrompt(server_id: Snowflake, prompt_name: string): void {
+  db.prepare('DELETE FROM ChatbotPrompt WHERE server_id = ? AND prompt_name = ?').run(server_id, prompt_name);
+}
+// puts the server's modules in this order. any left out keep their position
+const reorderPrompts = db.transaction((server_id: Snowflake, prompt_names: string[]) => {
+  const update = db.prepare('UPDATE ChatbotPrompt SET position = ? WHERE server_id = ? AND prompt_name = ?');
+  prompt_names.forEach((prompt_name, position) => update.run(position, server_id, prompt_name));
+});
 function isChatbotSubscriber(server_id: Snowflake, user_id: Snowflake): boolean {
   return db.prepare('SELECT 1 FROM ChatbotSubscriber WHERE server_id = ? AND user_id = ?').get(server_id, user_id) !== undefined;
 }
@@ -223,6 +242,17 @@ function insertConversationMessage(message: ConversationMessageTable): void {
       message.timestamp,
     );
 }
+// ==================== ConversationFile ====================
+// its message has to be saved first. they're deleted along with it
+function insertConversationFile(file: ConversationFileTable): void {
+  db.prepare('INSERT OR IGNORE INTO ConversationFile (conversation_id, message_id, url, name, kind, content, words) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(file.conversation_id, file.message_id, file.url, file.name, file.kind, file.content, file.words ?? null);
+}
+function getConversationFiles(conversation_id: string, message_id: string): ConversationFileTable[] {
+  const files = db.prepare('SELECT * FROM ConversationFile WHERE conversation_id = ? AND message_id = ?').all(conversation_id, message_id) as ConversationFileTable[];
+  return files.map((file) => ({ ...file, words: file.words ?? undefined }));
+}
+
 // NOTE: message ids are unique across a platform, so these two don't need the conversation
 function isConversationMessage(message_id: string): boolean {
   return db.prepare('SELECT 1 FROM ConversationMessage WHERE message_id = ?').get(message_id) !== undefined;
@@ -762,21 +792,7 @@ const updateDatabase = db.transaction(() => {
     db.prepare('ALTER TABLE Chatbot ADD COLUMN chatbot_prompt TEXT').run();
     db.prepare('DROP TABLE IF EXISTS ChatbotShortTermMemory').run(); // IF EXISTS, since the old memory tables were later removed entirely
     db.exec(schema);
-
-    const servers = getAllServers();
-
-    // add default prompt for all server chatbots
-    getDefaultSystemPrompt().then((defaultPrompt) => {
-      if (!servers) return;
-
-      servers.forEach((serverID) => {
-        const chatbot = getChatbot(serverID);
-        if (chatbot && (!chatbot.chatbot_prompt || chatbot.chatbot_prompt === '')) {
-          setChatbotPrompt(serverID, defaultPrompt);
-        }
-      });
-    });
-
+    // empty personas used to be filled with a copy of SYSTEM.md here. version 5 cleared those copies again, so it's skipped
     db.pragma('user_version = 2');
   }
   if (currentVersion < 3) {
@@ -893,6 +909,26 @@ const updateDatabase = db.transaction(() => {
     if (!hasColumn('Conversation', 'summary_attempts')) db.prepare('ALTER TABLE Conversation ADD COLUMN summary_attempts INTEGER').run();
     db.pragma('user_version = 16');
   }
+  if (currentVersion < 17) {
+    // the system prompt override and persona became prompt modules, so more can be added. a missing override is an empty
+    // `system` module, which still uses SYSTEM.md. columns are checked first, since a fresh database never had them
+    const systemColumn = hasColumn('Chatbot', 'system_prompt_override') ? 'system_prompt_override' : 'NULL';
+    const personaColumn = hasColumn('Chatbot', 'chatbot_prompt') ? 'chatbot_prompt' : 'NULL';
+    const chatbots = db.prepare(`SELECT server_id, ${systemColumn} AS system_prompt, ${personaColumn} AS persona FROM Chatbot`).all() as { server_id: Snowflake, system_prompt: string | null, persona: string | null }[];
+    const insert = db.prepare('INSERT OR IGNORE INTO ChatbotPrompt (server_id, prompt_name, content, position) VALUES (?, ?, ?, ?)');
+    chatbots.forEach((chatbot) => {
+      insert.run(chatbot.server_id, 'system', chatbot.system_prompt ?? '', 0);
+      insert.run(chatbot.server_id, 'persona', chatbot.persona ?? '', 1);
+    });
+
+    if (systemColumn !== 'NULL') db.prepare('ALTER TABLE Chatbot DROP COLUMN system_prompt_override').run();
+    if (personaColumn !== 'NULL') db.prepare('ALTER TABLE Chatbot DROP COLUMN chatbot_prompt').run();
+    db.pragma('user_version = 17');
+  }
+  if (currentVersion < 18) {
+    // ConversationFile is made by schema.sql. files sent before it existed aren't kept, so they show as no longer available
+    db.pragma('user_version = 18');
+  }
 });
 
 export {
@@ -902,7 +938,8 @@ export {
   getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, deleteHeartbeat,
   getMcpServer, getMcpServersByServer, insertMcpServer, updateMcpServer, deleteMcpServer,
   getCounter, getCountersByServer, insertCounter, setCounterValue, incrementCounter, deleteCounter,
-  getChatbot, getAttachedServers, upsertChatbot, deleteChatbot, setChatbotPrompt,
+  getChatbot, getAttachedServers, upsertChatbot, deleteChatbot,
+  getPrompts, getPrompt, upsertPrompt, deletePrompt, reorderPrompts,
   isChatbotSubscriber, addChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, getCrossServerSubscribers, getSubscribersAmong, removeChatbotSubscriber,
   getHeartBoard, getHeartBoardsByServer, getHeartBoardsByEmoji, insertHeartBoard, updateHeartBoard, deleteHeartBoard,
   getHeartBoardEmojis, insertHeartBoardEmoji, deleteHeartBoardEmoji, deleteAllHeartBoardEmojis,
@@ -912,6 +949,7 @@ export {
   saveAnonymizedMessage,
   getConversation, getAllConversations, getConversationsBySource, getConversationByChannel, getExpiredConversations, upsertConversation, setSummaryAttempts, deleteConversation, deleteAllConversations,
   getConversationMessages, insertConversationMessage, isConversationMessage, updateConversationMessageContent, deleteConversationMessageByID, deleteConversationMessage, clearConversationMessages, getConversationTokenCount,
+  insertConversationFile, getConversationFiles,
   getMemory, getMemoriesBySource, upsertMemory, deleteMemory,
   getConversationSummary, getConversationSummaries, getConversationSummariesBySource, getLatestConversationSummaries, upsertConversationSummary, deleteConversationSummary,
   getNextUserRef, getIndexUser, getIndexUsers, insertIndexUser, resolveUserRef, deleteIndexUser,

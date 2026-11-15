@@ -19,7 +19,7 @@ A Discord bot written in TypeScript. It began in 2023 as a set of utilities for 
 ## Features
 
 ### AI agent (`/chatbot`, `/subscribe`, `/heartbeat`, `/mcp`)
-- Replies when pinged or replied to, with a configurable model, temperature, reasoning effort, persona, and system prompt for each server
+- Replies when pinged or replied to, with a configurable model, temperature, reasoning effort, and prompt modules (a system prompt, a persona, and any others you add) for each server
 - Persistent **memories** the model can create and edit, and searchable **conversation summaries**, both viewable and editable by admins
 - **Heartbeats**: prompts on a cron schedule, so the bot can post on its own (for example, a morning check-in)
 - **Shared or detached context**: servers can share one "personality" or keep their own

@@ -84,9 +84,15 @@ CREATE TABLE IF NOT EXISTS Chatbot(
   model TEXT,
   reasoning_effort TEXT,
   temperature REAL,
-  system_prompt_override TEXT,
-  chatbot_prompt TEXT,
   disabled_tools TEXT
+);
+CREATE TABLE IF NOT EXISTS ChatbotPrompt(
+  server_id VARCHAR(20) NOT NULL REFERENCES Server(server_id) ON DELETE CASCADE,
+  prompt_name VARCHAR(32) NOT NULL COLLATE NOCASE,
+  content TEXT NOT NULL,
+  position INTEGER NOT NULL,
+
+  PRIMARY KEY (server_id, prompt_name)
 );
 CREATE TABLE IF NOT EXISTS ChatbotSubscriber(
   server_id VARCHAR(20) REFERENCES Server(server_id) ON DELETE CASCADE,
@@ -136,6 +142,19 @@ CREATE TABLE IF NOT EXISTS ConversationMessage(
   timestamp INTEGER,
 
   PRIMARY KEY (conversation_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS ConversationFile(
+  conversation_id VARCHAR(50) NOT NULL,
+  message_id VARCHAR(50) NOT NULL,
+  url TEXT NOT NULL,
+
+  name TEXT NOT NULL,
+  kind VARCHAR(4) NOT NULL,
+  content BLOB NOT NULL,
+  words INTEGER,
+
+  PRIMARY KEY (conversation_id, message_id, url),
+  FOREIGN KEY (conversation_id, message_id) REFERENCES ConversationMessage(conversation_id, message_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS ConversationToolResult(
   conversation_id VARCHAR(50) NOT NULL REFERENCES Conversation(conversation_id) ON DELETE CASCADE,

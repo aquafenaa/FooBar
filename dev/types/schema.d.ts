@@ -65,9 +65,23 @@ interface ChatbotTable {
   model?: string, // openrouter model id, e.g. z-ai/glm-5.3. the default model if unset
   reasoning_effort?: string, // e.g. low, high, max. which ones work depends on the model. the default effort if unset
   temperature?: number, // 0-2, how random its replies are. the default temperature if unset
-  system_prompt_override?: string, // replaces SYSTEM.md for this server, if set
-  chatbot_prompt: string, // the server's persona, layered on top of the system prompt. Empty for none
   disabled_tools?: string[], // tool groups turned off here (see TOOL_GROUPS in chatbot.ts). stored as JSON. every group is on if unset
+}
+interface ChatbotPromptTable {
+  server_id: Snowflake,
+  prompt_name: string, // also the tag it's wrapped in. 'system' and 'persona' are made with every chatbot
+  content: string, // empty for nothing, except the 'system' module, which uses SYSTEM.md while it's empty
+  position?: number, // where it goes in the prompt, in creation order. set when it's first saved
+}
+// a file from a message, downloaded once when the message is saved, so it can be attached on later replies without fetching it again
+interface ConversationFileTable {
+  conversation_id: string,
+  message_id: string,
+  url: string, // matches the file's "(url) [file: name, size]" line in the message's content
+  name: string,
+  kind: 'text' | 'pdf',
+  content: string | Buffer, // the text (cut short if it's too long), or the PDF itself
+  words?: number, // the text's whole length in words, so the model can be told if it was cut short
 }
 interface MemoryTable {
   name: string,
@@ -206,5 +220,5 @@ interface McpServerTable {
 export {
   ServerTable, // ChannelTable, MessageTable, /* Core structures */
   AutomaticResponseTable, ResponseMessageTable, ReminderTable, HeartbeatTable, McpServerTable, CounterTable, HeartBoardTable, HeartBoardEmojiTable, HeartBoardMessageTable, VoicePingTable, VoicePingInputTable, /* Features */
-  ChatbotTable, SavedAnonymizedChat, ChatbotSubscriberTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable, /* AI-related structures */
+  ChatbotTable, ChatbotPromptTable, SavedAnonymizedChat, ChatbotSubscriberTable, MemoryTable, ConversationTable, ConversationMessageTable, ConversationFileTable, ConversationSummaryTable, ConversationToolResultTable, ToolResultDiscard, IndexUserTable, IndexMessageTable, IndexChannelTable, IndexRoleTable, /* AI-related structures */
 };

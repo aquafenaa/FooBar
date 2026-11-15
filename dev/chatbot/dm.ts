@@ -11,6 +11,7 @@ import { ChatbotTable } from '../types/schema';
 import { safeFetch } from '../utils';
 import { MAIN_SOURCE } from './context';
 import { SOURCE_SEPARATOR } from './conversation';
+import { createDefaultPrompts } from './prompts';
 
 const DM_USERS = (process.env.DM_USERS ?? '').split(',').map((id) => id.trim()).filter(Boolean);
 
@@ -59,7 +60,8 @@ function ensureDMServer(userID: Snowflake): ChatbotTable {
   const existing = getChatbot(userID);
   if (existing) return existing;
 
-  upsertChatbot({ server_id: userID, chatbot_enabled: true, tools_enabled: true, detached: false, chatbot_prompt: '' });
+  upsertChatbot({ server_id: userID, chatbot_enabled: true, tools_enabled: true, detached: false });
+  createDefaultPrompts(userID);
   return getChatbot(userID)!;
 }
 

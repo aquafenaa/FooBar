@@ -1,4 +1,4 @@
-import { BaseMessageOptions, Channel, ChannelType, Client, EmbedBuilder, Events, GuildMember, Message, MessageFlags, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, RESTJSONErrorCodes, User } from 'discord.js';
+import { BaseMessageOptions, Channel, ChannelType, Client, EmbedBuilder, Events, GuildMember, Message, MessageFlags, MessageReaction, PartialMessage, PartialMessageReaction, PartialUser, User } from 'discord.js';
 import cron from 'node-cron';
 
 import { commandMap, dmCommandMap } from './commands';
@@ -121,17 +121,8 @@ async function handleDirectMessage(message: Message): Promise<void> {
   const { author, channel } = message;
   if (channel.type !== ChannelType.DM) return;
 
-  // the bot's own messages to its owner get a 🗑️, which they can react with to delete it. not the status message, which goes away by itself
-  if (author.id === message.client.user.id) {
-    if (message.content === THINKING_STATUS) return;
-    const recipient = await dmRecipient(channel);
-    if (recipient && isDMUser(recipient)) {
-      await message.react('🗑️').catch((error) => {
-        if (error?.code !== RESTJSONErrorCodes.UnknownMessage) console.error('Couldn\'t add 🗑️ to a DM message:', error); // already deleted, e.g. a status message, so there's nothing to react to
-      });
-    }
-    return;
-  }
+  // the bot's own messages. its replies have a 🗑️ button to delete them (replies.ts), and reacting 🗑️ deletes any of them (handleDMReaction)
+  if (author.id === message.client.user.id) return;
   if (author.bot || !isDMUser(author.id)) return; // anyone else's DMs are ignored
 
   // its server id is its owner's user id

@@ -39,7 +39,7 @@ async function readImage(response: Response): Promise<Buffer> {
 
 /**
  * Every image in a message: attachments, plus images in embeds (e.g. a link preview, or a gif from tenor).
- * fetch is where it's downloaded from, and shown is the url the model sees, which it can give to caption_image
+ * fetch is where it's downloaded from, and shown is the url the model sees, which it can give to view_image
  */
 function getImages(message: Message): { fetch: string, shown: string, size?: number }[] {
   // signed urls, which expire after about a day. by then the message has usually left the conversation anyway

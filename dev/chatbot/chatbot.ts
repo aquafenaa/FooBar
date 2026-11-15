@@ -1,12 +1,9 @@
-import path from 'node:path';
 import { ChannelType, Guild, GuildChannel, Message, MessageMentionOptions, SendableChannels, Snowflake, User } from 'discord.js';
 import cron from 'node-cron';
 import { z as zod } from 'zod';
 import { OpenResponsesResult, ResponsesRequest } from '@openrouter/sdk/models';
 
-import { existsSync, readFileSync } from 'fs';
-
-import { getChatbot, getConversationByChannel, getConversationMessages, getConversationTokenCount, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, getSubscribersAmong, insertConversationMessage, insertConversationToolResult, updateConversationMessageContent, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
+import { getChatbot, getConversationByChannel, getConversationFiles, getConversationMessages, getConversationTokenCount, getIndexChannel, getIndexMessage, getIndexRole, getIndexUser, getNextChannelRef, getNextMessageRef, getNextRoleRef, getNextUserRef, getSubscribersAmong, insertConversationMessage, insertConversationFile, insertConversationToolResult, updateConversationMessageContent, insertIndexChannel, insertIndexMessage, insertIndexRole, insertIndexUser, resolveChannelRef, resolveRoleRef, resolveUserRef, upsertConversation } from '../data';
 import { ChatbotTable, ConversationMessageTable, ConversationTable, ConversationToolResultTable, HeartbeatTable } from '../types/schema';
 import { estimateTokens, millisToCronSchedule, safeFetch, splitPoint, trackFence } from '../utils';
 import { discordClient, openRouter } from '..';
@@ -14,14 +11,13 @@ import { PromptToolResult, compactToolResults, endConversation, getRelevantSumma
 import localTools, { LocalTool } from './tools';
 import { getVisibleMemories, isAttached, isShareable } from './context';
 import { AUTO_EFFORT, judgeEffort } from './effort';
-import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, getSupportedEfforts, reasoningFor, supportsImages, supportsTemperature, supportsTools, temperatureFor } from './models';
+import { DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, DEFAULT_TEMPERATURE, getSupportedEfforts, reasoningFor, supportsFiles, supportsImages, supportsTemperature, supportsTools, temperatureFor } from './models';
 import { isSandboxEnabled, readNotes } from './sandbox';
 import { withCaptions, withImagePlaceholders, withImages } from './vision';
+import { FilePart, KeptFile, describeFiles, withFiles } from './files';
 import { isDMServer } from './dm';
 import { McpOffer, callMcpTool, getMcpOffers } from './mcp';
-
-const promptPath = path.join(__dirname, '../../data/SYSTEM.md'); // two levels up: this file is in dev/chatbot/ (src/chatbot/ once built)
-const { DISCORD_ID } = process.env;
+import { buildPromptModules } from './prompts';
 
 const MAX_MESSAGE_LENGTH = 2000;
 const PADDING_LENGTH = 8;
@@ -34,6 +30,7 @@ const DELETED_MEMORY_DURATION = 10 * 60_000; // 10 minutes, far longer than a re
 const MAX_CONVERSATION_TOKENS = 10_000; // ~125 messages, counting tool results as shown. past this, the conversation is summarized and a new one starts
 const MESSAGE_BREAK_GAP = 60 * 60_000; // 1 hour. a longer silence between two messages is marked, so the model knows time has passed
 const MAX_IMAGE_MESSAGES = 8; // a model with vision sees the images in this many of the latest messages. older ones are given by their captions
+const MAX_FILE_MESSAGES = 4; // the files in this many of the latest messages are attached. older ones are only named (see files.ts)
 
 // shown as each channel's type in the index, so the model knows what it can do there (e.g. threads can't hold threads)
 const CHANNEL_TYPE_NAMES: Partial<Record<ChannelType, string>> = {
@@ -85,7 +82,7 @@ function markMessageDeleted(message_id: string): void {
 type ModelInput = Exclude<ResponsesRequest['input'], string | undefined>[number];
 type ModelTool = NonNullable<ResponsesRequest['tools']>[number];
 // a message from formatInput, which has an extra system one for the index
-type ModelMessage = { role: 'user' | 'assistant' | 'system', content: string | ({ type: 'input_text', text: string } | { type: 'input_image', detail: 'auto', imageUrl: string })[] };
+type ModelMessage = { role: 'user' | 'assistant' | 'system', content: string | ({ type: 'input_text', text: string } | { type: 'input_image', detail: 'auto', imageUrl: string } | FilePart)[] };
 
 // converts one of our tools into the shape OpenRouter expects
 function toModelTool(name: string, localTool: LocalTool): ModelTool {
@@ -122,22 +119,6 @@ function parseToolInput(args: string): any {
   }
 }
 
-/**
- * The base system prompt, from SYSTEM.md. Read fresh each time, so edits apply without a restart.
- * SYSTEM.md is gitignored, so a fresh clone won't have one. That's fine, it just means no base prompt
- */
-function getBaseSystemPrompt(): string {
-  if (!existsSync(promptPath)) return '';
-  return readFileSync(promptPath, 'utf-8').replace('<discord-id>', DISCORD_ID ?? 'undefined');
-}
-async function getDefaultSystemPrompt(): Promise<string> {
-  return getBaseSystemPrompt();
-}
-// the server's override if it has one, otherwise SYSTEM.md
-function getSystemPrompt(chatbot: ChatbotTable): string {
-  return chatbot.system_prompt_override || getBaseSystemPrompt();
-}
-
 async function getEmbedding(text: string): Promise<number[]> {
   const embedding = await openRouter.embeddings.generate({
     requestBody: { model: 'openai/text-embedding-3-small', input: text, encodingFormat: 'float' },
@@ -168,14 +149,21 @@ function formatElapsed(millis: number): string {
  * Resolves user, channel, and role mentions.
  * With vision, the latest messages' images are attached, along with the out-of-context reference's
 */
-async function formatInput(guild: Guild | undefined, currentChannel: SendableChannels, conversation: ConversationTable, referenceMessage: ConversationMessageTable | undefined, toolList: PromptToolResult[], convoContext: ConversationMessageTable[], vision: boolean): Promise<ModelMessage[]> {
+async function formatInput(guild: Guild | undefined, currentChannel: SendableChannels, conversation: ConversationTable, referenceMessage: ConversationMessageTable | undefined, toolList: PromptToolResult[], convoContext: ConversationMessageTable[], vision: boolean, filesOf: (messageID: string) => KeptFile[]): Promise<ModelMessage[]> {
   if (!convoContext) return [];
 
   const MENTION_RE = /<(?:@!?(\d{17,20})|#(\d{17,20})|@&(\d{17,20}))>/g; // 3 capture groups for users, channels, & role mentions respectively
   const esc = (s: unknown) => String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 
   // e.g. no permission to read pins in this channel. not worth failing the reply over
-  const pinnedMessages = (await safeFetch(() => currentChannel.messages.fetchPins()))?.items ?? [];
+  const pins = ((await safeFetch(() => currentChannel.messages.fetchPins()))?.items ?? []).map((pin) => pin.message);
+  // in a thread or forum post, the message it started from comes first, moved up rather than listed twice if it's pinned too.
+  // it's in the parent channel for a thread started from a message. null when there isn't one (e.g. a thread started on its own) or it was deleted
+  const starter = currentChannel.isThread() ? await safeFetch(() => currentChannel.fetchStarterMessage()) : undefined;
+  const pinnedMessages = [
+    ...(starter ? [{ message: starter, starter: true }] : []),
+    ...pins.filter((message) => message.id !== starter?.id).map((message) => ({ message, starter: false })),
+  ];
   // the referenced message too, so its author and anyone it mentions are known, even when it's from outside the context
   const allMessages = referenceMessage ? [referenceMessage, ...convoContext] : convoContext;
   const mentionedUserIDs: Snowflake[] = allMessages.map((m) => m.author_id);
@@ -312,7 +300,13 @@ async function formatInput(guild: Guild | undefined, currentChannel: SendableCha
   // the bot's own messages are left out, since an assistant turn can't hold images
   const imageMessages = vision ? [...new Set([...(outOfContextReference ? [stm[0]] : []), ...stm.slice(-MAX_IMAGE_MESSAGES)])]
     .filter((msg) => msg.author_id !== discordClient.user!.id) : [];
-  const withImagesByID = new Map(await Promise.all(imageMessages.map(async (msg) => [msg.message_id, await withImages(msg.message_content)] as const)));
+  // files are attached for every model, in fewer messages, since a text file can be far longer than a caption. they were kept when their message was saved
+  const fileMessages = stm.slice(-MAX_FILE_MESSAGES).filter((msg) => msg.author_id !== discordClient.user!.id);
+  const withImagesByID = new Map(await Promise.all([...new Set([...imageMessages, ...fileMessages])].map(async (msg) => {
+    const images = imageMessages.includes(msg) ? await withImages(msg.message_content) : { text: msg.message_content, images: [] };
+    const files = fileMessages.includes(msg) ? withFiles(images.text, filesOf(msg.message_id)) : { text: images.text, parts: [] };
+    return [msg.message_id, { text: files.text, images: images.images, files: files.parts }] as const;
+  })));
 
   // format the message to include message number, and reference message number
   const modelMessages: ModelMessage[] = stm.flatMap((msg, i): ModelMessage[] => {
@@ -331,11 +325,11 @@ async function formatInput(guild: Guild | undefined, currentChannel: SendableCha
 
     const shown = withImagesByID.get(msg.message_id);
     const text = `${messageShorthand} ${referenceMap.get(msg.reference_id ?? '') !== undefined ? `↪ ${referenceMap.get(msg.reference_id!)} ` : ''}${msg.author_name}: ${shown?.text ?? msg.message_content}${reactions ? ` <reactions>${reactions}</reactions>` : ''}`;
-    if (!shown?.images.length) return [...messageBreak, { role: 'user', content: text }];
+    if (!shown?.images.length && !shown?.files.length) return [...messageBreak, { role: 'user', content: text }];
 
     return [...messageBreak, {
       role: 'user',
-      content: [{ type: 'input_text', text }, ...shown.images.map((imageUrl) => ({ type: 'input_image' as const, detail: 'auto' as const, imageUrl }))],
+      content: [{ type: 'input_text', text }, ...shown.images.map((imageUrl) => ({ type: 'input_image' as const, detail: 'auto' as const, imageUrl })), ...shown.files],
     }];
   });
 
@@ -375,7 +369,7 @@ async function formatInput(guild: Guild | undefined, currentChannel: SendableCha
     ${pinnedMessages.length === 0
     ? ''
     : `<pinned_messages>
-      ${pinnedMessages.map((msg) => `<msg authorID="${msg.message.author.id}">${esc(msg.message.content)}</msg>`).join('\n\t')}
+      ${pinnedMessages.map((msg) => `<msg authorID="${msg.message.author.id}"${msg.starter ? ' starter="true"' : ''}>${esc(msg.starter ? withImagePlaceholders(msg.message) : msg.message.content)}</msg>`).join('\n\t')}
     </pinned_messages>`}
     ${reactionsToBot.length === 0
     ? ''
@@ -524,7 +518,7 @@ const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, desc
   { list: 'other', key: 'web_search', label: 'Web search', description: 'Search the web', tools: ['web_search'] },
   { list: 'other', key: 'fetch_url', label: 'Fetch URLs', description: 'Read web pages and call APIs', tools: ['fetch_url'] },
   { list: 'other', key: 'workspace', label: 'Workspace', description: 'Run commands and write files in its sandbox', tools: ['shell', 'run_command', 'write_file', 'edit_file'] },
-  { list: 'other', key: 'images', label: 'Images', description: 'Caption and look at images from URLs', tools: ['caption_image', 'view_image'] },
+  { list: 'other', key: 'images', label: 'Images & files', description: 'Look at images and read files from URLs', tools: ['view_image', 'view_file'] },
   { list: 'other', key: 'x_search', label: 'X search', description: 'Search posts on X (costs about 5 cents a search)', tools: ['x_search'] },
   { list: 'other', key: 'bluesky', label: 'Bluesky', description: 'Read Bluesky, and post or DM where it\'s logged in', tools: ['bluesky', 'bluesky_act', 'bluesky_dms'] },
   { list: 'other', key: 'metacog', label: 'Metacog', description: 'Shift its own mindset, or structure its reasoning', tools: ['metacog'] },
@@ -556,8 +550,8 @@ function isDirtyCall(name: string, input: any): boolean {
     case 'list_counters':
     case 'list_heartbeats':
     case 'search_summaries':
-    case 'caption_image':
     case 'view_image':
+    case 'view_file': // it can save to the workspace, but only a download, which doing again is harmless
     case 'metacog':
     case 'x_search':
     case 'bluesky':
@@ -622,8 +616,8 @@ function describeToolCall(name: string, input: any): [string, string] {
       if (input.action === 'read') return ['read Bluesky DMs with', clip(input.with)];
       return ['checked Bluesky DMs', ''];
     case 'fetch_url': return ['fetched', host(input.url)];
-    case 'caption_image':
     case 'view_image': return ['looked at images', ''];
+    case 'view_file': return ['read a file from', host(input.url)];
     // a verb of its own for each mode, so two in one reply aren't run together. a call missing its fields failed, so it's just the verb
     case 'metacog': {
       const list = (items: unknown) => (Array.isArray(items) ? items.map((item) => quote(item)).filter(Boolean).join(' / ') : '');
@@ -720,6 +714,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   // a DM with the bot's owner is a server of its own, with no guild behind it. it gets full control over every server instead
   const isDM = isDMServer(serverID);
   const guild = isDM ? undefined : await discordClient.guilds.fetch(serverID);
+  // the workspace is shared like the main memories, so detached servers don't get it. a DM always does, even when private, since it has full control
+  const useSandbox = isSandboxEnabled() && (isAttached(serverID) || isDM);
 
   let conversation = heartbeat ? undefined : getConversationByChannel(channel.id);
   if (heartbeat) {
@@ -763,10 +759,17 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   // with vision, the model is shown the images themselves, so their captions are made alongside the reply, and saved once they're done.
   // the bot's own messages are captioned first as usual, since an assistant turn can't hold images
   const pendingCaptions = new Map<string, Promise<string>>();
+  // other files get a line each too, after the images. the readable ones are kept here until their message is saved, and saved with it.
+  // the big or unreadable ones are saved to the sandbox now, so this only runs once per message
+  const pendingFiles = new Map<string, KeptFile[]>();
   const describe = async (message: Message): Promise<string> => {
-    if (!vision || message.author.id === discordClient.user?.id) return withCaptions(message);
-    pendingCaptions.set(message.id, withCaptions(message));
-    return withImagePlaceholders(message);
+    const isBot = message.author.id === discordClient.user?.id;
+    const { lines: fileLines, files } = isBot ? { lines: [], files: [] } : await describeFiles(message, useSandbox);
+    if (files.length > 0) pendingFiles.set(message.id, files);
+    const withFileLines = (text: string) => [text, ...fileLines].filter(Boolean).join('\n');
+    if (!vision || isBot) return withFileLines(await withCaptions(message));
+    pendingCaptions.set(message.id, withCaptions(message).then(withFileLines));
+    return withFileLines(withImagePlaceholders(message));
   };
   // filtered before captioning, so messages already saved (with their captions) aren't captioned again
   const uniqueContext: ConversationMessageTable[] = await Promise.all(recentMessages.filter((txt) => !conversationContext.find((convoTxt) => convoTxt.message_id === txt.id))
@@ -851,13 +854,12 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
 
   // the latest results in full, and older ones by their digest, so a long conversation's prompt doesn't keep growing. the full results are still kept for the summary
   const toolContext = splitToolResults(getVisibleToolResults(conversation.conversation_id));
-  const agentInput = await formatInput(guild, channel, conversation, referenceMessage, toolContext, conversationContext, vision);
+  const filesOf = (messageID: string) => pendingFiles.get(messageID) ?? getConversationFiles(conversation.conversation_id, messageID);
+  const agentInput = await formatInput(guild, channel, conversation, referenceMessage, toolContext, conversationContext, vision, filesOf);
   const indexMsg = agentInput.shift()!;
   // dated, so the model can tell how long ago it was
   const summaryStr = relevantSummaries.map((summary) => `<summary date="${new Date(summary.timestamp).toLocaleDateString('en-US', { dateStyle: 'medium' })}">${summary.summary}</summary>`).join('\n');
   const memories = getVisibleMemories(serverID);
-  // the workspace is shared like the main memories, so detached servers don't get it. a DM always does, even when private, since it has full control
-  const useSandbox = isSandboxEnabled() && (isAttached(serverID) || isDM);
   const workspaceNotes = useSandbox ? await readNotes() : '';
   // given to every tool by the bot, never by the model
   const replyContext = {
@@ -870,15 +872,11 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     shareable: !heartbeat && (isDM ? isAttached(serverID) : isShareable(serverID, conversationContext.filter((msg) => msg.role === 'user').map((msg) => msg.author_id))),
     reference_message_id: messageReference?.id, // the message the user is replying to, shown to the model as [$0]
     dm: isDM || undefined, // full control: channel and server tools can reach any server the bot is in
+    vision, // view_image shows the image itself, or a caption of it for a model without vision
   };
 
-  // SYSTEM.md (or the server's override), with the server's persona layered on top
-  const systemPrompt = `<system>
-      ${getSystemPrompt(chatbot)}
-    </system>
-    ${chatbot.chatbot_prompt ? `<persona>
-      ${chatbot.chatbot_prompt}
-    </persona>` : ''}
+  // the server's prompt modules in order, by default `system` (SYSTEM.md, unless it's been set) and `persona`
+  const systemPrompt = `${buildPromptModules(serverID)}
     <relevant_summaries>
       ${summaryStr}
     </relevant_summaries>
@@ -944,8 +942,9 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toModelTool('remove_memory', localTools.removeMemory),
     toModelTool('search_summaries', localTools.searchSummaries),
     toModelTool('fetch_url', localTools.fetchURL),
-    toModelTool('caption_image', localTools.captionImage),
-    ...(vision ? [toModelTool('view_image', localTools.viewImage)] : []),
+    // the same tool either way, but a model without vision is told it gets a description of the image, and can ask about it
+    toModelTool('view_image', vision ? localTools.viewImage : localTools.viewImageCaptioned),
+    toModelTool('view_file', localTools.viewFile),
     toModelTool('list_counters', localTools.listCounters),
     toModelTool('counter', localTools.counter),
     toModelTool('metacog', localTools.metacog),
@@ -1004,8 +1003,8 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     search_summaries: localTools.searchSummaries,
 
     fetch_url: localTools.fetchURL,
-    caption_image: localTools.captionImage,
-    view_image: localTools.viewImage,
+    view_image: localTools.viewImage, // captions instead when the model has no vision, by replyContext.vision
+    view_file: localTools.viewFile,
     list_counters: localTools.listCounters,
     counter: localTools.counter,
     metacog: localTools.metacog,
@@ -1081,6 +1080,9 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         reasoning: reasoningFor(model, reasoningEffort),
         input: messages,
         tools,
+        // a PDF for a model that can't read one is turned into text with the free engine. otherwise openrouter falls back to paid OCR.
+        // it only reads PDFs with a text layer, so a scanned one comes back empty
+        ...(supportsFiles(model) ? {} : { plugins: [{ id: 'file-parser' as const, pdf: { engine: 'cloudflare-ai' as const } }] }),
         // after Stop, it has to answer rather than call another tool
         ...(finishing && tools ? { toolChoice: 'none' as const } : {}),
         stream: true,
@@ -1201,9 +1203,10 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
           mcpTools = await loadMcpTools();
           tools = withMcpTools(mcpTools);
         }
-        // view_image's image is given to the model as an image, and left out of what's saved, since it's huge
+        // view_image's image and view_file's PDF are given to the model as they are, and left out of what's saved, since they're huge
         const image: string | undefined = typeof output === 'object' ? output?.image : undefined;
-        const outputStr = typeof output === 'string' ? output : JSON.stringify(image ? { ...output, image: undefined } : output);
+        const file: FilePart | undefined = typeof output === 'object' ? output?.file : undefined;
+        const outputStr = typeof output === 'string' ? output : JSON.stringify(image || file ? { ...output, image: undefined, file: undefined } : output);
 
         saveToolResult({
           conversation_id: conversation.conversation_id,
@@ -1216,7 +1219,9 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
         return {
           type: 'function_call_output',
           callId: toolUse.callId,
-          output: image ? [{ type: 'input_text', text: outputStr }, { type: 'input_image', detail: 'auto', imageUrl: image }] : outputStr,
+          output: image || file
+            ? [{ type: 'input_text', text: outputStr }, ...(image ? [{ type: 'input_image' as const, detail: 'auto' as const, imageUrl: image }] : []), ...(file ? [file] : [])]
+            : outputStr,
         };
       })();
       run.catch((error) => console.error(error)); // a tool given up on can still fail later, with nothing waiting on it
@@ -1231,7 +1236,11 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   abort?.throwIfAborted();
 
   // skip any message deleted while the reply was generating, since its delete event found nothing to delete yet
-  conversationContext.filter((ctx) => !recentlyDeleted.has(ctx.message_id)).forEach((ctx) => insertConversationMessage(ctx));
+  // each message's files right after it, since they need it saved first
+  conversationContext.filter((ctx) => !recentlyDeleted.has(ctx.message_id)).forEach((ctx) => {
+    insertConversationMessage(ctx);
+    pendingFiles.get(ctx.message_id)?.forEach((file) => insertConversationFile({ ...file, conversation_id: ctx.conversation_id, message_id: ctx.message_id }));
+  });
   // filled in once they're done, rather than holding up the reply. a message deleted by then isn't saved, so nothing is updated
   pendingCaptions.forEach((caption, message_id) => caption.then((content) => updateConversationMessageContent(message_id, content, estimateTokens(content))));
 
@@ -1255,4 +1264,4 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
   return { conversation_id: conversation.conversation_id, chunks };
 }
 
-export { ReplyControl, TOOL_GROUPS, THINKING_STATUS, TYPING_STATUS, STOPPED_STATUS, setWriting, getBaseSystemPrompt, getDefaultSystemPrompt, getSystemPrompt, getEmbedding, formatReactions, formatResponse, resolveRefs, chatbotMentions, generateReply, isAllowedServer, markMessageDeleted };
+export { ReplyControl, TOOL_GROUPS, THINKING_STATUS, TYPING_STATUS, STOPPED_STATUS, setWriting, getEmbedding, formatReactions, formatResponse, resolveRefs, chatbotMentions, generateReply, isAllowedServer, markMessageDeleted };

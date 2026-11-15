@@ -27,10 +27,12 @@ import { addChatbotSubscriber, addReminder, deleteAllHeartBoardEmojis, deleteAll
   getVoicePingInputs, getVoicePingsByServer, insertAutomaticResponse, insertHeartBoard, insertHeartBoardEmoji,
   insertVoicePing, insertVoicePingInput, isChatbotSubscriber, getChatbotSubscriber, setChatbotSubscriberCrossServer, removeChatbotSubscriber, updateAutomaticResponse,
   updateHeartBoard, updateReminder, updateVoicePing, upsertChatbot, upsertConversationSummary,
-  getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getMcpServer, getMcpServersByServer } from './data';
+  getHeartbeat, getHeartbeatsByServer, insertHeartbeat, updateHeartbeat, getMcpServer, getMcpServersByServer,
+  getPrompt, getPrompts, upsertPrompt, deletePrompt } from './data';
 import { AutomaticResponseTable, ChatbotTable, ConversationSummaryTable, ReminderTable, HeartbeatTable, HeartBoardTable, McpServerTable, VoicePingTable } from './types/schema';
 import { removeHeartbeat, scheduleHeartbeat, triggerHeartbeat } from './chatbot/heartbeat';
-import { TOOL_GROUPS, getEmbedding, getSystemPrompt } from './chatbot/chatbot';
+import { TOOL_GROUPS, getEmbedding } from './chatbot/chatbot';
+import { DEFAULT_PROMPT_NAMES, MAX_PROMPTS, SYSTEM_PROMPT_NAME, createDefaultPrompts, getBaseSystemPrompt, invalidPromptName, promptContent, resetPrompt } from './chatbot/prompts';
 import { SOURCE_SEPARATOR, endConversation, fromSummarySource } from './chatbot/conversation';
 import { MAIN_SOURCE, findMemory, getVisibleMemories, isAttached } from './chatbot/context';
 import { fetchServerChannel, isDMServer } from './chatbot/dm';
@@ -429,49 +431,73 @@ async function setTools(interaction: ChatInputCommandInteraction, serverID: Snow
   interaction.reply({ content: `Tools ${enabledOption ? 'enabled' : 'disabled'}!`, flags: MessageFlags.Ephemeral });
 }
 
+// the server's prompt modules in order, for the settings embed, e.g. "system (SYSTEM.md) → persona (empty)"
+function promptSummary(serverID: Snowflake): string {
+  const prompts = getPrompts(serverID);
+  if (prompts.length === 0) return 'None';
+  return prompts.map((prompt) => {
+    if (prompt.content) return prompt.prompt_name;
+    return `${prompt.prompt_name} (${prompt.prompt_name === SYSTEM_PROMPT_NAME ? 'SYSTEM.md' : 'empty'})`;
+  }).join(' → ').substring(0, 1024);
+}
+
+// a hint for what goes in a module, for the ones every chatbot starts with
+function promptDescription(name: string): string {
+  if (name === SYSTEM_PROMPT_NAME) return 'The base instructions. /chatbot prompt reset goes back to SYSTEM.md';
+  if (name === 'persona') return 'Who the chatbot is here. /chatbot prompt reset clears it';
+  return `Added to the prompt as <${name}>. /chatbot prompt reset clears it`;
+}
+
 /**
- * Sets the persona (layered on top of the system prompt), or the system prompt override (replacing SYSTEM.md), in a modal.
- * The override starts from the current system prompt, so it can be tweaked rather than written from scratch
+ * Writes a prompt module in a modal, either a new one, or an existing one starting from what it says now.
+ * An empty `system` module starts from SYSTEM.md, so it can be tweaked rather than written from scratch
  */
-async function setPrompt(interaction: ChatInputCommandInteraction, serverID: Snowflake, kind: 'persona' | 'system-prompt'): Promise<void> {
-  const chatbot = getChatbot(serverID);
-  if (!chatbot) {
-    interaction.reply({ content: NO_CHATBOT_MESSAGE, flags: MessageFlags.Ephemeral });
+async function editPrompt(interaction: ChatInputCommandInteraction, serverID: Snowflake, creating: boolean): Promise<void> {
+  const name = interaction.options.getString('name', true).trim().toLowerCase();
+  const existing = getPrompt(serverID, name);
+
+  if (creating) {
+    const invalid = invalidPromptName(name);
+    if (invalid) {
+      interaction.reply({ content: invalid, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (existing) {
+      interaction.reply({ content: `There's already a prompt called "${name}"! Try /chatbot prompt set to change it.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (getPrompts(serverID).length >= MAX_PROMPTS) {
+      interaction.reply({ content: `This server already has ${MAX_PROMPTS} prompts, the most it can have! Try deleting one first.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+  } else if (!existing) {
+    interaction.reply({ content: `There's no prompt called "${name}"! Try /chatbot prompt create to make it.`, flags: MessageFlags.Ephemeral });
     return;
   }
 
-  const isPersona = kind === 'persona';
-  const promptName = isPersona ? 'persona' : 'system prompt override';
-  const promptModal = new ModalBuilder().setTitle(isPersona ? 'Set Persona' : 'Override System Prompt');
-
-  const currentPrompt = isPersona ? chatbot.chatbot_prompt : getSystemPrompt(chatbot);
-  const note = overflowNote(currentPrompt, isPersona ? 'persona' : 'system prompt');
+  const promptModal = new ModalBuilder().setTitle(`${creating ? 'Create' : 'Set'} Prompt: ${name}`.substring(0, 45));
+  const currentPrompt = existing ? promptContent(existing) : '';
+  const note = overflowNote(currentPrompt, 'prompt');
   if (note) promptModal.addTextDisplayComponents(note);
-  promptModal.addLabelComponents(isPersona
-    ? textField('prompt', 'Persona', {
-      paragraph: true,
-      value: currentPrompt,
-      required: false,
-      placeholder: 'e.g. You\'re a laid-back pirate who loves puns, and calls everyone "matey".',
-      description: 'Who the chatbot is here, added on top of the system prompt. Empty for none',
-    })
-    : textField('prompt', 'System prompt', {
-      paragraph: true,
-      value: currentPrompt,
-      required: false,
-      description: 'Replaces SYSTEM.md here. Empty to go back to SYSTEM.md',
-    }));
+  promptModal.addLabelComponents(textField('prompt', 'Prompt', {
+    paragraph: true,
+    value: currentPrompt,
+    required: false,
+    placeholder: name === 'persona' ? 'e.g. You\'re a laid-back pirate who loves puns, and calls everyone "matey".' : undefined,
+    description: promptDescription(name),
+  }));
 
   const submit = await askModal(interaction, promptModal);
   if (!submit) return;
 
-  const newPrompt = submit.fields.getTextInputValue('prompt').trim();
-  if (isPersona) chatbot.chatbot_prompt = newPrompt;
-  else chatbot.system_prompt_override = newPrompt || undefined;
-  upsertChatbot(chatbot);
+  // saving SYSTEM.md unchanged keeps it empty, so later edits to the file still apply
+  let newPrompt = submit.fields.getTextInputValue('prompt').trim();
+  if (name === SYSTEM_PROMPT_NAME && newPrompt === getBaseSystemPrompt().trim()) newPrompt = '';
+  upsertPrompt({ server_id: serverID, prompt_name: name, content: newPrompt });
 
-  const result = newPrompt ? `updated ${promptName}` : `cleared ${promptName}${isPersona ? '' : ', so SYSTEM.md is used again'}`;
-  submit.reply({ content: `Successfully ${result}!`, flags: MessageFlags.Ephemeral });
+  const result = creating ? `created "${name}"` : `updated "${name}"`;
+  const fallback = name === SYSTEM_PROMPT_NAME && !newPrompt ? ', which uses SYSTEM.md while it\'s empty' : '';
+  submit.reply({ content: `Successfully ${result}${fallback}!`, flags: MessageFlags.Ephemeral });
 }
 
 // models matching what's typed, by id or name. ids starting with it come first, e.g. "anthropic/" lists anthropic's models
@@ -530,18 +556,32 @@ const ChatbotCommand: ConfigCommand = {
       .setDescription('Whether the bot keeps its own memories, instead of sharing them with other servers')
       .addBooleanOption((detachOption) => detachOption.setName('enable').setDescription('True = Separate from other servers, False = Joins the hivemind')
         .setRequired(true)))
-    .addSubcommandGroup((personaSubcommandGroup) => personaSubcommandGroup.setName('persona')
-      .setDescription('Set or delete the persona for the chatbot, which is added on top of the system prompt.')
-      .addSubcommand((setPersonaSubcommand) => setPersonaSubcommand.setName('set')
-        .setDescription('Set the persona.'))
-      .addSubcommand((deletePersonaSubcommand) => deletePersonaSubcommand.setName('delete')
-        .setDescription('Delete the persona.')))
-    .addSubcommandGroup((systemPromptSubcommandGroup) => systemPromptSubcommandGroup.setName('system-prompt')
-      .setDescription('Override the base system prompt for this server.')
-      .addSubcommand((setSystemPromptSubcommand) => setSystemPromptSubcommand.setName('set')
-        .setDescription('Set the system prompt override.'))
-      .addSubcommand((deleteSystemPromptSubcommand) => deleteSystemPromptSubcommand.setName('delete')
-        .setDescription('Delete the override, going back to the base system prompt.')))
+    .addSubcommandGroup((promptSubcommandGroup) => promptSubcommandGroup.setName('prompt')
+      .setDescription('The chatbot\'s prompt modules, like "system" and "persona", added to its prompt in order.')
+      .addSubcommand((createPromptSubcommand) => createPromptSubcommand.setName('create')
+        .setDescription('Create a new prompt module, added after the others.')
+        .addStringOption((nameOption) => nameOption.setName('name')
+          .setDescription('Lowercase letters, numbers, and hyphens, e.g. "style-guide"')
+          .setRequired(true)
+          .setMaxLength(32)))
+      .addSubcommand((setPromptSubcommand) => setPromptSubcommand.setName('set')
+        .setDescription('Change what a prompt module says.')
+        .addStringOption((nameOption) => nameOption.setName('name')
+          .setDescription('The prompt to change.')
+          .setRequired(true)
+          .setAutocomplete(true)))
+      .addSubcommand((resetPromptSubcommand) => resetPromptSubcommand.setName('reset')
+        .setDescription('Empty a prompt module. "system" goes back to SYSTEM.md, and a deleted default comes back.')
+        .addStringOption((nameOption) => nameOption.setName('name')
+          .setDescription('The prompt to reset.')
+          .setRequired(true)
+          .setAutocomplete(true)))
+      .addSubcommand((deletePromptSubcommand) => deletePromptSubcommand.setName('delete')
+        .setDescription('Delete a prompt module.')
+        .addStringOption((nameOption) => nameOption.setName('name')
+          .setDescription('The prompt to delete.')
+          .setRequired(true)
+          .setAutocomplete(true))))
     .addSubcommand((clearMemoryCommand) => clearMemoryCommand.setName('clear-memory').setDescription('Clears this server\'s conversations and summaries. Memories are kept'))
     .addSubcommandGroup((summariesGroup) => summariesGroup.setName('summaries')
       .setDescription('View, edit, and delete the conversation summaries for the chatbot.')
@@ -796,27 +836,39 @@ const ChatbotCommand: ConfigCommand = {
         return;
       }
     }
-    // the persona is layered on top of the system prompt. the system prompt is SYSTEM.md, unless this server overrides it
-    if (subcommandGroup === 'persona' || subcommandGroup === 'system-prompt') {
-      const chatbot = getChatbot(serverID);
-      if (!chatbot) {
-        interaction.reply({ content: 'There is no chatbot! Try making one first with /chatbot create', flags: MessageFlags.Ephemeral });
+    // prompt modules go into the prompt in order. every chatbot starts with `system` (SYSTEM.md while it's empty) and `persona`
+    if (subcommandGroup === 'prompt') {
+      if (!getChatbot(serverID)) {
+        interaction.reply({ content: NO_CHATBOT_MESSAGE, flags: MessageFlags.Ephemeral });
         return;
       }
 
-      const isPersona = subcommandGroup === 'persona';
-      const promptName = isPersona ? 'persona' : 'system prompt override';
+      if (subcommand === 'create' || subcommand === 'set') {
+        await editPrompt(interaction, serverID, subcommand === 'create');
+        return;
+      }
+      if (subcommand === 'reset') {
+        const name = interaction.options.getString('name', true).trim().toLowerCase();
+        const result = resetPrompt(serverID, name);
+        if (result === 'missing') {
+          interaction.reply({ content: `There's no prompt called "${name}"!`, flags: MessageFlags.Ephemeral });
+          return;
+        }
 
-      if (subcommand === 'set') {
-        await setPrompt(interaction, serverID, isPersona ? 'persona' : 'system-prompt');
+        const effect = name === SYSTEM_PROMPT_NAME ? 'so it uses SYSTEM.md again' : 'so it\'s left out until it\'s set';
+        interaction.reply({ content: `${result === 'restored' ? 'Brought back' : 'Reset'} "${name}", ${effect}!`, flags: MessageFlags.Ephemeral });
         return;
       }
       if (subcommand === 'delete') {
-        if (isPersona) chatbot.chatbot_prompt = '';
-        else chatbot.system_prompt_override = undefined;
-        upsertChatbot(chatbot);
+        const name = interaction.options.getString('name', true).trim().toLowerCase();
+        if (!getPrompt(serverID, name)) {
+          interaction.reply({ content: `There's no prompt called "${name}"!`, flags: MessageFlags.Ephemeral });
+          return;
+        }
 
-        interaction.reply({ content: `Successfully deleted ${promptName}!`, flags: MessageFlags.Ephemeral });
+        deletePrompt(serverID, name);
+        const note = name === SYSTEM_PROMPT_NAME ? ' SYSTEM.md won\'t be used until it\'s brought back with /chatbot prompt reset name:system.' : '';
+        interaction.reply({ content: `Successfully deleted "${name}"!${note}`, flags: MessageFlags.Ephemeral });
         return;
       }
     }
@@ -905,8 +957,8 @@ const ChatbotCommand: ConfigCommand = {
         chatbot_enabled: false,
         tools_enabled: false,
         detached: false,
-        chatbot_prompt: '', // SYSTEM.md is used as the base, so a persona is optional
       });
+      createDefaultPrompts(serverID);
 
       interaction.reply({ content: 'Successfully created chatbot!', flags: MessageFlags.Ephemeral });
       return;
@@ -936,8 +988,7 @@ const ChatbotCommand: ConfigCommand = {
         { name: 'Tools Enabled', value: (chatbot?.tools_enabled ? 'Yes' : 'No') },
         { name: 'Tools Turned Off', value: disabledToolLabels(serverID, chatbot).join(', ') || 'None' },
         { name: 'Context', value: (chatbot?.detached ? 'Detached (this server only)' : 'Shared with other servers (for opted-in users)') },
-        { name: 'System Prompt', value: (chatbot?.system_prompt_override ? 'Overridden for this server' : 'Default (SYSTEM.md)') },
-        { name: 'Persona', value: (chatbot?.chatbot_prompt ? 'Set' : 'None') },
+        { name: 'Prompts', value: promptSummary(serverID) },
         { name: 'Model', value: chatbot?.model ?? `${DEFAULT_MODEL} (default)` },
         { name: 'Reasoning Effort', value: chatbot?.reasoning_effort ?? `${DEFAULT_REASONING_EFFORT} (default)` },
         { name: 'Temperature', value: String(chatbot?.temperature ?? `${DEFAULT_TEMPERATURE} (default)`) },
@@ -952,6 +1003,17 @@ const ChatbotCommand: ConfigCommand = {
     }
     if (interaction.options.getSubcommand() === 'reasoning-effort') {
       await effortChoices(interaction, serverID);
+      return;
+    }
+
+    if (interaction.options.getSubcommandGroup() === 'prompt') {
+      // reset can also bring back a deleted default, so those are offered too
+      const names = getPrompts(serverID).map((prompt) => prompt.prompt_name);
+      const deletedDefaults = interaction.options.getSubcommand() === 'reset' ? DEFAULT_PROMPT_NAMES.filter((name) => !names.includes(name)) : [];
+      await interaction.respond([...names, ...deletedDefaults]
+        .filter((name) => name.includes(focusedValue))
+        .slice(0, 25)
+        .map((name) => ({ name: deletedDefaults.includes(name) ? `${name} (deleted, bring back)` : name, value: name })));
       return;
     }
 

@@ -1,8 +1,9 @@
 // the chatbot's replies to messages: sending them, and the buttons under them to retry the reply (🔄) or switch between its versions (◀️ ▶️).
 // only a channel's latest reply has buttons. once another replaces it, it keeps whichever version was on screen.
 // versions are kept in memory, so the buttons on replies from before a restart stop working.
-// while a reply is being written, its status message has Stop (no more tools, answer now) and Cancel (throw it all away) buttons, and so does a retry
-import { ActionRowBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, Message, MessageFlags, PermissionFlagsBits, SendableChannels, Snowflake } from 'discord.js';
+// while a reply is being written, its status message has Stop (no more tools, answer now) and Cancel (throw it all away) buttons, and so does a retry.
+// in a DM, there's a 🗑️ button on the far right too, which deletes the reply
+import { ActionRowBuilder, ButtonBuilder, ButtonInteraction, ButtonStyle, ChannelType, Message, MessageFlags, PermissionFlagsBits, SendableChannels, Snowflake } from 'discord.js';
 
 import { setToolResultsDiscarded, updateConversationMessageContent } from '../data';
 import { ToolResultDiscard } from '../types/schema';
@@ -201,6 +202,11 @@ function buttonRows(state: ReplyState): ActionRowBuilder<ButtonBuilder>[] {
   } else {
     row.addComponents(page, retryButton);
   }
+  // in a DM, the reply can be deleted, on the far right. reacting 🗑️ still works too, for once the buttons are gone
+  if (state.channel.type === ChannelType.DM) {
+    row.addComponents(new ButtonBuilder().setCustomId('reply:delete').setEmoji('🗑️').setStyle(ButtonStyle.Danger)
+      .setDisabled(state.busy));
+  }
   return [row];
 }
 
@@ -392,6 +398,13 @@ async function interruptRetry(state: ReplyState, interaction: ButtonInteraction,
 
 async function handleReplyButton(interaction: ButtonInteraction): Promise<void> {
   const state = replies.get(interaction.message.id);
+  // 🗑️ still works after a restart, since it needs nothing from memory. only ever in a DM, which only its owner is in
+  if (!state && interaction.customId === 'reply:delete' && interaction.channel?.type === ChannelType.DM) {
+    await interaction.deferUpdate();
+    const { channel } = interaction;
+    await Promise.all(forgetReply(interaction.message.id).map((id) => channel.messages.delete(id).catch((error) => console.error(`Couldn't delete DM message ${id}:`, error))));
+    return;
+  }
   if (!state) {
     await interaction.update({ components: [] });
     // a newer reply replaced it (and the buttons were already removed), or the bot restarted
@@ -427,6 +440,13 @@ async function handleReplyButton(interaction: ButtonInteraction): Promise<void> 
     return;
   }
 
+  if (action === 'delete') {
+    // like reacting 🗑️: the whole reply goes, and the delete event takes it out of the conversation too
+    await interaction.deferUpdate();
+    const { channel } = state;
+    await Promise.all(forgetReply(interaction.message.id).map((id) => channel.messages.delete(id).catch((error) => console.error(`Couldn't delete DM message ${id}:`, error))));
+    return;
+  }
   if (action === 'prev' || action === 'next') {
     state.current = Math.min(Math.max(state.current + (action === 'next' ? 1 : -1), 0), state.versions.length - 1);
     await interaction.deferUpdate();
