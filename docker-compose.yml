@@ -6,6 +6,8 @@ services:
     restart: unless-stopped
     volumes:
       - workspace:/workspace
+    environment:
+      GH_TOKEN: ${GH_TOKEN:-}
     tmpfs:
       - /tmp:size=256m
     # the bot is root in here, with only the capabilities apt and dpkg need to install packages.
