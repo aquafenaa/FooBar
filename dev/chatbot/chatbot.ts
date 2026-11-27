@@ -561,7 +561,7 @@ ${heartbeat.silent
  * Each MCP server is a checkbox of its own too, in a third list under these, keyed by mcpGroupKey in mcp.ts
  */
 const TOOL_GROUPS: { list: 'discord' | 'other', key: string, label: string, description: string, tools: string[] }[] = [
-  { list: 'discord', key: 'channels', label: 'Channels & messages', description: 'Read and search channels, send messages and embeds, create threads', tools: ['fetch_channel', 'search_channel', 'fetch_embed', 'send_message', 'create_embed', 'create_thread'] },
+  { list: 'discord', key: 'channels', label: 'Channels & messages', description: 'Read and search channels, send and delete its own messages, send embeds, create threads', tools: ['fetch_channel', 'search_channel', 'fetch_embed', 'send_message', 'delete_message', 'create_embed', 'create_thread'] },
   { list: 'discord', key: 'users', label: 'Users', description: 'Look up members and roles of the server', tools: ['search_users', 'list_users', 'view_user', 'view_role'] },
   { list: 'discord', key: 'roles', label: 'Roles', description: 'Create, edit, give, remove, and delete roles, for people who could themselves', tools: ['edit_role', 'manage_role', 'delete_role'] },
   { list: 'discord', key: 'reactions', label: 'Reactions & nickname', description: 'React to messages, change its own nickname', tools: ['react_to_message', 'change_nickname'] },
@@ -607,6 +607,7 @@ function getLocalTools(): Record<string, LocalTool> {
     manage_role: localTools.manageRole,
     delete_role: localTools.deleteRole,
     send_message: localTools.sendMessage,
+    delete_message: localTools.deleteMessage,
     create_embed: localTools.createEmbed,
     create_thread: localTools.createThread,
 
@@ -761,6 +762,7 @@ function describeToolCall(name: string, input: any): [string, string] {
     case 'fetch_channel': return ['read', clip(input.channel) || 'this channel'];
     case 'search_channel': return [`searched ${clip(input.channel) || 'this channel'} for`, quote(input.query ?? input.author)];
     case 'send_message': return ['sent a message in', clip(input.channel) || 'this channel'];
+    case 'delete_message': return ['deleted its message', clip(input.message_id)];
     case 'create_embed': return ['sent an embed in', clip(input.channel) || 'this channel'];
     case 'create_thread': return ['created thread', quote(input.name)];
     case 'react_to_message': return ['reacted', clip(input.emoji, 8)];
@@ -1061,6 +1063,7 @@ async function generateReply(serverID: Snowflake, trigger: ReplyTrigger): Promis
     toModelTool('manage_role', localTools.manageRole),
     toModelTool('delete_role', localTools.deleteRole),
     toModelTool('send_message', localTools.sendMessage),
+    toModelTool('delete_message', localTools.deleteMessage),
     toModelTool('create_embed', localTools.createEmbed),
     toModelTool('create_thread', localTools.createThread),
     toModelTool('create_memory', localTools.createMemory),

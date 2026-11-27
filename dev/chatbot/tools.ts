@@ -2691,6 +2691,51 @@ const sendMessage = tool({
   },
 });
 
+const MAX_DELETES_PER_REPLY = 5;
+const deleteCounts = new WeakMap<ReplyContext, number>(); // delete_message calls so far, per reply
+
+// only ever the bot's own messages. the MessageDelete event takes it out of the conversation, like any other deleted message.
+// takes a raw message id, never a ref like [$4], so deleting is a deliberate choice of one exact message
+const deleteMessage = tool({
+  description: 'Delete one of your own messages, e.g. one you sent by mistake or were asked to take back. Only messages you wrote can be deleted, never anyone else\'s. '
+    + 'Give the message\'s Discord id (a number of 17 to 20 digits), not a reference like [$4]. '
+    + 'Get the id from fetch_channel or search_channel (each message\'s id), or from what send_message or create_embed returned. '
+    + `Only use it when you really mean to delete that exact message: this can't be undone. At most ${MAX_DELETES_PER_REPLY} per reply.`,
+  inputExamples: [
+    { input: { message_id: '1234567890123456789' } },
+    { input: { message_id: '1234567890123456789', channel: '[#3]' } },
+  ],
+  inputSchema: zod.object({
+    message_id: zod.string().regex(/^\d{17,20}$/, 'Must be a Discord message id: 17 to 20 digits, not a reference like [$4]')
+      .describe('The Discord id of your message, e.g. 1234567890123456789. Not a reference like [$4]'),
+    channel: zod.string().optional().describe('Reference of the message\'s channel, e.g. [#3], or its id. Defaults to this channel'),
+  }),
+  contextSchema: replyContextSchema,
+  execute: async (input: { message_id: string, channel?: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message: string }> => {
+    // checked here too, in case the schema isn't enforced on the model's call
+    const messageID = input.message_id?.trim() ?? '';
+    if (!/^\d{17,20}$/.test(messageID)) return { result: 'failure', message: `"${input.message_id}" isn't a message id. Give the message's Discord id (17 to 20 digits), from fetch_channel or search_channel, not a reference like [$4].` };
+
+    if (!countUse(deleteCounts, context, MAX_DELETES_PER_REPLY)) return { result: 'failure', message: `You've already deleted ${MAX_DELETES_PER_REPLY} messages this reply, the most allowed.` };
+
+    const channel = await resolveTextChannel(context, input.channel);
+    if (typeof channel === 'string') return { result: 'failure', message: channel };
+    // so someone can't have the bot delete its messages in a channel they can't see
+    if (!isPublicOrCurrent(channel, context)) return { result: 'failure', message: 'This channel is private, so your messages in it can only be deleted from inside it.' };
+
+    const message = await safeFetch(() => channel.messages.fetch(messageID));
+    if (!message) return { result: 'failure', message: `There is no message with id ${messageID} in ${channelLabel(channel)}.` };
+    if (message.author.id !== discordClient.user!.id) return { result: 'failure', message: 'That message isn\'t yours, and you can only delete your own messages.' };
+
+    try {
+      await message.delete();
+      return { result: 'success', message: `Deleted your message in ${channelLabel(channel)}.` };
+    } catch (error: any) {
+      return { result: 'failure', message: String(error?.message ?? error) };
+    }
+  },
+});
+
 // discord's embed limits, checked up front so the model gets a clear reason instead of an API error
 const EMBED_LIMITS = { title: 256, description: 4096, fields: 25, fieldName: 256, fieldValue: 1024, footer: 2048, author: 256, total: 6000 };
 const MAX_EMBED_CONTENT_LENGTH = 2000; // the content above it is a normal message, so it can't be split like send_message's
@@ -3207,4 +3252,4 @@ const addMcpTool = tool({
 });
 
 export { LocalTool };
-export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, viewImage: viewImageTool, viewImageCaptioned, viewFile: viewFileTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, viewRole, editRole, manageRole, deleteRole, sendMessage, createEmbed, createThread, runCommand, writeFile, editFile };
+export default { addMcpTool, reactToMessage, changeNickname, createReminder, editReminder, listReminders, viewReminder, removeReminder, createMemory, listMemories, viewMemory, editMemory, removeMemory, searchSummaries, fetchURL, viewImage: viewImageTool, viewImageCaptioned, viewFile: viewFileTool, xSearch, bluesky, blueskyAct, blueskyDMs, listCounters, counter, metacog, listHeartbeats, createHeartbeat, editHeartbeat, deleteHeartbeat, fetchChannel, searchChannel, fetchEmbed, searchUsers, listUsers, viewUser, viewRole, editRole, manageRole, deleteRole, sendMessage, deleteMessage, createEmbed, createThread, runCommand, writeFile, editFile };
