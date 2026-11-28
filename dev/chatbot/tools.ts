@@ -3130,6 +3130,7 @@ const DETACHED_MESSAGE = 'The workspace is only available in servers attached to
 
 const runCommand = tool({
   description: `Run a bash command in your workspace, and get back its output. ${SANDBOX_DESCRIPTION} `
+    + 'Each command runs in a fresh shell that starts in /workspace, so cd, variables, and activated venvs don\'t carry over between commands: chain them with && in one command when you need them. '
     + `Output is cut to the last 4000 characters. Commands are stopped after the timeout (default 30 seconds, at most ${MAX_TIMEOUT}).`,
   inputExamples: [
     { input: { command: 'ls -la' } },
