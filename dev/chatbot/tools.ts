@@ -2654,23 +2654,58 @@ const viewRole = tool({
 const MAX_SENDS_PER_REPLY = 5;
 const sendCounts = new WeakMap<ReplyContext, number>(); // send_message calls so far, per reply
 
+// a user's id, from a ref like [@2], a mention, or a plain id. the same lookup view_user and manage_role do
+function resolveUserID(context: ReplyContext, userInput: string): string | undefined {
+  const raw = userInput.trim();
+  return /^<?@?!?(\d{17,20})>?$/.exec(raw)?.[1] ?? resolveUserRef(context.conversation_id, raw) ?? resolveUserRef(context.conversation_id, `[${raw}]`) ?? resolveUserRef(context.conversation_id, `[@${raw}]`);
+}
+
+/**
+ * The DM channel with a user, for send_message. Only members of this server, so no one can have the bot message strangers from other servers.
+ * A DM with the bot's owner can reach anyone who shares a server with the bot, which Discord checks when it's sent.
+ * Their replies are only answered if they're in DM_USERS (handleDirectMessage). Returns why not instead, worded to give to the model as-is
+ */
+async function resolveUserDM(context: ReplyContext, userInput: string): Promise<DMChannel | string> {
+  const userID = resolveUserID(context, userInput);
+  if (!userID) return `There is no user with ref ${userInput.trim()}.`;
+  if (userID === discordClient.user!.id) return 'You can\'t DM yourself.';
+
+  let user;
+  if (context.dm) {
+    user = await safeFetch(() => discordClient.users.fetch(userID));
+    if (!user) return `There is no user ${userInput.trim()}.`;
+  } else {
+    const guild = await safeFetch(() => discordClient.guilds.fetch(context.server_id));
+    const member = await safeFetch(() => guild!.members.fetch(userID));
+    if (!member) return `${userInput.trim()} isn't a member of this server, so you can't DM them from here.`;
+    user = member.user;
+  }
+  if (user.bot) return 'You can\'t DM other bots.';
+
+  return (await safeFetch(() => user.createDM())) ?? `Couldn't open a DM with ${user.displayName}.`;
+}
+
 const sendMessage = tool({
-  description: 'Send a message to a channel in this server (in a DM with your owner, any server), separate from your reply. Use it to post somewhere else, or to post more than one message. '
+  description: 'Send a message to a channel in this server (in a DM with your owner, any server), or to someone\'s DMs, separate from your reply. Use it to post somewhere else, or to post more than one message. '
+    + 'To DM someone, give user instead of channel: they have to be a member of this server. '
     + `Refs like [@2] and [#3] work the same as in your replies. At most ${MAX_SENDS_PER_REPLY} per reply.`,
   inputExamples: [
     { input: { channel: '[#3]', content: 'Movie night starts in 10 minutes! 🍿' } },
+    { input: { user: '[@2]', content: 'Hey! Just a heads up, movie night got moved to Saturday.' } },
   ],
   inputSchema: zod.object({
-    channel: zod.string().optional().describe('Reference of the channel, e.g. [#3], or its id. Defaults to this channel'),
+    channel: zod.string().optional().describe('Reference of the channel, e.g. [#3], or its id. Defaults to this channel. Leave out when giving user'),
+    user: zod.string().optional().describe('To DM someone instead: reference of the user, e.g. [@2], or their id. Leave out channel when giving this'),
     content: zod.string().describe('Content of the message. Long messages are split up'),
   }),
   contextSchema: replyContextSchema,
-  execute: async (input: { channel?: string, content: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message_ids?: string[], message: string }> => {
+  execute: async (input: { channel?: string, user?: string, content: string }, { context }: { context: ReplyContext }): Promise<{ result: 'success' | 'failure', message_ids?: string[], message: string }> => {
     if (!input.content.trim()) return { result: 'failure', message: 'The message is empty.' };
+    if (input.channel?.trim() && input.user?.trim()) return { result: 'failure', message: 'Give either channel or user, not both.' };
 
     if (!countUse(sendCounts, context, MAX_SENDS_PER_REPLY)) return { result: 'failure', message: `You've already sent ${MAX_SENDS_PER_REPLY} messages this reply, the most allowed.` };
 
-    const channel = await resolveTextChannel(context, input.channel);
+    const channel = input.user?.trim() ? await resolveUserDM(context, input.user) : await resolveTextChannel(context, input.channel);
     if (typeof channel === 'string') return { result: 'failure', message: channel };
     if (!channel.isSendable()) return { result: 'failure', message: 'I can\'t send messages in this channel.' };
 
@@ -2686,6 +2721,8 @@ const sendMessage = tool({
 
       return { result: 'success', message_ids: messageIDs, message: `Sent ${messageIDs.length} message${messageIDs.length === 1 ? '' : 's'} in ${channelLabel(channel)}.` };
     } catch (error: any) {
+      // 50007: Discord won't deliver it, e.g. they've turned off DMs from server members, or share no server with the bot
+      if (error?.code === 50007) return { result: 'failure', message: 'They don\'t accept DMs from you, e.g. they\'ve turned off DMs from server members.' };
       return { result: 'failure', message: String(error?.message ?? error) };
     }
   },

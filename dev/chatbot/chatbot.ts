@@ -761,7 +761,7 @@ function describeToolCall(name: string, input: any): [string, string] {
     // channel refs like [#3] are left as written, so they're turned into channel links with the rest of the reply
     case 'fetch_channel': return ['read', clip(input.channel) || 'this channel'];
     case 'search_channel': return [`searched ${clip(input.channel) || 'this channel'} for`, quote(input.query ?? input.author)];
-    case 'send_message': return ['sent a message in', clip(input.channel) || 'this channel'];
+    case 'send_message': return input.user ? ['sent a DM to', clip(input.user)] : ['sent a message in', clip(input.channel) || 'this channel'];
     case 'delete_message': return ['deleted its message', clip(input.message_id)];
     case 'create_embed': return ['sent an embed in', clip(input.channel) || 'this channel'];
     case 'create_thread': return ['created thread', quote(input.name)];
